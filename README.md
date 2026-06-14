@@ -10,38 +10,47 @@ commands and mutating Band actions are owner-only in every Band room.
 
 ## Install
 
-Pick the path matching how you run Hermes. In every case the plugin key is
-`band` — enable it with `hermes plugins enable band`.
+Two paths. The plugin key is `band`. **Directory install is recommended** — it
+prompts for credentials and enables the plugin in one step; the pip path needs a
+couple of manual touches on stock Hermes.
 
-### pip (recommended)
-
-```bash
-pip install hermes-band-platform
-hermes plugins enable band
-
-# Set credentials (via `hermes config`, the setup wizard, or ~/.hermes/.env):
-#   BAND_AGENT_ID=<agent-uuid>
-#   BAND_API_KEY=<agent-api-key>
-hermes gateway restart
-```
-
-`thenvoi-sdk` is pulled in automatically as a dependency.
-
-### Directory plugin
-
-Install the plugin as a directory drop-in under `~/.hermes/plugins/band`:
+### Directory plugin (recommended)
 
 ```bash
 hermes plugins install thenvoi/hermes-band-platform --enable
+```
 
-# Directory plugins don't carry their own dependencies, so install the SDK
-# into the SAME environment as the gateway:
+This clones the plugin into `~/.hermes/plugins/band`, prompts you for
+`BAND_AGENT_ID` + `BAND_API_KEY`, and enables it. Directory plugins don't carry
+their own dependencies, so install the SDK into the SAME environment as the
+gateway:
+
+```bash
 pip install thenvoi-sdk
 #   uv-managed venv (no pip): uv pip install --python .venv/bin/python thenvoi-sdk
 ```
 
-Then set `BAND_AGENT_ID` + `BAND_API_KEY` (`hermes config` or `~/.hermes/.env`)
-and `hermes gateway restart`.
+Then `hermes gateway restart`.
+
+### pip
+
+```bash
+pip install hermes-band-platform   # also pulls in thenvoi-sdk
+```
+
+The plugin is discovered automatically but is **opt-in**. On a Hermes build that
+manages entry-point plugins, enable it with `hermes plugins enable band`. On
+stock Hermes that command doesn't yet recognize entry-point plugins, so add it
+by hand to `~/.hermes/config.yaml`:
+
+```yaml
+plugins:
+  enabled:
+    - band
+```
+
+Set `BAND_AGENT_ID` + `BAND_API_KEY` (`hermes config` or `~/.hermes/.env`), then
+`hermes gateway restart`.
 
 ### Nix
 

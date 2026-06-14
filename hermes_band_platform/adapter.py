@@ -330,7 +330,7 @@ class BandAdapter(BasePlatformAdapter):
 
         if not BAND_AVAILABLE:
             logger.error(
-                "[band] thenvoi-sdk not installed. Run: pip install 'thenvoi-sdk>=0.2.9,<0.3'",
+                "[band] thenvoi-sdk not installed. Run: pip install 'thenvoi-sdk>=1.0.0,<2.0.0'",
             )
             self._set_fatal_error(
                 "dependency_missing",
@@ -1633,7 +1633,7 @@ def check_band_requirements() -> bool:
     specific names inside the function, binds them to module globals, and
     returns True; on ImportError it returns False.
 
-    To enable Hermes auto-install, a ``'platform.band': ('thenvoi-sdk>=0.2.9,<0.3',)``
+    To enable Hermes auto-install, a ``'platform.band': ('thenvoi-sdk>=1.0.0,<2.0.0',)``
     entry could be added to tools/lazy_deps.py and this could use
     ``tools.lazy_deps.ensure_and_bind``; deferred to keep zero core edits.
     """
@@ -1839,7 +1839,7 @@ def register(ctx) -> None:
         validate_config=validate_config,
         is_connected=_is_connected,
         required_env=["BAND_AGENT_ID", "BAND_API_KEY"],
-        install_hint="pip install 'thenvoi-sdk>=0.2.9,<0.3'",
+        install_hint="pip install 'thenvoi-sdk>=1.0.0,<2.0.0'",
         # Interactive setup wizard — gives Band the same native ``hermes gateway
         # setup`` flow as Slack/Discord (called with no args via this hook).
         setup_fn=interactive_setup,

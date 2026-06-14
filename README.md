@@ -39,8 +39,8 @@ their own dependencies, so install the SDK into the SAME environment as the
 gateway:
 
 ```bash
-pip install thenvoi-sdk
-#   uv-managed venv (no pip): uv pip install --python .venv/bin/python thenvoi-sdk
+pip install 'thenvoi-sdk>=1.0.0,<2.0.0'
+#   uv-managed venv (no pip): uv pip install --python .venv/bin/python 'thenvoi-sdk>=1.0.0,<2.0.0'
 ```
 
 Then `hermes gateway restart`.

@@ -54,11 +54,11 @@ PY -c 'import thenvoi; print("thenvoi", thenvoi.__version__)'
 If that errors, install it:
 
 ```bash
-pip install 'thenvoi-sdk>=0.2.9,<0.3'
+pip install 'thenvoi-sdk>=1.0.0,<2.0.0'
 ```
 
 > **uv-managed venv (dev checkouts):** if there is no `pip` in the venv, `pip install` fails. Use:
-> `uv pip install --python .venv/bin/python 'thenvoi-sdk>=0.2.9,<0.3'`. Note `thenvoi-sdk` may not be in
+> `uv pip install --python .venv/bin/python 'thenvoi-sdk>=1.0.0,<2.0.0'`. Note `thenvoi-sdk` may not be in
 > `uv.lock`, so a later `uv sync --locked` can remove it — re-run this import check if Band suddenly
 > stops loading.
 

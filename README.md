@@ -8,6 +8,19 @@ messaging, it registers a `band` action toolset and bootstraps a **Hermes Hub**:
 a private owner↔agent control room that serves as the Band main channel. Slash
 commands and mutating Band actions are owner-only in every Band room.
 
+## Before you install
+
+You need a **Band account** and a Band **agent's credentials**, minted in a
+browser (no API can do this for you):
+
+1. Go to **app.thenvoi.com/agents/new** — the Agents page, *not* Settings (which
+   only holds REST API keys).
+2. Create an external agent; copy its **Agent ID** (a UUID) → `BAND_AGENT_ID`.
+3. Copy the agent's **API key** (`band_a_…`) → `BAND_API_KEY`. **It's shown
+   once** — grab it now.
+
+Have both values ready before the steps below.
+
 ## Install
 
 Two paths. The plugin key is `band`. **Directory install is recommended** — it
@@ -49,8 +62,19 @@ plugins:
     - band
 ```
 
-Set `BAND_AGENT_ID` + `BAND_API_KEY` (`hermes config` or `~/.hermes/.env`), then
-`hermes gateway restart`.
+Not sure which build you have? Run `hermes plugins list` after install — if `band`
+doesn't appear, use the manual `config.yaml` edit above.
+
+Set the credentials in `~/.hermes/.env` directly — **don't** use
+`hermes config set BAND_AGENT_ID` (names without a `_KEY`/`_TOKEN` suffix route to
+`config.yaml`, which the adapter doesn't read):
+
+```bash
+BAND_AGENT_ID=<agent-uuid>
+BAND_API_KEY=<band_a_key>
+```
+
+Then `hermes gateway restart`.
 
 ### Nix
 
@@ -97,6 +121,22 @@ adapter resolves the owner, bootstraps the [hub](#the-hub-main-channel--command-
 as the Band main channel, persists `BAND_HUB_ROOM`, and greets the owner in the
 room so they see it in-band. The fastest route through credentials → restart →
 hub verification is the bundled **`add-band`** skill.
+
+### Verify it worked
+
+`connect()` succeeding only means the WebSocket opened — it does **not** prove the
+hub was created (bootstrap runs in a try/except that never blocks connect). Check
+the real signals:
+
+```bash
+grep -E '\[band\] Connected as agent|\[band\] Hub ready: room|✓ band connected' ~/.hermes/logs/gateway.log
+grep BAND_HUB_ROOM ~/.hermes/.env   # a non-empty UUID = hub created
+```
+
+Then open the auto-created **"Hermes Agent Hub"** room in Band and **@mention the
+agent** — Band has no DMs, so an un-mentioned message is ignored by design. A reply
+means you're live. If you see `[band] Owner unresolved — hub disabled`, set
+`BAND_OWNER_ID=<your-uuid>` and restart.
 
 ## Environment variables
 

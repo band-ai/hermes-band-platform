@@ -1549,7 +1549,7 @@ class TestGetChatInfo:
         assert info["type"] == "group"
 
     @pytest.mark.asyncio
-    async def test_returns_unknown_when_fetch_fails(self, monkeypatch):
+    async def test_returns_group_when_fetch_fails(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         # Wire link with a failing REST call
         mock_link = MagicMock()
@@ -1557,8 +1557,9 @@ class TestGetChatInfo:
             side_effect=RuntimeError("fetch failed")
         )
         adapter._link = mock_link
+        # Band has no DMs — the fall-through type is "group", never "unknown".
         info = await adapter.get_chat_info("unknown-room")
-        assert info["type"] == "unknown"
+        assert info["type"] == "group"
 
 
 # ---------------------------------------------------------------------------

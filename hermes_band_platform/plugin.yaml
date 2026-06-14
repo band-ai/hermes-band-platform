@@ -22,6 +22,7 @@ requires_env:
     description: "Thenvoi agent API key (authenticates the WebSocket + REST link)"
     prompt: "Band API key"
     password: true
+    secret: true   # also mask in `hermes plugins install` prompt (reads `secret`)
 optional_env:
   - name: BAND_BASE_URL
     description: "Band host base URL (default: https://app.thenvoi.com). WS + REST URLs are derived from this host."

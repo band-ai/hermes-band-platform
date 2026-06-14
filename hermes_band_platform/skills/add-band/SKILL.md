@@ -54,12 +54,11 @@ PY -c 'import thenvoi; print("thenvoi", thenvoi.__version__)'
 If that errors, install it:
 
 ```bash
-pip install thenvoi-sdk==0.2.9          # standalone / community plugin
-#   bundled hermes-agent build:  pip install 'hermes-agent[band]'
+pip install 'thenvoi-sdk>=0.2.9,<0.3'
 ```
 
 > **uv-managed venv (dev checkouts):** if there is no `pip` in the venv, `pip install` fails. Use:
-> `uv pip install --python .venv/bin/python 'thenvoi-sdk==0.2.9'`. Note `thenvoi-sdk` may not be in
+> `uv pip install --python .venv/bin/python 'thenvoi-sdk>=0.2.9,<0.3'`. Note `thenvoi-sdk` may not be in
 > `uv.lock`, so a later `uv sync --locked` can remove it — re-run this import check if Band suddenly
 > stops loading.
 
@@ -166,7 +165,8 @@ curl -sS "BASE/api/v1/agent/me" -H "X-API-Key: <band_a_key>"   # returns the age
 You can't see the Band UI, so ask the user to close the loop:
 
 > Check your Band app — a **"Hermes Agent Hub"** room should have appeared with a greeting from the
-> agent. Send it a test message (here or in any other Band chat) and confirm it replies.
+> agent. **@mention the agent** and send a test message — Band has no DMs, so an
+> un-mentioned message is ignored by design — and confirm it replies.
 
 A round-tripped reply is the proof the integration is live.
 
@@ -209,4 +209,4 @@ grants others. Restart the gateway after editing. Then re-verify chat still work
 - [ ] `BAND_HUB_ROOM` is a non-empty UUID in `~/.hermes/.env`
 - [ ] `gateway.log` shows `[band] Connected as agent` + `[band] Hub ready: room` + `✓ band connected`
 - [ ] No `[band] Owner unresolved` / `[band] Hub bootstrap failed`
-- [ ] User confirms the "Hermes Agent Hub" room appeared and a test message round-trips
+- [ ] User confirms the "Hermes Agent Hub" room appeared and an **@mention** test message round-trips

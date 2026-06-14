@@ -330,7 +330,7 @@ class BandAdapter(BasePlatformAdapter):
 
         if not BAND_AVAILABLE:
             logger.error(
-                "[band] thenvoi-sdk not installed. Run: pip install thenvoi-sdk==0.2.9",
+                "[band] thenvoi-sdk not installed. Run: pip install 'thenvoi-sdk>=0.2.9,<0.3'",
             )
             self._set_fatal_error(
                 "dependency_missing",
@@ -1315,7 +1315,7 @@ class BandAdapter(BasePlatformAdapter):
                 chat_type=_SESSION_CHAT_TYPE,
             )
             store_cfg = getattr(session_store, "config", None)
-            gspu = getattr(store_cfg, "group_sessions_per_user", True) if store_cfg else True
+            gspu = getattr(store_cfg, "group_sessions_per_user", False) if store_cfg else False
             session_key = build_session_key(source, group_sessions_per_user=gspu)
             session_store._ensure_loaded()
             return session_key in session_store._entries
@@ -1616,7 +1616,9 @@ class BandAdapter(BasePlatformAdapter):
                 "name": self._room_name_for(chat_id) or chat_id,
                 "type": self._chat_type_label(chat_id),
             }
-        return {"name": chat_id, "type": "unknown"}
+        # Participant fetch failed. Band has no DMs, so "group" is the correct
+        # fall-through type (never the base contract's "unknown").
+        return {"name": chat_id, "type": "group"}
 
 
 # ---------------------------------------------------------------------------
@@ -1631,7 +1633,7 @@ def check_band_requirements() -> bool:
     specific names inside the function, binds them to module globals, and
     returns True; on ImportError it returns False.
 
-    To enable Hermes auto-install, a ``'platform.band': ('thenvoi-sdk==0.2.9',)``
+    To enable Hermes auto-install, a ``'platform.band': ('thenvoi-sdk>=0.2.9,<0.3',)``
     entry could be added to tools/lazy_deps.py and this could use
     ``tools.lazy_deps.ensure_and_bind``; deferred to keep zero core edits.
     """
@@ -1778,7 +1780,7 @@ def interactive_setup() -> None:
     print_info("  1. Open the Band app and go to the Agents page (/agents/new).")
     print_info("  2. Create a new external agent (or open an existing one).")
     print_info("  3. Copy the Agent ID (a UUID) and the agent's API key (shown once).")
-    print()
+    print_info("")
 
     # Already-configured: offer reconfigure, mirroring Discord / standard setup.
     existing = get_env_value("BAND_AGENT_ID")
@@ -1805,7 +1807,7 @@ def interactive_setup() -> None:
     print_success("Saved BAND_API_KEY")
 
     # Optional base URL (empty → adapter default app.thenvoi.com).
-    print()
+    print_info("")
     print_info("Band host (only override for self-hosted / non-default Band).")
     base_url = prompt("Band base URL (leave empty for app.thenvoi.com)")
     if base_url:
@@ -1813,7 +1815,7 @@ def interactive_setup() -> None:
         print_success("Saved BAND_BASE_URL")
 
     # ── Auto-resolved info (no prompts) ───────────────────────────────────────
-    print()
+    print_info("")
     print_info("Access is governed by Band itself — anyone Band lets reach the")
     print_info("agent (in any chat or the hub) can talk to it; no allowlist setup is needed.")
     print_info("Owner, hub room, and home room are resolved automatically:")
@@ -1821,8 +1823,9 @@ def interactive_setup() -> None:
     print_info("  • A private 'Hermes Hub' control room is created automatically")
     print_info("    on first connect and wired as the Band main channel (where")
     print_info("    cron and notification deliveries land).")
+    print_info("Band has no DMs — to reach the agent, @mention it in a room (the hub included).")
     print_info("To restrict further, set BAND_ALLOWED_USERS (optional) later.")
-    print()
+    print_info("")
     print_success("🎵 Band configured!")
 
 
@@ -1836,7 +1839,7 @@ def register(ctx) -> None:
         validate_config=validate_config,
         is_connected=_is_connected,
         required_env=["BAND_AGENT_ID", "BAND_API_KEY"],
-        install_hint="pip install thenvoi-sdk==0.2.9",
+        install_hint="pip install 'thenvoi-sdk>=0.2.9,<0.3'",
         # Interactive setup wizard — gives Band the same native ``hermes gateway
         # setup`` flow as Slack/Discord (called with no args via this hook).
         setup_fn=interactive_setup,
@@ -1898,5 +1901,8 @@ def register(ctx) -> None:
                 _skill_md,
                 description="Connect this Hermes agent to Band (Thenvoi) end-to-end.",
             )
-    except Exception:
+    except AttributeError:
+        # Older host without ctx.register_skill — skip the skill silently.
         pass
+    except Exception as e:
+        logger.debug("[band] Skill registration skipped: %s", e)

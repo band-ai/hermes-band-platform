@@ -1,0 +1,65 @@
+name: band
+label: Band
+kind: platform
+version: 1.0.0
+description: >
+  Band (Thenvoi) gateway adapter for Hermes Agent.
+  Connects a Thenvoi agent to the Band platform over a persistent WebSocket
+  link and relays text messages between Band chat rooms and the Hermes agent.
+  Wraps the official ``thenvoi-sdk`` ThenvoiLink — it does not reimplement the
+  Thenvoi protocol.  Includes the Band action toolset and the Hermes Hub: an
+  auto-created owner control room that serves as the Band main channel.
+  Slash commands and Band actions are owner-only across all Band rooms.
+author: Thenvoi
+# ``requires_env`` entries are surfaced in ``hermes config`` UI via the
+# platform-plugin env var injector in ``hermes_cli/config.py``.
+requires_env:
+  - name: BAND_AGENT_ID
+    description: "Thenvoi agent ID (UUID) for this Hermes agent"
+    prompt: "Band agent ID"
+    password: false
+  - name: BAND_API_KEY
+    description: "Thenvoi agent API key (authenticates the WebSocket + REST link)"
+    prompt: "Band API key"
+    password: true
+optional_env:
+  - name: BAND_BASE_URL
+    description: "Band host base URL (default: https://app.thenvoi.com). WS + REST URLs are derived from this host."
+    prompt: "Band base URL (or empty for default)"
+    password: false
+  - name: BAND_OWNER_ID
+    description: "Owner UUID override. Normally resolved from the agent identity on connect; anchors the Hermes Hub (owner control room) and the owner-only gates (slash commands, mutating Band tools)."
+    prompt: "Owner UUID (or empty)"
+    password: false
+  - name: BAND_HUB_ROOM
+    description: "Hub room UUID — the private owner↔agent control room. Auto-created and persisted here on first connect; set it to pin an existing room."
+    prompt: "Hub room ID (or empty for auto-create)"
+    password: false
+  - name: BAND_HOME_ROOM
+    description: "Main-channel override: room ID for cron / notification delivery (also set by /sethome from a Band room). Defaults to the hub."
+    prompt: "Home room ID (or empty to use the hub)"
+    password: false
+  - name: BAND_HUB_FAILOVER_THRESHOLD
+    description: "Consecutive failed hub sends before the agent creates a fresh hub room and re-wires it as the main channel (default 3). Recovers when the hub hits its Band message limit or persistently errors; a successful hub send resets the count."
+    prompt: "Hub failover threshold (or empty for 3)"
+    password: false
+  - name: BAND_HUB_FAILOVER_MAX_PER_CONNECT
+    description: "Backstop cap on how many hub failovers may occur per gateway connection, so a platform-wide outage can't spin up rooms without bound (default 5)."
+    prompt: "Max hub failovers per connect (or empty for 5)"
+    password: false
+  - name: BAND_ALLOWED_USERS
+    description: "Optional. Comma-separated Band user IDs allowed to talk to the agent. Band's own ACL is trusted by default (the adapter enforces its own access policy); set this only to narrow access below what Band already permits."
+    prompt: "Allowed user IDs (comma-separated, or empty to trust Band's ACL)"
+    password: false
+  - name: BAND_ALLOW_ALL
+    description: "Explicitly allow anyone in a room to talk to the agent. Redundant with the default Band-ACL trust; mainly useful to override a BAND_ALLOWED_USERS restriction. Does not grant owner-only slash commands."
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: BAND_TOOL_OWNERS
+    description: "Comma-separated platform:user_id identities allowed to drive Band actions (e.g. telegram:<tg-id>). The resolved Band owner is always authorized from Band rooms; this allowlist grants others (fail-closed otherwise)."
+    prompt: "Band tool owners (comma-separated platform:user_id)"
+    password: false
+  - name: BAND_GROUP_SESSIONS_PER_USER
+    description: "Split a group room into a separate session per participant (true) or keep one shared session for the whole room (false). Default false — a Band room is one shared channel."
+    prompt: "Per-user group sessions? (true/false, default false)"
+    password: false

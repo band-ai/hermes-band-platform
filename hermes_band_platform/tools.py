@@ -1,0 +1,895 @@
+"""
+Band (Thenvoi) action tools for the Hermes agent.
+
+This module is the **tools pass** companion to ``adapter.py`` (the messaging
+adapter).  Where the adapter relays inbound/outbound *messages*, these tools let
+the agent *act on Band* — create rooms, add/remove participants, send messages,
+look up contacts — from any conversation it is in (a Band room, Telegram, the
+CLI, …).
+
+Design anchors (see ``Drafts/hermes-band-tools-events-buildplan.md``):
+
+  * **Native REST.** Handlers drive the Thenvoi ``AsyncRestClient`` directly,
+    reusing the *live* :class:`BandAdapter`'s authenticated link when the
+    gateway is in-process, and falling back to a fresh client from env creds for
+    out-of-process callers (cron, tests).
+  * **Session-bound room.** Room-context tools take an *optional* ``room_id``;
+    when absent they default to the current Band room resolved from session
+    context (``HERMES_SESSION_PLATFORM`` / ``HERMES_SESSION_CHAT_ID``).  An
+    explicit id always wins (cross-room / off-platform / freshly-created rooms).
+  * **Owner-gated mutation.** Creating rooms and adding/removing/messaging are
+    mutating and outward-facing, and may be exposed on other platforms, so every
+    mutating handler enforces an owner gate, **fail-closed**.  The gate uses the
+    explicit ``BAND_TOOL_OWNERS`` allowlist when set; when unset it falls back to
+    the calling platform's own ``<PLATFORM>_ALLOWED_USERS`` (so a single-operator
+    setup needs no second allowlist).  Read-only tools (find/get) bypass the gate.
+
+Conventions mirrored from ``adapter.py``: lazy SDK import (the module imports
+cleanly when ``thenvoi-sdk`` is absent), ``_short_id`` for low-cardinality logs,
+and API keys are **never** logged.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Dict, List, Optional
+
+from gateway.config import Platform
+from gateway.platforms.base import BasePlatformAdapter
+from gateway.session_context import get_session_env
+from tools.registry import tool_error, tool_result
+
+# Reuse the adapter's helpers + the lazy SDK-availability check. Importing the
+# adapter module is safe even when the SDK is absent (it guards its own import).
+from .adapter import (
+    DEFAULT_REQUEST_OPTIONS,
+    _derive_urls,
+    _short_id,
+    check_band_requirements,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Lazy SDK import guard.
+#
+# The request *types* we construct (ChatRoomRequest / ParticipantRequest) are
+# imported lazily — like the adapter's module-top guard — so this module loads
+# even when ``thenvoi-sdk`` isn't installed (plugin discovery runs before deps
+# are guaranteed present). ``check_band_requirements()`` (re)binds the names on
+# demand; ``_load_sdk()`` below re-imports inside handlers so a late install is
+# picked up without a process restart.
+# ---------------------------------------------------------------------------
+try:
+    from thenvoi.client.rest import (  # noqa: F401
+        ChatMessageRequest,
+        ChatMessageRequestMentionsItem,
+        ChatRoomRequest,
+        ParticipantRequest,
+    )
+except ImportError:  # SDK not present yet — bind to None, rebind in _load_sdk().
+    ChatMessageRequest = None
+    ChatMessageRequestMentionsItem = None
+    ChatRoomRequest = None
+    ParticipantRequest = None
+
+
+# Cap for read-only listings (find_room / find_contact / get_participants) so a
+# huge org directory can't blow up a tool result; we log when truncated.
+_MAX_RESULTS = 50
+# Hard cap on pages we'll paginate through for lookups (defensive bound).
+_MAX_LOOKUP_PAGES = 20
+
+# Same conservative per-message content cap the adapter uses (no confirmed Band
+# hard limit) — mirrors ``BandAdapter.MAX_MESSAGE_LENGTH``. Reused for chunking
+# long sends via ``BasePlatformAdapter.truncate_message``.
+_MAX_MESSAGE_LENGTH = 4000
+
+
+class _ToolError(Exception):
+    """A user-facing tool failure (bad args, auth, no room) → ``tool_error``."""
+
+
+class _ToolUnavailable(Exception):
+    """Band isn't configured/available in this process → ``tool_error``."""
+
+
+def _load_sdk() -> bool:
+    """(Re)bind the SDK request types this module constructs.
+
+    Returns True when the symbols are bound. Mirrors the adapter's
+    ``check_band_requirements()`` lazy-rebind so a late ``pip install`` is picked
+    up without restarting the process.
+    """
+    global ChatMessageRequest, ChatMessageRequestMentionsItem
+    global ChatRoomRequest, ParticipantRequest
+
+    if ChatRoomRequest is not None:
+        return True
+    try:
+        from thenvoi.client.rest import (
+            ChatMessageRequest as _ChatMessageRequest,
+            ChatMessageRequestMentionsItem as _ChatMessageRequestMentionsItem,
+            ChatRoomRequest as _ChatRoomRequest,
+            ParticipantRequest as _ParticipantRequest,
+        )
+    except ImportError:
+        return False
+
+    ChatMessageRequest = _ChatMessageRequest
+    ChatMessageRequestMentionsItem = _ChatMessageRequestMentionsItem
+    ChatRoomRequest = _ChatRoomRequest
+    ParticipantRequest = _ParticipantRequest
+    return True
+
+
+def _check_band_tools_available() -> bool:
+    """``check_fn`` for every Band tool.
+
+    True only when the SDK is importable (``check_band_requirements``) AND a
+    ``BAND_API_KEY`` is present — so the tools disappear cleanly when Band is
+    unconfigured rather than failing at call time.
+    """
+    try:
+        if not check_band_requirements():
+            return False
+    except Exception:
+        return False
+    return bool(os.getenv("BAND_API_KEY", "").strip())
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+async def _rest() -> Any:
+    """Return an authenticated async REST client.
+
+    Prefers the *live* :class:`BandAdapter`'s link (no second connection); falls
+    back to a fresh ``AsyncRestClient`` from env creds for out-of-process callers
+    (cron / no live gateway). The fallback client is short-lived — created per
+    call — so it never leaks a pooled connection across a loop.
+    """
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(Platform("band")) if runner else None
+        link = getattr(adapter, "_link", None) if adapter is not None else None
+        if link is not None:
+            return link.rest
+    except Exception:
+        # Fall through to the env-creds fallback.
+        pass
+
+    if not _load_sdk():
+        raise _ToolUnavailable("Band not available (thenvoi-sdk not installed)")
+    from thenvoi.client.rest import AsyncRestClient
+
+    api_key = os.getenv("BAND_API_KEY", "").strip()
+    if not api_key:
+        raise _ToolUnavailable("Band not configured (BAND_API_KEY)")
+    _, rest_url = _derive_urls(os.getenv("BAND_BASE_URL", "").strip())
+    return AsyncRestClient(api_key=api_key, base_url=rest_url)
+
+
+def _resolve_room(args: Dict[str, Any]) -> str:
+    """Resolve the target room id for a room-context tool.
+
+    Precedence: explicit ``room_id`` arg → else the current Band room from
+    session context (only when this conversation *is* a Band session) → else
+    error.  An explicit id always wins, so cross-room / off-platform /
+    freshly-created rooms work the same way.
+    """
+    rid = str((args or {}).get("room_id") or "").strip()
+    if rid:
+        return rid
+    if get_session_env("HERMES_SESSION_PLATFORM") == "band":
+        rid = (get_session_env("HERMES_SESSION_CHAT_ID") or "").strip()
+        if rid:
+            return rid
+    raise _ToolError("room_id required (no current Band room in this conversation)")
+
+
+def _platform_allows_user(platform: str, user_id: str) -> bool:
+    """Whether ``platform``'s own allowed-users config admits ``user_id``.
+
+    Mirrors the gateway's per-platform gating env: ``<PLATFORM>_ALLOWED_USERS``
+    (a comma-separated id list) plus an allow-all flag (``<PLATFORM>_ALLOW_ALL``
+    or ``<PLATFORM>_ALLOW_ALL_USERS``). Used only as the ``BAND_TOOL_OWNERS``
+    fallback below — it reuses whatever allowlist the platform already trusts.
+    """
+    up = platform.upper()
+    allow_all = (
+        os.getenv(f"{up}_ALLOW_ALL_USERS") or os.getenv(f"{up}_ALLOW_ALL") or ""
+    ).strip().lower()
+    if allow_all in {"1", "true", "yes", "on"}:
+        return True
+    allowed = {
+        u.strip() for u in os.getenv(f"{up}_ALLOWED_USERS", "").split(",") if u.strip()
+    }
+    return bool(user_id) and user_id in allowed
+
+
+def _owner_identity() -> Optional[str]:
+    """Resolve the Band owner UUID — live adapter first, env fallback.
+
+    Mirrors ``_agent_id_or_none``: prefer the connected adapter's resolved
+    state (set on connect from the agent identity); fall back to
+    ``BAND_OWNER_ID`` for out-of-process callers. Never raises.
+    """
+    owner: Optional[str] = None
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(Platform("band")) if runner else None
+        if adapter is not None:
+            owner = getattr(adapter, "_owner_uuid", None)
+    except Exception:
+        pass
+    return owner or (os.getenv("BAND_OWNER_ID", "").strip() or None)
+
+
+def _require_owner() -> None:
+    """Authorize the calling session for a mutating Band action.
+
+    Owner bypass (checked first): the agent's resolved Band owner calling
+    from *any* Band room is the platform's designated operator, so it needs
+    no allowlist entry — owner implies authority (fail-closed when the owner
+    is unresolved).
+
+    Primary gate: the explicit ``BAND_TOOL_OWNERS`` allowlist (comma-separated
+    ``platform:user_id`` identities). When set, only those identities pass.
+
+    Fallback (when ``BAND_TOOL_OWNERS`` is unset/empty): defer to the *calling
+    platform's own* allowed-users config (``<PLATFORM>_ALLOWED_USERS`` and the
+    allow-all flag). This lets a single-operator setup work without a second
+    allowlist — whoever the platform already trusts to talk to the agent may
+    also drive Band. It is broader than the explicit gate (it inherits the
+    platform's chat allowlist), so set ``BAND_TOOL_OWNERS`` to tighten.
+
+    There is no built-in cross-platform owner in Hermes, so either way the Band
+    tools carry their own gate; if neither path authorizes the caller (or the
+    caller has no identity), the action refuses — fail-closed.
+    """
+    platform = (get_session_env("HERMES_SESSION_PLATFORM") or "").strip()
+    user_id = (get_session_env("HERMES_SESSION_USER_ID") or "").strip()
+    who = f"{platform}:{user_id}"
+
+    # Owner-implies-authority: the resolved Band owner → authorized from any
+    # Band room, no env needed.
+    if platform == "band" and user_id:
+        owner_uuid = _owner_identity()
+        if owner_uuid and user_id == owner_uuid:
+            return
+
+    owners = {o.strip() for o in os.getenv("BAND_TOOL_OWNERS", "").split(",") if o.strip()}
+    if owners:
+        if who not in owners:
+            raise _ToolError(f"Band actions are owner-only; {who} is not authorized")
+        return
+
+    # Fallback: BAND_TOOL_OWNERS unset -> inherit the calling platform's allowlist.
+    if not platform or not user_id:
+        raise _ToolError(
+            "Band actions are owner-only; no caller identity and BAND_TOOL_OWNERS is unset"
+        )
+    if _platform_allows_user(platform, user_id):
+        return
+    raise _ToolError(
+        f"Band actions are owner-only; {who} is not on BAND_TOOL_OWNERS "
+        f"nor {platform.upper()}_ALLOWED_USERS"
+    )
+
+
+def _peer_to_dict(p: Any) -> Dict[str, Any]:
+    """Normalize an SDK peer/participant object into a plain dict."""
+    return {
+        "id": getattr(p, "id", None),
+        "handle": getattr(p, "handle", None),
+        "name": getattr(p, "name", None),
+        "type": getattr(p, "type", None),
+    }
+
+
+async def _list_peers(rest: Any) -> List[Dict[str, Any]]:
+    """Paginate ``list_agent_peers`` (and contacts, if present) into dicts.
+
+    Best-effort: peers are the primary directory; contacts are merged in when
+    the resource exists. Bounded by ``_MAX_LOOKUP_PAGES``.
+    """
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    page = 1
+    while page <= _MAX_LOOKUP_PAGES:
+        resp = await rest.agent_api_peers.list_agent_peers(
+            page=page,
+            page_size=_MAX_RESULTS,
+            request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+        rows = getattr(resp, "data", None) or []
+        for row in rows:
+            d = _peer_to_dict(row)
+            if d["id"] and d["id"] not in seen:
+                seen.add(d["id"])
+                out.append(d)
+        meta = getattr(resp, "metadata", None)
+        total_pages = getattr(meta, "total_pages", None)
+        if total_pages is None or page >= total_pages:
+            break
+        page += 1
+
+    # Merge in contacts when the resource exists (older SDKs may omit it).
+    contacts_api = getattr(rest, "agent_api_contacts", None)
+    list_contacts = getattr(contacts_api, "list_agent_contacts", None)
+    if callable(list_contacts):
+        try:
+            resp = await list_contacts(request_options=DEFAULT_REQUEST_OPTIONS)
+            for row in getattr(resp, "data", None) or []:
+                d = _peer_to_dict(row)
+                if d["id"] and d["id"] not in seen:
+                    seen.add(d["id"])
+                    out.append(d)
+        except Exception as e:
+            logger.debug("[band.tools] contacts lookup skipped: %s", e)
+
+    return out
+
+
+async def _find_participant(rest: Any, query: str) -> Optional[Dict[str, Any]]:
+    """Resolve a free-text ``query`` to a single peer/contact.
+
+    Case-insensitive match on handle / name / id. Prefers an exact id or handle
+    match, then an exact name, then a substring match. Returns ``{id, handle,
+    name}`` or None.
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+    ql = q.lower()
+
+    peers = await _list_peers(rest)
+    substring: Optional[Dict[str, Any]] = None
+    for p in peers:
+        pid = (p.get("id") or "")
+        handle = (p.get("handle") or "")
+        name = (p.get("name") or "")
+        if pid == q or handle.lower() == ql:
+            return p
+        if name.lower() == ql:
+            return p
+        if substring is None and (ql in handle.lower() or ql in name.lower()):
+            substring = p
+    return substring
+
+
+async def _mentions_for(
+    rest: Any, room_id: str, mention_ids: Optional[List[str]]
+) -> List[Any]:
+    """Build the mandatory mention list for a send (Band requires ≥1).
+
+    If ``mention_ids`` is given, build one mention per id (handle resolved from
+    the room participants when cheap). Otherwise mention every non-agent
+    participant in the room. Raises ``_ToolError`` if the result is empty.
+    """
+    if not _load_sdk():
+        raise _ToolUnavailable("Band not available (thenvoi-sdk not installed)")
+
+    # Fetch participants once for handle resolution / fallback mentions.
+    participants = await _list_participants(rest, room_id)
+    by_id = {p["id"]: p for p in participants if p.get("id")}
+
+    ids = [str(m).strip() for m in (mention_ids or []) if str(m).strip()]
+    items: List[Any] = []
+    if ids:
+        for mid in ids:
+            p = by_id.get(mid)
+            items.append(
+                ChatMessageRequestMentionsItem(
+                    id=mid,
+                    handle=(p.get("handle") if p else None),
+                    name=(p.get("name") if p else None),
+                )
+            )
+    else:
+        # Resolve the running agent's id so we don't @mention ourselves.
+        agent_id = await _agent_id_or_none(rest)
+        for p in participants:
+            pid = p.get("id")
+            if not pid or pid == agent_id:
+                continue
+            if (p.get("type") or "") == "Agent":
+                continue
+            items.append(
+                ChatMessageRequestMentionsItem(
+                    id=pid, handle=p.get("handle"), name=p.get("name")
+                )
+            )
+
+    if not items:
+        raise _ToolError(
+            "Band requires at least one @mention; no mentionable recipient was found "
+            "(pass mention_ids or add a participant to the room first)"
+        )
+    return items
+
+
+async def _list_participants(rest: Any, room_id: str) -> List[Dict[str, Any]]:
+    """Fetch a room's participants as plain dicts (best-effort)."""
+    resp = await rest.agent_api_participants.list_agent_chat_participants(
+        chat_id=room_id,
+        request_options=DEFAULT_REQUEST_OPTIONS,
+    )
+    return [_peer_to_dict(p) for p in (getattr(resp, "data", None) or [])]
+
+
+async def _agent_id_or_none(rest: Any) -> Optional[str]:
+    """Best-effort: the running adapter's resolved agent id (for self-exclusion).
+
+    Prefers the live adapter's ``_agent_id``; falls back to ``BAND_AGENT_ID``.
+    Never raises.
+    """
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(Platform("band")) if runner else None
+        aid = getattr(adapter, "_agent_id", None) if adapter is not None else None
+        if aid:
+            return aid
+    except Exception:
+        pass
+    return os.getenv("BAND_AGENT_ID", "").strip() or None
+
+
+def _tool_exc(exc: Exception) -> str:
+    """Convert an exception into a ``tool_error`` JSON string.
+
+    ``_ToolError`` / ``_ToolUnavailable`` carry user-facing messages; anything
+    else is wrapped with its type so the model gets a useful (but bounded) hint.
+    """
+    if isinstance(exc, (_ToolError, _ToolUnavailable)):
+        return tool_error(str(exc))
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return tool_error(f"Band tool failed: {exc}", status_code=status)
+    return tool_error(f"Band tool failed: {type(exc).__name__}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Tier-A tools — platform-level (no room context)
+# ---------------------------------------------------------------------------
+
+async def _handle_create_room(args: dict, **kwargs) -> str:
+    """Create a Band room; optionally add a person and send them a message.
+
+    Composite: with ``person`` it resolves → creates → adds → (if ``message``)
+    sends in one call. No ``title`` arg — the server derives the title from the
+    first message.
+    """
+    try:
+        _require_owner()
+        if not _load_sdk():
+            raise _ToolUnavailable("Band not available (thenvoi-sdk not installed)")
+        rest = await _rest()
+
+        created = await rest.agent_api_chats.create_agent_chat(
+            chat=ChatRoomRequest(),
+            request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+        room_id = getattr(getattr(created, "data", None), "id", None)
+        if not room_id:
+            raise _ToolError("Band did not return a room id for the created room")
+
+        result: Dict[str, Any] = {"success": True, "room_id": room_id, "added": []}
+
+        person = str(args.get("person") or "").strip()
+        role = str(args.get("role") or "").strip() or "member"
+        resolved: Optional[Dict[str, Any]] = None
+        if person:
+            resolved = await _find_participant(rest, person)
+            if resolved is None:
+                # Room exists; report the partial result rather than silently dropping it.
+                result["warning"] = f"Room created but no contact matched '{person}'"
+                logger.info(
+                    "[band.tools] create_room %s: no contact matched query",
+                    _short_id(room_id),
+                )
+                return tool_result(result)
+            await rest.agent_api_participants.add_agent_chat_participant(
+                room_id,
+                participant=ParticipantRequest(participant_id=resolved["id"], role=role),
+                request_options=DEFAULT_REQUEST_OPTIONS,
+            )
+            result["added"] = [
+                {"id": resolved["id"], "handle": resolved.get("handle"), "name": resolved.get("name")}
+            ]
+
+        message = str(args.get("message") or "").strip()
+        if message:
+            if resolved is None:
+                raise _ToolError("'message' requires 'person' so the message has a recipient to @mention")
+            mentions = [
+                ChatMessageRequestMentionsItem(
+                    id=resolved["id"], handle=resolved.get("handle"), name=resolved.get("name")
+                )
+            ]
+            chunks = BasePlatformAdapter.truncate_message(message, _MAX_MESSAGE_LENGTH)
+            sent_id: Optional[str] = None
+            for chunk in chunks:
+                resp = await rest.agent_api_messages.create_agent_chat_message(
+                    room_id,
+                    message=ChatMessageRequest(content=chunk, mentions=mentions),
+                    request_options=DEFAULT_REQUEST_OPTIONS,
+                )
+                sent_id = getattr(getattr(resp, "data", None), "id", None) or sent_id
+            result["sent"] = sent_id
+
+        logger.info(
+            "[band.tools] Created room %s (added=%d, sent=%s)",
+            _short_id(room_id),
+            len(result["added"]),
+            bool(result.get("sent")),
+        )
+        return tool_result(result)
+    except Exception as exc:
+        return _tool_exc(exc)
+
+
+async def _handle_find_room(args: dict, **kwargs) -> str:
+    """Read-only: find existing rooms by free-text ``query`` on title/id."""
+    try:
+        rest = await _rest()
+        q = str(args.get("query") or "").strip()
+        ql = q.lower()
+
+        matches: List[Dict[str, Any]] = []
+        truncated = False
+        page = 1
+        while page <= _MAX_LOOKUP_PAGES:
+            resp = await rest.agent_api_chats.list_agent_chats(
+                page=page,
+                request_options=DEFAULT_REQUEST_OPTIONS,
+            )
+            for room in getattr(resp, "data", None) or []:
+                room_id = getattr(room, "id", None)
+                title = getattr(room, "title", None) or ""
+                if not room_id:
+                    continue
+                if not q or ql in title.lower() or ql == room_id.lower():
+                    if len(matches) >= _MAX_RESULTS:
+                        truncated = True
+                        break
+                    matches.append({"room_id": room_id, "title": title or None})
+            if truncated:
+                break
+            meta = getattr(resp, "metadata", None)
+            total_pages = getattr(meta, "total_pages", None)
+            if total_pages is None or page >= total_pages:
+                break
+            page += 1
+
+        if truncated:
+            logger.info("[band.tools] find_room truncated at %d results", _MAX_RESULTS)
+        return tool_result({"success": True, "rooms": matches, "truncated": truncated})
+    except Exception as exc:
+        return _tool_exc(exc)
+
+
+async def _handle_find_contact(args: dict, **kwargs) -> str:
+    """Read-only: resolve a free-text ``query`` to matching contacts/peers."""
+    try:
+        rest = await _rest()
+        q = str(args.get("query") or "").strip()
+        if not q:
+            return tool_error("query is required")
+        ql = q.lower()
+
+        peers = await _list_peers(rest)
+        matches: List[Dict[str, Any]] = []
+        for p in peers:
+            handle = (p.get("handle") or "").lower()
+            name = (p.get("name") or "").lower()
+            pid = (p.get("id") or "")
+            if pid == q or ql in handle or ql in name:
+                matches.append(
+                    {"id": p.get("id"), "handle": p.get("handle"), "name": p.get("name")}
+                )
+                if len(matches) >= _MAX_RESULTS:
+                    break
+        return tool_result({"success": True, "contacts": matches})
+    except Exception as exc:
+        return _tool_exc(exc)
+
+
+# ---------------------------------------------------------------------------
+# Tier-B tools — room-context (room from session or explicit room_id)
+# ---------------------------------------------------------------------------
+
+async def _handle_send_message(args: dict, **kwargs) -> str:
+    """Send a message into a room (mandatory @mention; chunked at the cap)."""
+    try:
+        _require_owner()
+        if not _load_sdk():
+            raise _ToolUnavailable("Band not available (thenvoi-sdk not installed)")
+        rest = await _rest()
+        room_id = _resolve_room(args)
+
+        content = str(args.get("content") or "")
+        if not content.strip():
+            return tool_error("content is required")
+
+        mention_ids = args.get("mention_ids")
+        if mention_ids is not None and not isinstance(mention_ids, list):
+            mention_ids = [mention_ids]
+        mentions = await _mentions_for(rest, room_id, mention_ids)
+
+        chunks = BasePlatformAdapter.truncate_message(content, _MAX_MESSAGE_LENGTH)
+        last_id: Optional[str] = None
+        for chunk in chunks:
+            resp = await rest.agent_api_messages.create_agent_chat_message(
+                room_id,
+                message=ChatMessageRequest(content=chunk, mentions=mentions),
+                request_options=DEFAULT_REQUEST_OPTIONS,
+            )
+            last_id = getattr(getattr(resp, "data", None), "id", None) or last_id
+
+        logger.info(
+            "[band.tools] Sent message to room %s (chunks=%d)", _short_id(room_id), len(chunks)
+        )
+        return tool_result({"success": True, "room_id": room_id, "message_id": last_id})
+    except Exception as exc:
+        return _tool_exc(exc)
+
+
+async def _handle_add_participant(args: dict, **kwargs) -> str:
+    """Add a participant (by UUID) to a room."""
+    try:
+        _require_owner()
+        if not _load_sdk():
+            raise _ToolUnavailable("Band not available (thenvoi-sdk not installed)")
+        rest = await _rest()
+        room_id = _resolve_room(args)
+
+        participant_id = str(args.get("participant_id") or "").strip()
+        if not participant_id:
+            return tool_error("participant_id is required")
+        role = str(args.get("role") or "").strip() or "member"
+
+        await rest.agent_api_participants.add_agent_chat_participant(
+            room_id,
+            participant=ParticipantRequest(participant_id=participant_id, role=role),
+            request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+        logger.info(
+            "[band.tools] Added participant %s to room %s",
+            _short_id(participant_id),
+            _short_id(room_id),
+        )
+        return tool_result(
+            {"success": True, "room_id": room_id, "participant_id": participant_id, "role": role}
+        )
+    except Exception as exc:
+        return _tool_exc(exc)
+
+
+async def _handle_remove_participant(args: dict, **kwargs) -> str:
+    """Remove a participant (by UUID) from a room."""
+    try:
+        _require_owner()
+        rest = await _rest()
+        room_id = _resolve_room(args)
+
+        participant_id = str(args.get("participant_id") or "").strip()
+        if not participant_id:
+            return tool_error("participant_id is required")
+
+        await rest.agent_api_participants.remove_agent_chat_participant(
+            room_id,
+            participant_id,
+            request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+        logger.info(
+            "[band.tools] Removed participant %s from room %s",
+            _short_id(participant_id),
+            _short_id(room_id),
+        )
+        return tool_result(
+            {"success": True, "room_id": room_id, "participant_id": participant_id}
+        )
+    except Exception as exc:
+        return _tool_exc(exc)
+
+
+async def _handle_get_participants(args: dict, **kwargs) -> str:
+    """Read-only: list a room's participants (no owner gate)."""
+    try:
+        rest = await _rest()
+        room_id = _resolve_room(args)
+        participants = await _list_participants(rest, room_id)
+        truncated = len(participants) > _MAX_RESULTS
+        if truncated:
+            participants = participants[:_MAX_RESULTS]
+            logger.info(
+                "[band.tools] get_participants truncated at %d for room %s",
+                _MAX_RESULTS,
+                _short_id(room_id),
+            )
+        return tool_result(
+            {
+                "success": True,
+                "room_id": room_id,
+                "participants": participants,
+                "truncated": truncated,
+            }
+        )
+    except Exception as exc:
+        return _tool_exc(exc)
+
+
+# ---------------------------------------------------------------------------
+# JSON schemas
+# ---------------------------------------------------------------------------
+
+_STRING = {"type": "string"}
+_ROOM_ID_PROP = {
+    "type": "string",
+    "description": "Target Band room id. Defaults to the current Band room; pass room_id to target another.",
+}
+
+BAND_CREATE_ROOM_SCHEMA = {
+    "name": "band_create_room",
+    "description": (
+        "Create a new Band room. Use `person` + `message` to spin up a room and message "
+        "someone in one step (the room title is derived by the server from the first "
+        "message — there is no title argument). Owner-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "person": {
+                "type": "string",
+                "description": "Optional contact to add — a handle, name, or UUID (resolved via the directory).",
+            },
+            "message": {
+                "type": "string",
+                "description": "Optional first message to send (requires `person` to @mention).",
+            },
+            "role": {
+                "type": "string",
+                "enum": ["owner", "admin", "member"],
+                "description": "Role for the added person (default: member).",
+            },
+        },
+        "required": [],
+    },
+}
+
+BAND_FIND_ROOM_SCHEMA = {
+    "name": "band_find_room",
+    "description": (
+        "Find existing Band rooms by a free-text query matched against room title or id. "
+        "Use this to get a room_id before acting on an existing room from another platform. "
+        "Read-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Text to match against room titles/ids. Omit to list rooms.",
+            },
+        },
+        "required": [],
+    },
+}
+
+BAND_FIND_CONTACT_SCHEMA = {
+    "name": "band_find_contact",
+    "description": (
+        "Resolve a person to their Band participant UUID by a free-text query (handle, name, "
+        "or id) over your peers and contacts. Use this before adding someone to a room or "
+        "@mentioning them. Read-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Handle, display name, or UUID to look up."},
+        },
+        "required": ["query"],
+    },
+}
+
+BAND_SEND_MESSAGE_SCHEMA = {
+    "name": "band_send_message",
+    "description": (
+        "Send a message to a Band room. Band requires at least one @mention per message: pass "
+        "`mention_ids` to choose recipients, otherwise all non-agent participants are mentioned. "
+        "Defaults to the current Band room; pass `room_id` to target another. Owner-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "description": "Message text to send."},
+            "mention_ids": {
+                "type": "array",
+                "items": _STRING,
+                "description": "Participant UUIDs to @mention. If omitted, all non-agent participants are mentioned.",
+            },
+            "room_id": _ROOM_ID_PROP,
+        },
+        "required": ["content"],
+    },
+}
+
+BAND_ADD_PARTICIPANT_SCHEMA = {
+    "name": "band_add_participant",
+    "description": (
+        "Add a participant (by UUID) to a Band room. Defaults to the current Band room; pass "
+        "`room_id` to target another. Owner-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "participant_id": {"type": "string", "description": "User/agent UUID to add."},
+            "role": {
+                "type": "string",
+                "enum": ["owner", "admin", "member"],
+                "description": "Role for the participant (default: member).",
+            },
+            "room_id": _ROOM_ID_PROP,
+        },
+        "required": ["participant_id"],
+    },
+}
+
+BAND_REMOVE_PARTICIPANT_SCHEMA = {
+    "name": "band_remove_participant",
+    "description": (
+        "Remove a participant (by UUID) from a Band room. Defaults to the current Band room; "
+        "pass `room_id` to target another. Owner-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "participant_id": {"type": "string", "description": "User/agent UUID to remove."},
+            "room_id": _ROOM_ID_PROP,
+        },
+        "required": ["participant_id"],
+    },
+}
+
+BAND_GET_PARTICIPANTS_SCHEMA = {
+    "name": "band_get_participants",
+    "description": (
+        "List the participants of a Band room. Defaults to the current Band room; pass `room_id` "
+        "to target another. Read-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "room_id": _ROOM_ID_PROP,
+        },
+        "required": [],
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Registry tuple — consumed by adapter.register():
+#   for name, schema, handler, emoji in BAND_TOOLS: ctx.register_tool(...)
+# ---------------------------------------------------------------------------
+
+BAND_TOOLS = (
+    ("band_create_room", BAND_CREATE_ROOM_SCHEMA, _handle_create_room, "🏠"),
+    ("band_find_room", BAND_FIND_ROOM_SCHEMA, _handle_find_room, "🔎"),
+    ("band_find_contact", BAND_FIND_CONTACT_SCHEMA, _handle_find_contact, "👤"),
+    ("band_send_message", BAND_SEND_MESSAGE_SCHEMA, _handle_send_message, "💬"),
+    ("band_add_participant", BAND_ADD_PARTICIPANT_SCHEMA, _handle_add_participant, "➕"),
+    ("band_remove_participant", BAND_REMOVE_PARTICIPANT_SCHEMA, _handle_remove_participant, "➖"),
+    ("band_get_participants", BAND_GET_PARTICIPANTS_SCHEMA, _handle_get_participants, "👥"),
+)

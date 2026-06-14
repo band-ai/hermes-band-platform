@@ -1,0 +1,40 @@
+name: Package directory plugin
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble directory-plugin bundle
+        run: |
+          set -euo pipefail
+          # Stage band/ = the contents of hermes_band_platform/ so the bundle is a
+          # drop-in for ~/.hermes/plugins/band/ (band/plugin.yaml, band/__init__.py,
+          # band/adapter.py, band/tools.py, band/skills/...).
+          rm -rf staging
+          mkdir -p staging/band
+          cp -r hermes_band_platform/. staging/band/
+          # Strip caches.
+          find staging -name '__pycache__' -type d -prune -exec rm -rf {} +
+          find staging -name '*.pyc' -delete
+
+          tag="${GITHUB_REF_NAME}"
+          ( cd staging && tar -czf "../hermes-band-platform-${tag}.tar.gz" band )
+          ( cd staging && zip -qr "../hermes-band-platform-${tag}.zip" band )
+          ls -l hermes-band-platform-*.tar.gz hermes-band-platform-*.zip
+
+      - name: Upload bundles to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            hermes-band-platform-*.tar.gz \
+            hermes-band-platform-*.zip \
+            --clobber

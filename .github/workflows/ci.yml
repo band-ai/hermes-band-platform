@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # The gateway probes these provider keys; keep them empty so nothing
+      # tries to reach a live LLM during tests.
+      OPENAI_API_KEY: ""
+      OPENROUTER_API_KEY: ""
+      NOUS_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install host + plugin
+        run: |
+          python -m pip install --upgrade pip
+          # hermes-agent is the HOST (provides gateway/, tools/, ...); thenvoi-sdk
+          # is the runtime dep. Then install this plugin + dev extras.
+          pip install hermes-agent thenvoi-sdk
+          pip install -e ".[dev]"
+
+      - name: Standalone-load guard
+        run: python scripts/standalone_import_check.py
+
+      - name: Lint
+        run: ruff check hermes_band_platform
+
+      - name: Tests
+        run: python -m pytest tests -q

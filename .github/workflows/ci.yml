@@ -23,9 +23,9 @@ jobs:
       - name: Install host + plugin
         run: |
           python -m pip install --upgrade pip
-          # hermes-agent is the HOST (provides gateway/, tools/, ...); thenvoi-sdk
+          # hermes-agent is the HOST (provides gateway/, tools/, ...); band-sdk
           # is the runtime dep. Then install this plugin + dev extras.
-          pip install hermes-agent 'thenvoi-sdk>=1.0.0,<2.0.0'
+          pip install hermes-agent 'band-sdk>=1.0.0,<2.0.0'
           pip install -e ".[dev]"
 
       - name: Standalone-load guard

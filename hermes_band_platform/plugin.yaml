@@ -3,29 +3,29 @@ label: Band
 kind: platform
 version: 1.0.0
 description: >
-  Band (Thenvoi) gateway adapter for Hermes Agent.
-  Connects a Thenvoi agent to the Band platform over a persistent WebSocket
+  Band gateway adapter for Hermes Agent.
+  Connects a Band agent to the Band platform over a persistent WebSocket
   link and relays text messages between Band chat rooms and the Hermes agent.
-  Wraps the official ``thenvoi-sdk`` ThenvoiLink — it does not reimplement the
-  Thenvoi protocol.  Includes the Band action toolset and the Hermes Hub: an
+  Wraps the official ``band-sdk`` BandLink — it does not reimplement the
+  Band protocol.  Includes the Band action toolset and the Hermes Hub: an
   auto-created owner control room that serves as the Band main channel.
   Slash commands and Band actions are owner-only across all Band rooms.
-author: Thenvoi
+author: Band AI
 # ``requires_env`` entries are surfaced in ``hermes config`` UI via the
 # platform-plugin env var injector in ``hermes_cli/config.py``.
 requires_env:
   - name: BAND_AGENT_ID
-    description: "Thenvoi agent ID (UUID) for this Hermes agent"
+    description: "Band agent ID (UUID) for this Hermes agent"
     prompt: "Band agent ID"
     password: false
   - name: BAND_API_KEY
-    description: "Thenvoi agent API key (authenticates the WebSocket + REST link)"
+    description: "Band agent API key (authenticates the WebSocket + REST link)"
     prompt: "Band API key"
     password: true
     secret: true   # also mask in `hermes plugins install` prompt (reads `secret`)
 optional_env:
   - name: BAND_BASE_URL
-    description: "Band host base URL (default: https://app.thenvoi.com). WS + REST URLs are derived from this host."
+    description: "Band host base URL (default: https://app.band.ai). WS + REST URLs are derived from this host."
     prompt: "Band base URL (or empty for default)"
     password: false
   - name: BAND_OWNER_ID

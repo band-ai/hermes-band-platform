@@ -1,19 +1,19 @@
 ---
 name: add-band
-description: "Use when a user wants to connect their Hermes agent to Band (Thenvoi). Bootstraps the full integration end-to-end: installs the thenvoi SDK, gets or mints Band credentials (programmatic agent registration with fallback to the manual Band UI), persists them, restarts the gateway, and verifies the auto-created Hermes Hub room — leaving the user able to chat with their Hermes agent through any Band chat."
+description: "Use when a user wants to connect their Hermes agent to Band. Bootstraps the full integration end-to-end: installs the band SDK, gets or mints Band credentials (programmatic agent registration with fallback to the manual Band UI), persists them, restarts the gateway, and verifies the auto-created Hermes Hub room — leaving the user able to chat with their Hermes agent through any Band chat."
 version: 1.0.0
 platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [band, thenvoi, messaging, onboarding, setup, integration]
+    tags: [band, messaging, onboarding, setup, integration]
     related_skills: [webhook-subscriptions]
 ---
 
-# Add Band (Thenvoi) to Hermes
+# Add Band to Hermes
 
 ## Overview
 
-Connect this Hermes agent to **Band** (the Thenvoi messaging platform, `app.thenvoi.com`)
+Connect this Hermes agent to **Band** (the Band messaging platform, `app.band.ai`)
 end-to-end. By the end: `BAND_AGENT_ID` + `BAND_API_KEY` are in `~/.hermes/.env`, the gateway
 is connected to Band, a private **"Hermes Agent Hub"** room exists on Band as the agent's main
 channel, and the user can chat with Hermes from any Band chat.
@@ -24,7 +24,7 @@ governed by Band's own ACL (the adapter sets `enforces_own_access_policy=True`),
 Hermes-side allowlist and no pairing codes**: anyone Band lets reach the agent can chat immediately.
 
 **The one thing no code can do is mint the credentials.** That needs a browser action at
-`app.thenvoi.com`. Tell the user this up front, then drive everything else for them.
+`app.band.ai`. Tell the user this up front, then drive everything else for them.
 
 ## When to Use
 
@@ -40,25 +40,25 @@ toolset step), or any non-Band platform.
 - `PY` = the Python interpreter that runs the gateway. In a repo checkout it's `.venv/bin/python`;
   in a `pip install` it's whatever `hermes` runs on. Run commands with that interpreter so imports
   resolve against the gateway's environment.
-- `BASE` = `${BAND_BASE_URL:-https://app.thenvoi.com}` (only differs for self-hosted Band).
+- `BASE` = `${BAND_BASE_URL:-https://app.band.ai}` (only differs for self-hosted Band).
 
 ## Step 1 — Ensure the plugin is installed and enabled
 
-Band needs the `thenvoi-sdk` package importable in the gateway's environment. If it's missing the
+Band needs the `band-sdk` package importable in the gateway's environment. If it's missing the
 platform is **silently skipped** (gateway logs "running with 1 platform(s)" and no `[band]` lines).
 
 ```bash
-PY -c 'import thenvoi; print("thenvoi", thenvoi.__version__)'
+PY -c 'import band; print("band", band.__version__)'
 ```
 
 If that errors, install it:
 
 ```bash
-pip install 'thenvoi-sdk>=1.0.0,<2.0.0'
+pip install 'band-sdk>=1.0.0,<2.0.0'
 ```
 
 > **uv-managed venv (dev checkouts):** if there is no `pip` in the venv, `pip install` fails. Use:
-> `uv pip install --python .venv/bin/python 'thenvoi-sdk>=1.0.0,<2.0.0'`. Note `thenvoi-sdk` may not be in
+> `uv pip install --python .venv/bin/python 'band-sdk>=1.0.0,<2.0.0'`. Note `band-sdk` may not be in
 > `uv.lock`, so a later `uv sync --locked` can remove it — re-run this import check if Band suddenly
 > stops loading.
 
@@ -203,7 +203,7 @@ grants others. Restart the gateway after editing. Then re-verify chat still work
 
 ## Verification Checklist
 
-- [ ] `PY -c 'import thenvoi'` succeeds (SDK installed in the gateway's env)
+- [ ] `PY -c 'import band'` succeeds (SDK installed in the gateway's env)
 - [ ] `BAND_AGENT_ID` + `BAND_API_KEY` present in `~/.hermes/.env` (`band_a_…` key, UUID id)
 - [ ] `hermes gateway restart` ran cleanly
 - [ ] `BAND_HUB_ROOM` is a non-empty UUID in `~/.hermes/.env`

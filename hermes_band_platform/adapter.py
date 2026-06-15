@@ -1,17 +1,17 @@
 """
-Band (Thenvoi) Platform Adapter for Hermes Agent.
+Band Platform Adapter for Hermes Agent.
 
-A plugin-based gateway adapter that connects a Thenvoi agent to the Band
+A plugin-based gateway adapter that connects a Band agent to the Band
 platform and relays text messages between Band chat rooms and the Hermes
-agent.  It wraps the official ``thenvoi-sdk`` :class:`ThenvoiLink` (persistent
-WebSocket + REST client) — it does NOT reimplement the Thenvoi protocol.
+agent.  It wraps the official ``band-sdk`` :class:`BandLink` (persistent
+WebSocket + REST client) — it does NOT reimplement the Band protocol.
 
 Configuration is env-driven (seeded into ``PlatformConfig.extra`` by
 ``_env_enablement`` during gateway config load):
 
-    BAND_AGENT_ID    Thenvoi agent ID (UUID)              [required]
-    BAND_API_KEY     Thenvoi agent API key                [required]
-    BAND_BASE_URL    Band host base URL (default app.thenvoi.com)
+    BAND_AGENT_ID    Band agent ID (UUID)              [required]
+    BAND_API_KEY     Band agent API key                [required]
+    BAND_BASE_URL    Band host base URL (default app.band.ai)
     ... see plugin.yaml for the full optional set.
 
 Memory preload/write-through and cron standalone delivery are deferred to
@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Lazy SDK import guard.
 #
-# Mirror the slack/discord module-top pattern: try to import the Thenvoi SDK
+# Mirror the slack/discord module-top pattern: try to import the Band SDK
 # symbols we drive directly.  When the SDK isn't installed the module must
 # still import cleanly (the gateway discovers plugins before deps are
 # guaranteed present), so we fall back to ``BAND_AVAILABLE = False`` and bind
@@ -68,14 +68,14 @@ logger = logging.getLogger(__name__)
 # shadowed.
 # ---------------------------------------------------------------------------
 try:
-    from thenvoi.platform.link import ThenvoiLink
-    from thenvoi.platform.event import (
+    from band.platform.link import BandLink
+    from band.platform.event import (
         MessageEvent as BandMessageEvent,
         RoomAddedEvent,
         RoomRemovedEvent,
         RoomDeletedEvent,
     )
-    from thenvoi.client.rest import (
+    from band.client.rest import (
         ChatMessageRequest,
         ChatMessageRequestMentionsItem,
         ChatRoomRequest,
@@ -86,7 +86,7 @@ try:
     BAND_AVAILABLE = True
 except ImportError:
     BAND_AVAILABLE = False
-    ThenvoiLink = None
+    BandLink = None
     BandMessageEvent = None
     RoomAddedEvent = None
     RoomRemovedEvent = None
@@ -98,9 +98,9 @@ except ImportError:
     DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
 
 
-# Default Band host — matches the SDK's own ThenvoiLink defaults
-# (wss://app.thenvoi.com/api/v1/socket/websocket, https://app.thenvoi.com).
-_DEFAULT_BAND_HOST = "app.thenvoi.com"
+# Default Band host — matches the SDK's own BandLink defaults
+# (wss://app.band.ai/api/v1/socket/websocket, https://app.band.ai).
+_DEFAULT_BAND_HOST = "app.band.ai"
 
 # Backstop cap for the sent-message-id dedup set; evict half when exceeded.
 _SENT_IDS_MAX = 5000
@@ -195,7 +195,7 @@ class BandAdapter(BasePlatformAdapter):
     """Async Band adapter implementing the BasePlatformAdapter interface.
 
     Instantiated by the ``adapter_factory`` passed to ``register_platform()``.
-    Drives :class:`ThenvoiLink` directly (NOT ``Agent.run()``): a persistent
+    Drives :class:`BandLink` directly (NOT ``Agent.run()``): a persistent
     WebSocket link surfaces inbound events through ``async for event in link``,
     and outbound messages post via the REST client.
     """
@@ -322,7 +322,7 @@ class BandAdapter(BasePlatformAdapter):
     # ── Connection lifecycle ──────────────────────────────────────────────
 
     async def connect(self) -> bool:
-        """Open the Thenvoi link, resolve identity, subscribe, start consuming."""
+        """Open the Band link, resolve identity, subscribe, start consuming."""
         # Reset per-connect hub failover state so a reconnect starts clean.
         self._hub_send_failures = 0
         self._failover_in_progress = False
@@ -330,11 +330,11 @@ class BandAdapter(BasePlatformAdapter):
 
         if not BAND_AVAILABLE:
             logger.error(
-                "[band] thenvoi-sdk not installed. Run: pip install 'thenvoi-sdk>=1.0.0,<2.0.0'",
+                "[band] band-sdk not installed. Run: pip install 'band-sdk>=1.0.0,<2.0.0'",
             )
             self._set_fatal_error(
                 "dependency_missing",
-                "thenvoi-sdk not installed",
+                "band-sdk not installed",
                 retryable=False,
             )
             return False
@@ -374,7 +374,7 @@ class BandAdapter(BasePlatformAdapter):
         ws_url, rest_url = _derive_urls(self._base_url)
 
         try:
-            self._link = ThenvoiLink(self._cfg_agent_id, self._api_key, ws_url, rest_url)
+            self._link = BandLink(self._cfg_agent_id, self._api_key, ws_url, rest_url)
             await self._link.connect()
 
             # Resolve identity — the authoritative agent UUID + handle + owner.
@@ -1626,18 +1626,18 @@ class BandAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 def check_band_requirements() -> bool:
-    """Check (and lazily bind) the Thenvoi SDK symbols this adapter needs.
+    """Check (and lazily bind) the Band SDK symbols this adapter needs.
 
     Self-contained lazy import to honor the zero-core-edits constraint: it
     ``global``s the SDK symbols + the ``BAND_AVAILABLE`` flag, imports the
     specific names inside the function, binds them to module globals, and
     returns True; on ImportError it returns False.
 
-    To enable Hermes auto-install, a ``'platform.band': ('thenvoi-sdk>=1.0.0,<2.0.0',)``
+    To enable Hermes auto-install, a ``'platform.band': ('band-sdk>=1.0.0,<2.0.0',)``
     entry could be added to tools/lazy_deps.py and this could use
     ``tools.lazy_deps.ensure_and_bind``; deferred to keep zero core edits.
     """
-    global BAND_AVAILABLE, ThenvoiLink, BandMessageEvent
+    global BAND_AVAILABLE, BandLink, BandMessageEvent
     global RoomAddedEvent, RoomRemovedEvent, RoomDeletedEvent
     global ChatMessageRequest, ChatMessageRequestMentionsItem
     global ChatRoomRequest, ParticipantRequest, DEFAULT_REQUEST_OPTIONS
@@ -1645,14 +1645,14 @@ def check_band_requirements() -> bool:
     if BAND_AVAILABLE:
         return True
     try:
-        from thenvoi.platform.link import ThenvoiLink as _ThenvoiLink
-        from thenvoi.platform.event import (
+        from band.platform.link import BandLink as _BandLink
+        from band.platform.event import (
             MessageEvent as _BandMessageEvent,
             RoomAddedEvent as _RoomAddedEvent,
             RoomRemovedEvent as _RoomRemovedEvent,
             RoomDeletedEvent as _RoomDeletedEvent,
         )
-        from thenvoi.client.rest import (
+        from band.client.rest import (
             ChatMessageRequest as _ChatMessageRequest,
             ChatMessageRequestMentionsItem as _ChatMessageRequestMentionsItem,
             ChatRoomRequest as _ChatRoomRequest,
@@ -1662,7 +1662,7 @@ def check_band_requirements() -> bool:
     except ImportError:
         return False
 
-    ThenvoiLink = _ThenvoiLink
+    BandLink = _BandLink
     BandMessageEvent = _BandMessageEvent
     RoomAddedEvent = _RoomAddedEvent
     RoomRemovedEvent = _RoomRemovedEvent
@@ -1745,7 +1745,7 @@ def _env_enablement() -> dict | None:
 
 
 def interactive_setup() -> None:
-    """Guide the user through Band (Thenvoi) credential setup.
+    """Guide the user through Band credential setup.
 
     Mirrors the Discord / ``_setup_standard_platform`` shape: lazy-imports the
     CLI helpers so the plugin's import surface stays small and prompts for the
@@ -1771,12 +1771,12 @@ def interactive_setup() -> None:
         print_warning,
     )
 
-    print_header("Band (Thenvoi)")
+    print_header("Band")
 
     # Step-by-step credential instructions. Agent creation lives on the Agents
     # page (/agents/new) — NOT Settings, which only holds REST API keys + profile.
     # The agent's API key is shown once in the creation modal.
-    print_info("To connect Hermes to Band you need a Thenvoi agent's ID and API key:")
+    print_info("To connect Hermes to Band you need a Band agent's ID and API key:")
     print_info("  1. Open the Band app and go to the Agents page (/agents/new).")
     print_info("  2. Create a new external agent (or open an existing one).")
     print_info("  3. Copy the Agent ID (a UUID) and the agent's API key (shown once).")
@@ -1806,10 +1806,10 @@ def interactive_setup() -> None:
     save_env_value("BAND_API_KEY", api_key)
     print_success("Saved BAND_API_KEY")
 
-    # Optional base URL (empty → adapter default app.thenvoi.com).
+    # Optional base URL (empty → adapter default app.band.ai).
     print_info("")
     print_info("Band host (only override for self-hosted / non-default Band).")
-    base_url = prompt("Band base URL (leave empty for app.thenvoi.com)")
+    base_url = prompt("Band base URL (leave empty for app.band.ai)")
     if base_url:
         save_env_value("BAND_BASE_URL", base_url)
         print_success("Saved BAND_BASE_URL")
@@ -1839,7 +1839,7 @@ def register(ctx) -> None:
         validate_config=validate_config,
         is_connected=_is_connected,
         required_env=["BAND_AGENT_ID", "BAND_API_KEY"],
-        install_hint="pip install 'thenvoi-sdk>=1.0.0,<2.0.0'",
+        install_hint="pip install 'band-sdk>=1.0.0,<2.0.0'",
         # Interactive setup wizard — gives Band the same native ``hermes gateway
         # setup`` flow as Slack/Discord (called with no args via this hook).
         setup_fn=interactive_setup,
@@ -1853,7 +1853,7 @@ def register(ctx) -> None:
         emoji="🎵",
         # LLM guidance
         platform_hint=(
-            "You are chatting via Band (Thenvoi). Conversations happen in rooms "
+            "You are chatting via Band. Conversations happen in rooms "
             "(not threads); Band has no DMs, so every room is a group room. You "
             "only see messages that @mention you — including in your owner's hub "
             "(control room) — so each turn addressed to you must @mention you. "
@@ -1899,7 +1899,7 @@ def register(ctx) -> None:
             ctx.register_skill(
                 "add-band",
                 _skill_md,
-                description="Connect this Hermes agent to Band (Thenvoi) end-to-end.",
+                description="Connect this Hermes agent to Band end-to-end.",
             )
     except AttributeError:
         # Older host without ctx.register_skill — skip the skill silently.

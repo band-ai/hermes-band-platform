@@ -1,11 +1,11 @@
-"""Tests for the Band (Thenvoi) action tools (``hermes_band_platform/tools.py``).
+"""Tests for the Band action tools (``hermes_band_platform/tools.py``).
 
 These cover the tools pass (Build Plan Step 6): the seven ``band_*`` action
 tools, the room-resolution matrix, and the owner gate.
 
 Strategy
 --------
-The thenvoi SDK *is* importable here (the request types tools.py constructs —
+The band SDK *is* importable here (the request types tools.py constructs —
 ``ChatRoomRequest`` / ``ParticipantRequest`` / ``ChatMessageRequest`` /
 ``ChatMessageRequestMentionsItem`` — bind at module import).  Each tool's REST
 calls are mocked by patching ``tools._rest`` to return a fake async REST client

@@ -1,9 +1,9 @@
-# Band (Thenvoi) Platform for Hermes
+# Band Platform for Hermes
 
-Connects a Hermes agent to the **Band** platform (Thenvoi) over a persistent
+Connects a Hermes agent to the **Band** platform (Band) over a persistent
 WebSocket link and relays text messages between Band chat rooms and the agent.
-It wraps the official [`thenvoi-sdk`](https://pypi.org/project/thenvoi-sdk/)
-`ThenvoiLink` — it does **not** reimplement the Thenvoi protocol. Beyond
+It wraps the official [`band-sdk`](https://pypi.org/project/band-sdk/)
+`BandLink` — it does **not** reimplement the Band protocol. Beyond
 messaging, it registers a `band` action toolset and bootstraps a **Hermes Hub**:
 a private owner↔agent control room that serves as the Band main channel. Slash
 commands and mutating Band actions are owner-only in every Band room.
@@ -13,7 +13,7 @@ commands and mutating Band actions are owner-only in every Band room.
 You need a **Band account** and a Band **agent's credentials**, minted in a
 browser (no API can do this for you):
 
-1. Go to **app.thenvoi.com/agents/new** — the Agents page, *not* Settings (which
+1. Go to **app.band.ai/agents/new** — the Agents page, *not* Settings (which
    only holds REST API keys).
 2. Create an external agent; copy its **Agent ID** (a UUID) → `BAND_AGENT_ID`.
 3. Copy the agent's **API key** (`band_a_…`) → `BAND_API_KEY`. **It's shown
@@ -30,7 +30,7 @@ couple of manual touches on stock Hermes.
 ### Directory plugin (recommended)
 
 ```bash
-hermes plugins install thenvoi/hermes-band-platform --enable
+hermes plugins install band-ai/hermes-band-platform --enable
 ```
 
 This clones the plugin into `~/.hermes/plugins/band`, prompts you for
@@ -39,8 +39,8 @@ their own dependencies, so install the SDK into the SAME environment as the
 gateway:
 
 ```bash
-pip install 'thenvoi-sdk>=1.0.0,<2.0.0'
-#   uv-managed venv (no pip): uv pip install --python .venv/bin/python 'thenvoi-sdk>=1.0.0,<2.0.0'
+pip install 'band-sdk>=1.0.0,<2.0.0'
+#   uv-managed venv (no pip): uv pip install --python .venv/bin/python 'band-sdk>=1.0.0,<2.0.0'
 ```
 
 Then `hermes gateway restart`.
@@ -48,7 +48,7 @@ Then `hermes gateway restart`.
 ### pip
 
 ```bash
-pip install hermes-band-platform   # also pulls in thenvoi-sdk
+pip install hermes-band-platform   # also pulls in band-sdk
 ```
 
 The plugin is discovered automatically but is **opt-in**. On a Hermes build that
@@ -89,10 +89,10 @@ then enable it by name:
         pname = "hermes-band-platform";
         version = "1.0.0";
         format = "pyproject";
-        src = ./.; # or fetchFromGitHub { owner = "thenvoi"; repo = "hermes-band-platform"; ... }
+        src = ./.; # or fetchFromGitHub { owner = "band-ai"; repo = "hermes-band-platform"; ... }
         nativeBuildInputs = [ ps.setuptools ];
-        # thenvoi-sdk must be available to Nix (see note below).
-        propagatedBuildInputs = [ ps.thenvoi-sdk ];
+        # band-sdk must be available to Nix (see note below).
+        propagatedBuildInputs = [ ps.band-sdk ];
       })
     ];
 
@@ -102,7 +102,7 @@ then enable it by name:
 }
 ```
 
-> **Note:** `thenvoi-sdk` is not (yet) in nixpkgs. Package it from PyPI yourself
+> **Note:** `band-sdk` is not (yet) in nixpkgs. Package it from PyPI yourself
 > (e.g. with `buildPythonPackage` / `poetry2nix` / `pip2nix`) and pass it in as a
 > dependency so the plugin can import it.
 
@@ -144,14 +144,14 @@ means you're live. If you see `[band] Owner unresolved — hub disabled`, set
 
 | Variable | Description |
 | --- | --- |
-| `BAND_AGENT_ID` | Thenvoi agent ID (UUID) for this Hermes agent. |
-| `BAND_API_KEY` | Thenvoi agent API key. Authenticates the WebSocket + REST link. Never logged. |
+| `BAND_AGENT_ID` | Band agent ID (UUID) for this Hermes agent. |
+| `BAND_API_KEY` | Band agent API key. Authenticates the WebSocket + REST link. Never logged. |
 
 ### Optional
 
 | Variable | Description |
 | --- | --- |
-| `BAND_BASE_URL` | Band host base URL (default `https://app.thenvoi.com`). WS + REST URLs are derived from this host. |
+| `BAND_BASE_URL` | Band host base URL (default `https://app.band.ai`). WS + REST URLs are derived from this host. |
 | `BAND_ALLOWED_USERS` | Comma-separated Band user IDs allowed to talk to the agent. **Optional** — Band's own ACL is trusted by default (`enforces_own_access_policy`); set this only to narrow access below what Band already permits. |
 | `BAND_ALLOW_ALL` | Explicitly allow anyone in a room to talk to the agent. Redundant with the default Band-ACL trust; mainly useful to override a `BAND_ALLOWED_USERS` restriction. |
 | `BAND_TOOL_OWNERS` | Comma-separated `platform:user_id` identities allowed to drive Band actions (e.g. `telegram:<tg-id>`). The resolved Band owner is always authorized from Band rooms; this allowlist grants others. **Fail-closed** otherwise. |
@@ -231,7 +231,7 @@ resolved, Band slash commands are refused everywhere. File-path-like text
 The plugin registers a `band` toolset so the agent can **act on Band** — create
 rooms, look people up, add/remove participants, and send messages — from *any*
 conversation it is in (a Band room, Telegram, or the CLI). All tools are async
-and call the Thenvoi REST API directly through the live adapter's authenticated
+and call the Band REST API directly through the live adapter's authenticated
 link (with an env-credential fallback for out-of-process use).
 
 The tools split into two tiers:

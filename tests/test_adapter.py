@@ -1,8 +1,8 @@
-"""Tests for the Band (Thenvoi) platform adapter.
+"""Tests for the Band platform adapter.
 
-The thenvoi SDK stub is installed by ``tests/conftest.py`` at collection time,
+The band SDK stub is installed by ``tests/conftest.py`` at collection time,
 BEFORE this module imports the adapter — so the adapter's top-level
-``try: from thenvoi ...`` binds the stub and ``BAND_AVAILABLE`` stays True.
+``try: from band ...`` binds the stub and ``BAND_AVAILABLE`` stays True.
 """
 
 import asyncio
@@ -136,7 +136,7 @@ class TestBandAdapterInit:
 class TestCheckBandRequirements:
 
     def test_returns_true_when_band_available(self):
-        # The adapter was loaded with the thenvoi stub installed, so
+        # The adapter was loaded with the band stub installed, so
         # BAND_AVAILABLE was set True at import time.
         assert _band_mod.BAND_AVAILABLE is True
         assert check_band_requirements() is True
@@ -145,12 +145,12 @@ class TestCheckBandRequirements:
         # Simulate the SDK being absent by patching the module global.
         monkeypatch.setattr(_band_mod, "BAND_AVAILABLE", False)
         # Make the lazy import path fail. Popping the stubs isn't enough when
-        # the real ``thenvoi`` SDK is installed on disk (it would just be
+        # the real ``band`` SDK is installed on disk (it would just be
         # re-imported), so we *block* the import by parking ``None`` at each
-        # ``thenvoi.*`` key — Python raises ImportError on a ``None`` entry.
+        # ``band.*`` key — Python raises ImportError on a ``None`` entry.
         saved = {}
         for key in list(sys.modules):
-            if key == "thenvoi" or key.startswith("thenvoi."):
+            if key == "band" or key.startswith("band."):
                 saved[key] = sys.modules.pop(key)
         for key in saved:
             sys.modules[key] = None
@@ -284,13 +284,13 @@ class TestDeriveUrls:
 
     def test_default_host_when_no_base_url(self):
         ws, rest = _derive_urls("")
-        assert ws == "wss://app.thenvoi.com/api/v1/socket/websocket"
-        assert rest == "https://app.thenvoi.com"
+        assert ws == "wss://app.band.ai/api/v1/socket/websocket"
+        assert rest == "https://app.band.ai"
 
     def test_default_host_when_base_url_is_none(self):
         ws, rest = _derive_urls(None)
-        assert ws == "wss://app.thenvoi.com/api/v1/socket/websocket"
-        assert rest == "https://app.thenvoi.com"
+        assert ws == "wss://app.band.ai/api/v1/socket/websocket"
+        assert rest == "https://app.band.ai"
 
     def test_custom_host_from_full_https_url(self):
         ws, rest = _derive_urls("https://myband.example.com")
@@ -1402,7 +1402,7 @@ class TestConnectDisconnect:
             lambda scope, identity: None,
         )
 
-        # Build a fake ThenvoiLink instance
+        # Build a fake BandLink instance
         fake_link = MagicMock()
         fake_link.connect = AsyncMock()
         fake_link.subscribe_agent_rooms = AsyncMock()
@@ -1427,8 +1427,8 @@ class TestConnectDisconnect:
         fake_link.__aiter__ = lambda self: self
         fake_link.__anext__ = AsyncMock(side_effect=StopAsyncIteration)
 
-        # Patch ThenvoiLink class in the band module
-        monkeypatch.setattr(_band_mod, "ThenvoiLink", lambda *a, **kw: fake_link)
+        # Patch BandLink class in the band module
+        monkeypatch.setattr(_band_mod, "BandLink", lambda *a, **kw: fake_link)
 
         result = await adapter.connect()
         assert result is True
@@ -1455,7 +1455,7 @@ class TestConnectDisconnect:
         def _bad_link(*a, **kw):
             raise ConnectionError("refused")
 
-        monkeypatch.setattr(_band_mod, "ThenvoiLink", _bad_link)
+        monkeypatch.setattr(_band_mod, "BandLink", _bad_link)
         result = await adapter.connect()
         assert result is False
 

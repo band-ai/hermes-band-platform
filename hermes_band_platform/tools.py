@@ -1,5 +1,5 @@
 """
-Band (Thenvoi) action tools for the Hermes agent.
+Band action tools for the Hermes agent.
 
 This module is the **tools pass** companion to ``adapter.py`` (the messaging
 adapter).  Where the adapter relays inbound/outbound *messages*, these tools let
@@ -9,7 +9,7 @@ CLI, …).
 
 Design anchors (see ``Drafts/hermes-band-tools-events-buildplan.md``):
 
-  * **Native REST.** Handlers drive the Thenvoi ``AsyncRestClient`` directly,
+  * **Native REST.** Handlers drive the Band ``AsyncRestClient`` directly,
     reusing the *live* :class:`BandAdapter`'s authenticated link when the
     gateway is in-process, and falling back to a fresh client from env creds for
     out-of-process callers (cron, tests).
@@ -25,7 +25,7 @@ Design anchors (see ``Drafts/hermes-band-tools-events-buildplan.md``):
     setup needs no second allowlist).  Read-only tools (find/get) bypass the gate.
 
 Conventions mirrored from ``adapter.py``: lazy SDK import (the module imports
-cleanly when ``thenvoi-sdk`` is absent), ``_short_id`` for low-cardinality logs,
+cleanly when ``band-sdk`` is absent), ``_short_id`` for low-cardinality logs,
 and API keys are **never** logged.
 """
 
@@ -57,13 +57,13 @@ logger = logging.getLogger(__name__)
 #
 # The request *types* we construct (ChatRoomRequest / ParticipantRequest) are
 # imported lazily — like the adapter's module-top guard — so this module loads
-# even when ``thenvoi-sdk`` isn't installed (plugin discovery runs before deps
+# even when ``band-sdk`` isn't installed (plugin discovery runs before deps
 # are guaranteed present). ``check_band_requirements()`` (re)binds the names on
 # demand; ``_load_sdk()`` below re-imports inside handlers so a late install is
 # picked up without a process restart.
 # ---------------------------------------------------------------------------
 try:
-    from thenvoi.client.rest import (  # noqa: F401
+    from band.client.rest import (  # noqa: F401
         ChatMessageRequest,
         ChatMessageRequestMentionsItem,
         ChatRoomRequest,
@@ -109,7 +109,7 @@ def _load_sdk() -> bool:
     if ChatRoomRequest is not None:
         return True
     try:
-        from thenvoi.client.rest import (
+        from band.client.rest import (
             ChatMessageRequest as _ChatMessageRequest,
             ChatMessageRequestMentionsItem as _ChatMessageRequestMentionsItem,
             ChatRoomRequest as _ChatRoomRequest,
@@ -165,8 +165,8 @@ async def _rest() -> Any:
         pass
 
     if not _load_sdk():
-        raise _ToolUnavailable("Band not available (thenvoi-sdk not installed)")
-    from thenvoi.client.rest import AsyncRestClient
+        raise _ToolUnavailable("Band not available (band-sdk not installed)")
+    from band.client.rest import AsyncRestClient
 
     api_key = os.getenv("BAND_API_KEY", "").strip()
     if not api_key:
@@ -377,7 +377,7 @@ async def _mentions_for(
     participant in the room. Raises ``_ToolError`` if the result is empty.
     """
     if not _load_sdk():
-        raise _ToolUnavailable("Band not available (thenvoi-sdk not installed)")
+        raise _ToolUnavailable("Band not available (band-sdk not installed)")
 
     # Fetch participants once for handle resolution / fallback mentions.
     participants = await _list_participants(rest, room_id)
@@ -474,7 +474,7 @@ async def _handle_create_room(args: dict, **kwargs) -> str:
     try:
         _require_owner()
         if not _load_sdk():
-            raise _ToolUnavailable("Band not available (thenvoi-sdk not installed)")
+            raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
 
         created = await rest.agent_api_chats.create_agent_chat(
@@ -615,7 +615,7 @@ async def _handle_send_message(args: dict, **kwargs) -> str:
     try:
         _require_owner()
         if not _load_sdk():
-            raise _ToolUnavailable("Band not available (thenvoi-sdk not installed)")
+            raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
         room_id = _resolve_room(args)
 
@@ -651,7 +651,7 @@ async def _handle_add_participant(args: dict, **kwargs) -> str:
     try:
         _require_owner()
         if not _load_sdk():
-            raise _ToolUnavailable("Band not available (thenvoi-sdk not installed)")
+            raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
         room_id = _resolve_room(args)
 

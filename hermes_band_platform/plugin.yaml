@@ -10,7 +10,7 @@ description: >
   Band protocol.  Includes the Band action toolset and the Hermes Hub: an
   auto-created owner control room that serves as the Band main channel.
   Slash commands and Band actions are owner-only across all Band rooms.
-author: Band AI
+author: Thenvoi Inc
 # ``requires_env`` entries are surfaced in ``hermes config`` UI via the
 # platform-plugin env var injector in ``hermes_cli/config.py``.
 requires_env:

@@ -9,7 +9,7 @@ description = "Band platform adapter for the Hermes Agent gateway."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Band AI" }]
+authors = [{ name = "Thenvoi Inc" }]
 dependencies = ["band-sdk>=1.0.0,<2.0.0"]
 
 [project.optional-dependencies]

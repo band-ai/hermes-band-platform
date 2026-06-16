@@ -10,32 +10,41 @@
     in
     {
       # The plugin packaged as a Python package (format = pyproject).
-      #
-      # NOTE: `band-sdk` is the runtime dependency and is not (yet) in
-      # nixpkgs — you must provide it. Override `propagatedBuildInputs` (or
-      # supply it via an overlay) so the plugin can import it at runtime, e.g.:
-      #
-      #   self.packages.${system}.default.override {
-      #     # ... wire in a band-sdk derivation built from PyPI ...
-      #   }
       packages = forAll (pkgs:
         let
           py = pkgs.python311Packages;
+          defaultBandSdk =
+            if py ? "band-sdk" then py."band-sdk" else
+            throw ''
+              band-sdk is not available in this nixpkgs Python package set.
+              Provide it explicitly:
+
+                self.packages.${pkgs.system}.default.override {
+                  bandSdk = <your band-sdk Python derivation>;
+                }
+
+              Build band-sdk from PyPI, poetry2nix, pip2nix, or an overlay, then
+              pass that derivation here so hermes_band_platform can import band
+              at runtime.
+            '';
+          plugin = py.callPackage (
+            { buildPythonPackage, setuptools, bandSdk ? defaultBandSdk }:
+            buildPythonPackage {
+              pname = "hermes-band-platform";
+              version = "1.0.0"; # x-release-please-version
+              format = "pyproject";
+              src = ./.;
+              nativeBuildInputs = [ setuptools ];
+              propagatedBuildInputs = [ bandSdk ];
+              # Tests need the hermes-agent host on PYTHONPATH; skip in the build.
+              doCheck = false;
+              pythonImportsCheck = [ "hermes_band_platform" ];
+              passthru.note = "Enable as Hermes plugin \"band\" after adding to the gateway Python environment.";
+            }
+          ) { };
         in
         {
-          default = py.buildPythonPackage {
-            pname = "hermes-band-platform";
-            version = "1.0.0";
-            format = "pyproject";
-            src = ./.;
-            nativeBuildInputs = [ py.setuptools ];
-            # band-sdk goes here once packaged (see note above).
-            propagatedBuildInputs = [ ];
-            # Tests need the hermes-agent host on PYTHONPATH; skip in the build.
-            doCheck = false;
-            pythonImportsCheck = [ ];
-            passthru.note = "Provide band-sdk (PyPI) as a runtime dep; enable as plugin \"band\".";
-          };
+          default = plugin;
         });
     };
 }

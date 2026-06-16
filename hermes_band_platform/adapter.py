@@ -1584,10 +1584,11 @@ class BandAdapter(BasePlatformAdapter):
 
         Caps the set at ``_SENT_IDS_MAX``; evicts half (arbitrary) when over.
         """
-        self._sent_ids.add(sent_id)
-        if len(self._sent_ids) > _SENT_IDS_MAX:
-            for _ in range(_SENT_IDS_MAX // 2):
+        if len(self._sent_ids) >= _SENT_IDS_MAX:
+            target = _SENT_IDS_MAX // 2
+            for _ in range(max(0, len(self._sent_ids) - target)):
                 self._sent_ids.pop()
+        self._sent_ids.add(sent_id)
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:

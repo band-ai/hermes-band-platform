@@ -8,7 +8,7 @@ BEFORE this module imports the adapter — so the adapter's top-level
 import asyncio
 import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

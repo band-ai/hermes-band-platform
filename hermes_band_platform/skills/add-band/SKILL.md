@@ -1,6 +1,6 @@
 ---
 name: add-band
-description: "Use when a user wants to connect their Hermes agent to Band. Bootstraps the full integration end-to-end: installs the band SDK, gets or mints Band credentials (programmatic agent registration with fallback to the manual Band UI), persists them, restarts the gateway, and verifies the auto-created Hermes Hub room — leaving the user able to chat with their Hermes agent through any Band chat."
+description: "Connect Hermes to Band end-to-end."
 version: 1.0.0
 platforms: [linux, macos, windows]
 metadata:
@@ -9,204 +9,122 @@ metadata:
     related_skills: [webhook-subscriptions]
 ---
 
-# Add Band to Hermes
+# Add Band Skill
 
-## Overview
+Connect a Hermes agent to Band from install through verification. This skill sets up the Hermes side and can optionally mint a Band external agent when the user provides a temporary user API key, but it does not keep user-level credentials after registration.
 
-Connect this Hermes agent to **Band** (the Band messaging platform, `app.band.ai`)
-end-to-end. By the end: `BAND_AGENT_ID` + `BAND_API_KEY` are in `~/.hermes/.env`, the gateway
-is connected to Band, a private **"Hermes Agent Hub"** room exists on Band as the agent's main
-channel, and the user can chat with Hermes from any Band chat.
-
-Almost everything is automatic once credentials exist. The Band adapter resolves the owner and
-**creates the hub room itself** on first connect — you do not call an API to make it. Access is
-governed by Band's own ACL (the adapter sets `enforces_own_access_policy=True`), so there is **no
-Hermes-side allowlist and no pairing codes**: anyone Band lets reach the agent can chat immediately.
-
-**The one thing no code can do is mint the credentials.** That needs a browser action at
-`app.band.ai`. Tell the user this up front, then drive everything else for them.
+Band rooms are mention-gated and Band owns access control. The plugin creates a private Hermes Hub room on first gateway connect and stores only agent-scoped credentials in Hermes.
 
 ## When to Use
 
-- A user asks to "connect Hermes to Band", "set up Band", "add the Band platform", or similar.
-- You're onboarding a fresh Hermes install onto Band for the first time.
+- The user asks to connect Hermes to Band or install the Band platform.
+- A fresh Hermes gateway needs Band credentials, plugin enablement, gateway restart, and hub verification.
+- The user wants the optional Band action toolset after chat already works.
 
-**Don't use for:** debugging an already-connected Band agent (read `~/.hermes/logs/gateway.log`
-directly), enabling Band *tools* on an agent that already chats on Band (jump to the optional
-toolset step), or any non-Band platform.
+Do not use this skill for ordinary Band chat troubleshooting after setup; inspect gateway logs and the adapter state directly instead.
 
-## Conventions used below
+## Prerequisites
 
-- `PY` = the Python interpreter that runs the gateway. In a repo checkout it's `.venv/bin/python`;
-  in a `pip install` it's whatever `hermes` runs on. Run commands with that interpreter so imports
-  resolve against the gateway's environment.
-- `BASE` = `${BAND_BASE_URL:-https://app.band.ai}` (only differs for self-hosted Band).
+- Hermes is installed and the gateway runs in the target Python environment.
+- The `hermes-band-platform` plugin is installed by directory, pip, or Nix.
+- The Band SDK is importable in the same Python environment as the gateway.
+- The user can provide either:
+  - Band agent credentials from `app.band.ai/agents/new`: `BAND_AGENT_ID` and `BAND_API_KEY`, or
+  - a short-lived user API key in `BAND_USER_API_KEY` for automated Enterprise registration.
 
-## Step 1 — Ensure the plugin is installed and enabled
+Never ask the user to paste a Band user API key into a command line. Ask them to set it as `BAND_USER_API_KEY` for the one registration step, then remove it.
 
-Band needs the `band-sdk` package importable in the gateway's environment. If it's missing the
-platform is **silently skipped** (gateway logs "running with 1 platform(s)" and no `[band]` lines).
+## How to Run
 
-```bash
-PY -c 'import band; print("band", band.__version__)'
-```
+Use the `terminal` tool for commands and the helper scripts shipped with this skill. Run scripts with the same Python interpreter that runs Hermes.
 
-If that errors, install it:
+Skill helper paths are relative to this skill directory:
 
-```bash
-pip install 'band-sdk>=1.0.0,<2.0.0'
-```
+- `scripts/register_agent.py`
+- `scripts/verify_install.py`
+- `scripts/verify_gateway.py`
 
-> **uv-managed venv (dev checkouts):** if there is no `pip` in the venv, `pip install` fails. Use:
-> `uv pip install --python .venv/bin/python 'band-sdk>=1.0.0,<2.0.0'`. Note `band-sdk` may not be in
-> `uv.lock`, so a later `uv sync --locked` can remove it — re-run this import check if Band suddenly
-> stops loading.
+The setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
 
-**Enablement.** A plugin dropped into `~/.hermes/plugins/band/` is opt-in and does **not** auto-load
-(only plugins bundled under `plugins/platforms/` do). Enable it once:
+## Quick Reference
+
+Directory plugin install:
 
 ```bash
-hermes plugins list | grep -i band      # discovered? enabled?
-hermes plugins enable band              # run if listed-but-not-enabled (skip for bundled builds)
+hermes plugins install band-ai/hermes-band-platform --enable
 ```
 
-Re-run the import check until it prints a version, and confirm the plugin is enabled, before continuing.
-
-## Step 2 — Get and store Band credentials
-
-You need `BAND_AGENT_ID` (a UUID) and `BAND_API_KEY` (`band_a_…`, shown once). **Credential
-collection and storage are delegated to the Band setup wizard** — it prompts for both, masks the key,
-writes them to `~/.hermes/.env` with the correct routing, and shows the right agent-creation path.
-Don't hand-write `.env` or re-implement the prompts here.
-
-### Default — run the wizard
-
-Have the user run, in their own terminal:
+Pip install:
 
 ```bash
-hermes gateway setup        # then choose "Band" 🎵 from the platform list
+pip install hermes-band-platform
+hermes plugins enable band
 ```
 
-The wizard walks them through creating the agent at `/agents/new` and pasting the **Agent ID** +
-**API key** (there is no `hermes gateway setup band` subcommand — it's an interactive picker). When
-they confirm they're done, verify the values landed:
+Verify install:
 
 ```bash
-PY -c "from hermes_cli.config import get_env_value as g; \
-print('BAND_AGENT_ID', bool(g('BAND_AGENT_ID')), '| BAND_API_KEY', bool(g('BAND_API_KEY')))"
+python scripts/verify_install.py
 ```
 
-Both `True` → continue. If not, the wizard was cancelled or `.env` writes are blocked (managed mode);
-re-run it, or have the user set the two vars by hand.
-
-### Optional accelerator — register the agent for them (Enterprise)
-
-To skip browser agent-creation, offer this *before* the wizard: ask for a **user** API key
-(`band_u_…`, created at **Settings → REST API Keys**) and register the agent in one call:
+Optional Enterprise registration:
 
 ```bash
-curl -sS -X POST "BASE/api/v1/me/agents/register" \
-  -H "X-API-Key: <band_u_key>" -H "Content-Type: application/json" \
-  -d '{"agent":{"name":"Hermes","description":"Hermes AI gateway agent"}}'
+python scripts/register_agent.py
 ```
 
-On HTTP 201, read `.data.agent.id` and `.data.credentials.api_key`, then persist them **directly** —
-the wizard can't mint, so the skill stores them here. Use `save_env_value`, **not** `hermes config
-set` (`BAND_AGENT_ID` ends in `_ID`, which routes to `config.yaml`, not `.env`):
+Verify gateway and hub:
 
 ```bash
-PY -c "from hermes_cli.config import save_env_value as s; \
-s('BAND_AGENT_ID','<uuid>'); s('BAND_API_KEY','<band_a_key>')"
+python scripts/verify_gateway.py
 ```
 
-Discard the `band_u_` key — it's only for this call (name ≥ 3 chars, description ≥ 10). On **403**
-(`plan_required`, non-Enterprise) or no user key → just use the wizard above.
+## Procedure
 
-## Step 3 — Restart the gateway
+1. Confirm the plugin is installed and enabled.
+   - For directory installs, use `hermes plugins install band-ai/hermes-band-platform --enable`.
+   - For pip installs, use `pip install hermes-band-platform`, then `hermes plugins enable band`.
+   - For Nix installs, ensure the package and `band-sdk` are in the gateway Python environment and `plugins.enabled` contains `band`.
 
-```bash
-hermes gateway restart
-```
+2. Verify the local install with `scripts/verify_install.py`.
+   - If `sdk_importable` is false, install `band-sdk>=1.0.0,<2.0.0` into the gateway environment.
+   - If `plugin_enabled` is false, enable `band`.
+   - If credential checks are false, continue to credential collection.
 
-On this connect the adapter resolves the owner from the agent identity, runs `_ensure_hub()`,
-**creates the "Hermes Agent Hub" room on Band**, posts an @owner greeting, persists `BAND_HUB_ROOM`
-to `~/.hermes/.env`, and wires the hub as the main channel — all automatic.
+3. Collect agent credentials.
+   - Preferred manual path: have the user create an external agent at `app.band.ai/agents/new`, then run the Band setup wizard or save `BAND_AGENT_ID` and `BAND_API_KEY` with Hermes's env writer.
+   - Optional Enterprise path: ask the user to set `BAND_USER_API_KEY`, run `scripts/register_agent.py`, confirm it saved `BAND_AGENT_ID` and `BAND_API_KEY`, then ask the user to remove `BAND_USER_API_KEY`.
+   - Never persist `BAND_USER_API_KEY`.
 
-## Step 4 — Verify (machine-checkable)
+4. Restart the gateway.
+   - Use the user's normal Hermes gateway restart command.
+   - On first connect the adapter resolves the owner, creates the Hermes Hub room, writes `BAND_HUB_ROOM`, and wires the hub as the home channel.
 
-`connect()` returning True only confirms the WebSocket — it does **not** prove the hub was created.
-Check the real signals:
+5. Verify the gateway with `scripts/verify_gateway.py`.
+   - Success means the hub exists, gateway logs show Band connection signals, and no known hub failure signal appears in recent logs.
+   - If the owner is unresolved, have the user set `BAND_OWNER_ID` and restart.
+   - If no Band log signals appear, re-run install verification and confirm the gateway process is using the expected Python environment.
 
-```bash
-# 1. Hub room was created + persisted (non-empty UUID):
-PY -c "from hermes_cli.config import get_env_value; print('BAND_HUB_ROOM=', get_env_value('BAND_HUB_ROOM'))"
+6. Ask the user to complete the Band UI loop.
+   - They should open the Hermes Agent Hub room, @mention the agent, and confirm the agent replies.
+   - Remind them that Band has no DMs; an unmentioned message is ignored by design.
 
-# 2. Gateway log shows a healthy Band connect + hub:
-grep -E '\[band\] Connected as agent|\[band\] Hub ready: room|✓ band connected' ~/.hermes/logs/gateway.log | tail
+7. Optionally enable Band action tools.
+   - Add the `band` toolset to each platform that should act on Band.
+   - Keep `hermes-band` for the messaging channel and add `band` only where action tools are needed.
+   - Mutating tools remain owner-gated by the plugin.
 
-# 3. No failure lines:
-grep -E '\[band\] Owner unresolved|\[band\] Hub bootstrap failed|requirements not met' ~/.hermes/logs/gateway.log | tail
-```
+## Pitfalls
 
-Interpretation:
-- `BAND_HUB_ROOM` set + `[band] Hub ready: room …` → **hub created, success.**
-- `[band] Owner unresolved — hub disabled` → owner couldn't be resolved. Find the owner UUID in the
-  Band profile, `save_env_value('BAND_OWNER_ID', '<uuid>')`, and restart.
-- No `[band]` lines at all → SDK missing (back to Step 1) or credentials not loaded (re-check Step 2).
+- Installing the pip package but forgetting `hermes plugins enable band` leaves the entry point discovered but inactive.
+- Installing a directory plugin without `band-sdk` in the gateway environment makes the platform unavailable at runtime.
+- Saving `BAND_AGENT_ID` with generic config-setting commands can route it to config YAML instead of Hermes `.env`; use the setup wizard or Hermes env writer.
+- Treating a successful WebSocket connect as full setup is incomplete; the hub must also be created and persisted as `BAND_HUB_ROOM`.
+- Leaving `BAND_USER_API_KEY` in the environment after registration unnecessarily keeps a broad user credential live.
+- Setting `BAND_HOME_ROOM` to another room means cron and notifications use that room instead of the hub.
 
-Optionally confirm the new agent key works:
+## Verification
 
-```bash
-curl -sS "BASE/api/v1/agent/me" -H "X-API-Key: <band_a_key>"   # returns the agent identity
-```
-
-## Step 5 — Confirm chat works (human-in-the-loop)
-
-You can't see the Band UI, so ask the user to close the loop:
-
-> Check your Band app — a **"Hermes Agent Hub"** room should have appeared with a greeting from the
-> agent. **@mention the agent** and send a test message — Band has no DMs, so an
-> un-mentioned message is ignored by design — and confirm it replies.
-
-A round-tripped reply is the proof the integration is live.
-
-## Optional — Enable the Band action toolset
-
-Chatting works without this. If the user wants the agent to **act** on Band (create rooms, add
-participants, message other rooms), add `band` to `platform_toolsets` in `~/.hermes/config.yaml`:
-
-```yaml
-platform_toolsets:
-  band:     [hermes-band, band]      # act on Band from Band rooms
-  telegram: [hermes-telegram, band]  # optional: drive Band from Telegram
-```
-
-Mutating tools are owner-gated; `BAND_TOOL_OWNERS` (`platform:user_id`, e.g. `telegram:123,band:<uuid>`)
-grants others. Restart the gateway after editing. Then re-verify chat still works.
-
-## Common Pitfalls
-
-1. **Expecting the wizard alone to finish setup.** `hermes gateway setup` (pick "Band") collects and
-   persists the two credentials — but it does **not** install the SDK, restart the gateway, register
-   an agent, or verify the hub. The skill delegates credentials to the wizard and owns everything else.
-2. **`hermes config set BAND_AGENT_ID`.** Routes to `config.yaml`, not `.env` — the adapter won't see
-   it. Always use `save_env_value` for the ID.
-3. **"Settings → Agents" for agent creation.** Wrong path — that page only has API keys. Agent creation
-   is `/agents/new` (the Agents page).
-4. **`pip install` in a uv-managed venv.** No `pip` binary there; use the `uv pip install` form.
-5. **Trusting `connect()=True`.** The hub is created in a `try/except` that never blocks connect — verify
-   via `BAND_HUB_ROOM` + the `Hub ready` log line.
-6. **`BAND_HOME_ROOM` already set to another room.** The hub is still created but cron/notifications go to
-   that other room instead. Warn the user and offer to clear it if they expected the hub to be the main channel.
-7. **Persisting the `band_u_` user key.** Don't — it's a user-level credential with a wide blast radius and
-   is only needed for the one-time register call.
-
-## Verification Checklist
-
-- [ ] `PY -c 'import band'` succeeds (SDK installed in the gateway's env)
-- [ ] `BAND_AGENT_ID` + `BAND_API_KEY` present in `~/.hermes/.env` (`band_a_…` key, UUID id)
-- [ ] `hermes gateway restart` ran cleanly
-- [ ] `BAND_HUB_ROOM` is a non-empty UUID in `~/.hermes/.env`
-- [ ] `gateway.log` shows `[band] Connected as agent` + `[band] Hub ready: room` + `✓ band connected`
-- [ ] No `[band] Owner unresolved` / `[band] Hub bootstrap failed`
-- [ ] User confirms the "Hermes Agent Hub" room appeared and an **@mention** test message round-trips
+- `scripts/verify_install.py` reports package or directory plugin presence, SDK importability, plugin enablement, and required credential presence.
+- `scripts/verify_gateway.py` reports `BAND_HUB_ROOM`, recent Band gateway success signals, and known failure signals.
+- The user confirms the Hermes Agent Hub room exists in Band and an @mention test message round-trips.

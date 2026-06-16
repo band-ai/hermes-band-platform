@@ -10,51 +10,32 @@ commands and mutating Band actions are owner-only in every Band room.
 
 ## Before you install
 
-You need a **Band account** and a Band **agent's credentials**, minted in a
-browser (no API can do this for you):
+You need a **Band account** and one of these credential paths:
 
-1. Go to **app.band.ai/agents/new** — the Agents page, *not* Settings (which
-   only holds REST API keys).
-2. Create an external agent; copy its **Agent ID** (a UUID) → `BAND_AGENT_ID`.
-3. Copy the agent's **API key** (`band_a_…`) → `BAND_API_KEY`. **It's shown
-   once** — grab it now.
-
-Have both values ready before the steps below.
+1. **Recommended:** a Band user API key that can create external agents. The
+   bundled `add-band` setup skill reads it from `BAND_USER_API_KEY`, calls Band's
+   registration API, then saves only the returned agent-scoped `BAND_AGENT_ID`
+   and `BAND_API_KEY`.
+2. **Manual fallback:** a pre-created Band external agent. Go to the Band Agents
+   page, create or open an external agent, then copy its Agent ID and one-time
+   agent API key.
 
 ## Install
 
-Two paths. The plugin key is `band`. **Directory install is recommended** — it
-prompts for credentials and enables the plugin in one step; the pip path needs a
-couple of manual touches on stock Hermes.
-
-### Directory plugin (recommended)
-
-```bash
-hermes plugins install band-ai/hermes-band-platform --enable
-```
-
-This clones the plugin into `~/.hermes/plugins/band`, prompts you for
-`BAND_AGENT_ID` + `BAND_API_KEY`, and enables it. Directory plugins don't carry
-their own dependencies, so install the SDK into the SAME environment as the
-gateway:
-
-```bash
-pip install 'band-sdk>=1.0.0,<2.0.0'
-#   uv-managed venv (no pip): uv pip install --python .venv/bin/python 'band-sdk>=1.0.0,<2.0.0'
-```
-
-Then `hermes gateway restart`.
+The plugin key is `band`. Use `pip` for normal installs; use the directory path
+when developing the plugin or before the package is published.
 
 ### pip
 
 ```bash
-pip install hermes-band-platform   # also pulls in band-sdk
+pip install hermes-band-platform
+hermes plugins enable band
 ```
 
-The plugin is discovered automatically but is **opt-in**. On a Hermes build that
-manages entry-point plugins, enable it with `hermes plugins enable band`. On
-stock Hermes that command doesn't yet recognize entry-point plugins, so add it
-by hand to `~/.hermes/config.yaml`:
+The package exposes a `hermes_agent.plugins` entry point, so Hermes builds with
+entry-point plugin management show `band` in `hermes plugins list` and accept
+`hermes plugins enable band`. If your Hermes build predates that support, add the
+plugin key manually to `~/.hermes/config.yaml`:
 
 ```yaml
 plugins:
@@ -62,19 +43,53 @@ plugins:
     - band
 ```
 
-Not sure which build you have? Run `hermes plugins list` after install — if `band`
-doesn't appear, use the manual `config.yaml` edit above.
+### Directory plugin
 
-Set the credentials in `~/.hermes/.env` directly — **don't** use
-`hermes config set BAND_AGENT_ID` (names without a `_KEY`/`_TOKEN` suffix route to
-`config.yaml`, which the adapter doesn't read):
+```bash
+hermes plugins install band-ai/hermes-band-platform --enable
+```
+
+This clones the repository root into `~/.hermes/plugins/band` and enables it.
+Directory plugins don't carry their own dependencies, so install the SDK into the
+same Python environment as the gateway:
+
+```bash
+pip install 'band-sdk>=1.0.0,<2.0.0'
+#   uv-managed venv (no pip): uv pip install --python .venv/bin/python 'band-sdk>=1.0.0,<2.0.0'
+```
+
+### End-to-end setup skill
+
+```bash
+export BAND_USER_API_KEY=...
+hermes /add-band
+```
+
+The skill walks the full setup: verifies the plugin install, registers a remote
+Band agent through the API, saves `BAND_AGENT_ID` and `BAND_API_KEY` through
+Hermes's env writer, reminds you to restart the gateway, then verifies the hub
+signals. The user API key is read from the environment and is never printed or
+stored.
+
+If you want to run the helper directly:
+
+```bash
+BAND_USER_API_KEY=... python hermes_band_platform/skills/add-band/scripts/register_agent.py
+```
+
+If you already created the Band external agent manually, skip the registration
+helper and save these values in `~/.hermes/.env`:
 
 ```bash
 BAND_AGENT_ID=<agent-uuid>
 BAND_API_KEY=<band_a_key>
 ```
 
-Then `hermes gateway restart`.
+Then restart the gateway:
+
+```bash
+hermes gateway restart
+```
 
 ### Nix
 

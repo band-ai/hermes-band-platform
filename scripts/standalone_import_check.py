@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Standalone-load regression guard for the Band platform plugin.
 
-Simulates how Hermes loads a *user-installed* plugin dropped into
-``~/.hermes/plugins/band/`` -- imported as ``hermes_plugins.band`` from its own
-package directory (mirroring ``hermes_cli/plugins.py::_load_directory_module``),
+Simulates how Hermes loads a *user-installed* plugin cloned from this repository
+root into ``~/.hermes/plugins/band/`` -- imported as ``hermes_plugins.band`` from
+that directory (mirroring ``hermes_cli/plugins.py::_load_directory_module``),
 with no dependency on any in-repo ``plugins.platforms.band`` package path being
 importable.
 
@@ -29,9 +29,11 @@ import pathlib
 import sys
 import types
 
-# scripts/ sits next to the package dir at the repo root.
+# scripts/ sits at the repository root. The root contains ``plugin.yaml`` and a
+# shim ``__init__.py`` so GitHub/directory installs load correctly while wheels
+# still expose the packaged ``hermes_band_platform`` entry point.
 REPO = pathlib.Path(__file__).resolve().parent.parent
-PLUGIN_DIR = REPO / "hermes_band_platform"
+PLUGIN_DIR = REPO
 NS = "hermes_plugins"
 
 
@@ -39,6 +41,9 @@ def main() -> int:
     init_file = PLUGIN_DIR / "__init__.py"
     if not init_file.exists():
         print(f"FAIL: {init_file} not found")
+        return 1
+    if not (PLUGIN_DIR / "plugin.yaml").exists():
+        print(f"FAIL: {PLUGIN_DIR / 'plugin.yaml'} not found")
         return 1
 
     # Mirror _load_directory_module: a namespace parent package, then the plugin
@@ -111,7 +116,7 @@ def main() -> int:
         return 1
 
     print(
-        "OK: Band plugin loads standalone as hermes_plugins.band "
+        "OK: Band plugin repository root loads standalone as hermes_plugins.band "
         "(no plugins.platforms.band dependency)"
     )
     return 0

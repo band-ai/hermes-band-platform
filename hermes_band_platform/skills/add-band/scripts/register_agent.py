@@ -104,6 +104,11 @@ def register_agent(
             detail = exc.read().decode("utf-8", errors="replace")
         except Exception:
             detail = str(exc)
+        # Truncate the raw server body before surfacing it — we don't control
+        # its contents, and it ends up in the skill's structured output stream.
+        detail = detail.strip()
+        if len(detail) > 500:
+            detail = detail[:500] + "… (truncated)"
         raise SetupError(f"Band registration failed with HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise SetupError(f"Band registration request failed: {exc.reason}") from exc

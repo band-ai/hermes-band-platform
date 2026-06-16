@@ -111,6 +111,23 @@ def test_verify_gateway_detects_successful_band_start(monkeypatch, tmp_path):
     assert result["failure_signals"] == []
 
 
+def test_verify_gateway_accepts_home_room_without_hub(monkeypatch, tmp_path):
+    """A pinned BAND_HOME_ROOM (no BAND_HUB_ROOM) is a valid main channel."""
+    module = _load_script("verify_gateway.py")
+    env = {"BAND_HOME_ROOM": "room_456"}
+    monkeypatch.setattr(module, "_env_value", lambda name: env.get(name, ""))
+    log_path = tmp_path / "gateway.log"
+    log_path.write_text(
+        "[band] Connected as agent agent_123\n[band] Hub ready: room room_456\n"
+    )
+
+    result = module.verify_gateway(log_path=log_path)
+
+    assert result["success"] is True
+    assert result["band_hub_room_present"] is False
+    assert result["band_home_room_present"] is True
+
+
 def test_verify_install_reports_missing_requirements(monkeypatch):
     module = _load_script("verify_install.py")
     monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: None)

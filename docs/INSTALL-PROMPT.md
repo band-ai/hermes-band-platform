@@ -1,12 +1,13 @@
 # Cross-machine agent install prompt
 
-> **Most installs should use [`install.sh`](install.sh)** — it prepares
-> credentials, drops the `add-band` skill into Hermes, and hands off to
-> `hermes /add-band` so Hermes' own agent finishes the setup on the box.
+> **Most installs should use the Band web app's "Add to Hermes" flow** (generated
+> from the bootstrapper source at
+> [band-ai/add-band](https://github.com/band-ai/add-band)) — on the gateway host it
+> fetches the `add-band` skill from this repo and hands off to `hermes /add-band`.
 
-Use the prompt below only when you **can't run `hermes /add-band` on the target
-host** — e.g. you're driving setup from a **different machine or a non-Hermes
-agent** (Claude Code, etc.), or Hermes isn't yet configured as a working agent.
+Use the prompt below only when you **can't run that on the target host** — e.g.
+you're driving setup from a **different machine or a non-Hermes agent** (Claude
+Code, etc.), or Hermes isn't yet configured as a working agent.
 Hand it to any shell-capable agent with access to the gateway host. It fetches the
 official `add-band` setup skill from GitHub and follows it end to end — install,
 enable, credentials, restart, and verification all live in the skill, so this

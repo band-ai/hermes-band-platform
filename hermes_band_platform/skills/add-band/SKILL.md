@@ -33,7 +33,7 @@ Do not use this skill for ordinary Band chat troubleshooting after setup; inspec
 
 This skill installs the plugin and the Band SDK as part of the procedure — they need not be present beforehand.
 
-Never ask the user to paste a Band user API key into a command line. Ask them to set it as `BAND_USER_API_KEY` for the one registration step, then remove it.
+Never ask the user to paste a Band user API key into a command line, and never read it yourself. The key is consumed by `register_agent.py` (a script that reads it from the environment) — ideally by the bootstrapper *before* this skill runs, so it never enters the agent's environment. Only the resulting agent-scoped `BAND_AGENT_ID` + `BAND_API_KEY` are stored; the user key is never printed or persisted. Have the user remove `BAND_USER_API_KEY` after the one registration step.
 
 ## How to Run
 
@@ -115,10 +115,10 @@ Verify install / register / verify gateway (always with the gateway interpreter)
    - If `plugin_enabled` is false, repeat step 3.
    - If credential checks are false, continue to credential collection.
 
-5. Collect agent credentials.
-   - Preferred manual path: have the user create an external agent at `app.band.ai/agents/new`, then run the Band setup wizard or save `BAND_AGENT_ID` and `BAND_API_KEY` with Hermes's env writer.
-   - Optional Enterprise path: ask the user to set `BAND_USER_API_KEY`, run `scripts/register_agent.py`, confirm it saved `BAND_AGENT_ID` and `BAND_API_KEY`, then ask the user to remove `BAND_USER_API_KEY`.
-   - Never persist `BAND_USER_API_KEY`.
+5. Ensure agent credentials are present (`BAND_AGENT_ID` + `BAND_API_KEY` in Hermes's `.env`). `scripts/verify_install.py` reports whether they are.
+   - Already saved (e.g. the bootstrapper registered the agent before handing off): continue.
+   - Pre-created agent: have the user create one at `app.band.ai/agents/new` and save `BAND_AGENT_ID` + `BAND_API_KEY` with Hermes's env writer.
+   - Auto-register from a user key — a **script step, not an LLM step**: with `BAND_USER_API_KEY` set in a plain shell, `scripts/register_agent.py` reads it from the environment, mints the agent, and saves only the agent-scoped `BAND_AGENT_ID` + `BAND_API_KEY`. It never prints or persists the user key. **Do not put `BAND_USER_API_KEY` into the agent's own environment or read it yourself** — let the bootstrapper or a plain shell consume it before/outside the agent, so the user key never reaches the LLM. Have the user remove `BAND_USER_API_KEY` afterward.
 
 6. Restart the gateway.
    - Use the user's normal Hermes gateway restart command.
@@ -147,6 +147,7 @@ Verify install / register / verify gateway (always with the gateway interpreter)
 - Saving `BAND_AGENT_ID` with generic config-setting commands can route it to config YAML instead of Hermes `.env`; use the setup wizard or Hermes env writer.
 - Treating a successful WebSocket connect as full setup is incomplete; the hub must also be created and persisted as `BAND_HUB_ROOM`.
 - Leaving `BAND_USER_API_KEY` in the environment after registration unnecessarily keeps a broad user credential live.
+- Exposing the Band *user* key to the LLM: registration is a script step — `register_agent.py` reads `BAND_USER_API_KEY` from the environment and stores only agent-scoped credentials. Don't set the user key in the *agent's* own environment or echo it; run registration in the bootstrapper or a plain shell before the agent takes over.
 - Setting `BAND_HOME_ROOM` to another room means cron and notifications use that room instead of the hub.
 
 ## Verification

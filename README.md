@@ -65,11 +65,17 @@ export BAND_USER_API_KEY=...
 hermes /add-band
 ```
 
-The skill walks the full setup: verifies the plugin install, registers a remote
-Band agent through the API, saves `BAND_AGENT_ID` and `BAND_API_KEY` through
-Hermes's env writer, reminds you to restart the gateway, then verifies the hub
-signals. The user API key is read from the environment and is never printed or
-stored.
+The skill walks the full setup: identifies the gateway's Python, installs and
+enables the plugin (with a `plugins.enabled` fallback for builds whose CLI does
+not list entry-point plugins), registers a remote Band agent through the API,
+saves `BAND_AGENT_ID` and `BAND_API_KEY` through Hermes's env writer, reminds you
+to restart the gateway, then verifies the hub signals. The user API key is read
+from the environment and is never printed or stored.
+
+On a **fresh box** where the plugin isn't installed yet (so `hermes /add-band`
+doesn't exist), hand a shell-capable agent the one-shot prompt in
+[`docs/INSTALL-PROMPT.md`](docs/INSTALL-PROMPT.md) — it clones this repo, then
+runs the same skill end to end.
 
 If you want to run the helper directly:
 

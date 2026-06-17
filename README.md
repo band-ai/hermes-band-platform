@@ -29,19 +29,24 @@ that the setup skill automates.
 ### Quickest: the Band web app
 
 The Band web app's **"Add to Hermes"** flow hands you a copy-paste snippet (your
-credentials prefilled) to run on the machine hosting your Hermes gateway. It
-fetches the `add-band` skill from this repo and hands off to `hermes /add-band`,
-which installs the plugin into the gateway's Python, enables it, registers the
-agent, restarts the gateway, and verifies the hub.
+key prefilled) to run on the machine hosting your Hermes gateway. A script
+registers the Band agent from your key — **the key never reaches the LLM** — and
+saves only the agent-scoped id + key, then hands off to `hermes /add-band`, which
+installs the plugin into the gateway's Python, enables it, restarts the gateway,
+and verifies the hub.
 
-That snippet is generated from the bootstrapper source in
-[`band-ai/add-band`](https://github.com/band-ai/add-band)
-(`hermes/manifest.yaml` → `scripts/gen.py`). To run the equivalent by hand on the
-gateway host, with Band credentials set:
+That snippet comes from the
+[`band-ai/add-band`](https://github.com/band-ai/add-band) catalog
+(`hermes/bootstrap.sh`). To run the equivalent by hand on the gateway host, with
+Band credentials set:
 
 ```bash
-export BAND_USER_API_KEY=...   # auto-registers an agent; or: export BAND_AGENT_ID=... BAND_API_KEY=...
+export BAND_USER_API_KEY=...   # auto-register; or set BAND_AGENT_ID + BAND_API_KEY and skip the register line
 git clone --depth 1 https://github.com/band-ai/hermes-band-platform /tmp/hbp
+# A script (not the agent) consumes the user key and saves only the agent id + key:
+hpy="$(hermes --version 2>&1 | sed -n 's/^Project: //p')/venv/bin/python"
+"$hpy" /tmp/hbp/hermes_band_platform/skills/add-band/scripts/register_agent.py
+unset BAND_USER_API_KEY
 hermes /add-band 2>/dev/null || cat /tmp/hbp/hermes_band_platform/skills/add-band/SKILL.md
 ```
 

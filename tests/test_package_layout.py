@@ -20,6 +20,22 @@ def test_root_manifest_matches_packaged_manifest():
     )
 
 
+def test_root_manifest_is_byte_identical_including_release_marker():
+    """The two manifests must stay verbatim-identical, marker included.
+
+    ``test_root_manifest_matches_packaged_manifest`` parses with
+    ``yaml.safe_load``, which drops comments — so it cannot see a missing
+    ``# x-release-please-version`` annotation. Without that marker on the
+    root manifest, release-please bumps the packaged manifest but leaves the
+    root (git directory-install) manifest stuck at the old version. Compare
+    raw bytes and assert the marker is present so that drift fails loudly.
+    """
+    root = (ROOT / "plugin.yaml").read_text()
+    packaged = (ROOT / "hermes_band_platform" / "plugin.yaml").read_text()
+    assert root == packaged
+    assert "# x-release-please-version" in root
+
+
 def test_root_directory_plugin_shim_registers():
     """The repository root loads as a Hermes directory plugin."""
     for key in list(sys.modules):

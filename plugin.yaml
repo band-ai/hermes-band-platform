@@ -1,7 +1,7 @@
 name: band
 label: Band
 kind: platform
-version: 1.0.0
+version: 1.0.0 # x-release-please-version
 description: >
   Band gateway adapter for Hermes Agent.
   Connects a Band agent to the Band platform over a persistent WebSocket

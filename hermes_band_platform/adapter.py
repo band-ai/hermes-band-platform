@@ -111,6 +111,12 @@ _SENT_IDS_MAX = 5000
 # demand, so eviction is a cache miss, not a failure).
 _ROOM_CACHE_MAX = 2000
 
+# Backstop: how many consecutive id-less messages a single room drain tolerates
+# before giving up. An id-less message can't be claimed/acked, so the cursor
+# can't advance past it; we skip it to keep draining the rest, but cap the skips
+# so a server that pathologically re-offers an un-ackable message can't spin.
+_MAX_DRAIN_IDLESS_SKIPS = 50
+
 # Session/source chat_type for every Band room. Band has no DMs — every room is
 # a group room regardless of participant count, mention-gated for all
 # participants — and ``group_sessions_per_user`` is locked False, so a single
@@ -243,10 +249,18 @@ class BandAdapter(BasePlatformAdapter):
         self._agent_id: str = self._cfg_agent_id
         self._handle: str = ""
 
-        # Rooms the agent is known to belong to (populated by
-        # _subscribe_known_rooms + room_added). A room_added for a room already
-        # in this set is a *re-join*: flag it for context rehydration.
+        # Room membership is two disjoint sets — a room is in at most one:
+        #   _known_rooms : rooms the agent currently belongs to (subscribed; the
+        #                  only set the catch-up drain iterates).
+        #   _left_rooms  : rooms it has since left (room_removed/room_deleted),
+        #                  dropped from _known_rooms so a long-lived agent
+        #                  cycling through many rooms can't grow it without
+        #                  bound, and kept here only as capped re-join memory.
+        # Invariant: a ``room_added`` for a room in *either* set is a *re-join*
+        # (its local session was reset on the prior leave), so it is flagged for
+        # context rehydration; a room in neither is brand new.
         self._known_rooms: set = set()
+        self._left_rooms: set = set()
         # Re-joined rooms whose next inbound message should pull recent Band
         # context into MessageEvent.channel_context (consumed once, then cleared).
         self._rehydrate_rooms: set = set()
@@ -727,11 +741,14 @@ class BandAdapter(BasePlatformAdapter):
             room_id = getattr(event, "room_id", None)
             if room_id:
                 await self._link.subscribe_room(room_id)
-                # A room_added for a room we already knew is a *re-join*: its
-                # local session was reset on the prior room_removed, so flag it
-                # to rehydrate from Band context on the next inbound message.
-                # Stay SILENT — events never proactively wake the agent.
-                if room_id in self._known_rooms:
+                # A room_added for a room we already knew (or recently left) is a
+                # *re-join*: its local session was reset on the prior
+                # room_removed, so flag it to rehydrate from Band context on the
+                # next inbound message. Stay SILENT — events never proactively
+                # wake the agent.
+                if room_id in self._known_rooms or room_id in self._left_rooms:
+                    self._left_rooms.discard(room_id)
+                    self._known_rooms.add(room_id)
                     self._rehydrate_rooms.add(room_id)
                     logger.debug(
                         "[band] Re-joined known room %s — flagged for rehydration",
@@ -749,6 +766,16 @@ class BandAdapter(BasePlatformAdapter):
                 self._participants_cache.pop(room_id, None)
                 self._last_human_sender.pop(room_id, None)
                 self._reset_room_session(room_id)
+                # Drop from the active set (so _known_rooms and the catch-up
+                # drain don't grow/iterate without bound) but remember the room
+                # in a capped _left_rooms so a later room_added is still seen as
+                # a re-join. Eviction is best-effort: a forgotten room just
+                # misses context rehydration on re-join.
+                self._known_rooms.discard(room_id)
+                self._left_rooms.add(room_id)
+                if len(self._left_rooms) > _ROOM_CACHE_MAX:
+                    for _ in range(_ROOM_CACHE_MAX // 2):
+                        self._left_rooms.pop()
                 logger.debug("[band] Unsubscribed from room %s", _short_id(room_id))
             return
 
@@ -1110,6 +1137,7 @@ class BandAdapter(BasePlatformAdapter):
         against a server re-offering the same id (which would otherwise spin).
         """
         seen: set = set()
+        idless_skips = 0
         while self._link is not None:
             try:
                 msg = await self._link.get_next_message(room_id)
@@ -1122,7 +1150,23 @@ class BandAdapter(BasePlatformAdapter):
                 return
             mid = getattr(msg, "id", None)
             if not mid:
-                return
+                # Can't claim/ack an id-less message, but skip it and keep
+                # draining the rest of the backlog rather than abandoning the
+                # whole room. Cap consecutive skips so a server re-offering an
+                # un-ackable message can't spin this loop forever.
+                idless_skips += 1
+                if idless_skips >= _MAX_DRAIN_IDLESS_SKIPS:
+                    logger.warning(
+                        "[band] Too many id-less messages draining room %s — stopping",
+                        _short_id(room_id),
+                    )
+                    return
+                logger.debug(
+                    "[band] /next returned an id-less message for room %s — skipping",
+                    _short_id(room_id),
+                )
+                continue
+            idless_skips = 0
             if mid in seen:
                 await self._ack_consumed(room_id, mid)
                 continue
@@ -1584,10 +1628,11 @@ class BandAdapter(BasePlatformAdapter):
 
         Caps the set at ``_SENT_IDS_MAX``; evicts half (arbitrary) when over.
         """
-        self._sent_ids.add(sent_id)
-        if len(self._sent_ids) > _SENT_IDS_MAX:
-            for _ in range(_SENT_IDS_MAX // 2):
+        if len(self._sent_ids) >= _SENT_IDS_MAX:
+            target = _SENT_IDS_MAX // 2
+            for _ in range(max(0, len(self._sent_ids) - target)):
                 self._sent_ids.pop()
+        self._sent_ids.add(sent_id)
 
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:

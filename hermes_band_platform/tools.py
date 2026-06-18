@@ -681,6 +681,8 @@ async def _handle_remove_participant(args: dict, **kwargs) -> str:
     """Remove a participant (by UUID) from a room."""
     try:
         _require_owner()
+        if not _load_sdk():
+            raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
         room_id = _resolve_room(args)
 

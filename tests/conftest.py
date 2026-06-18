@@ -15,6 +15,8 @@ from __future__ import annotations
 import sys
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 
 def _install_band_mock() -> MagicMock:
     """Register stub band sub-packages into sys.modules (idempotent).
@@ -95,3 +97,68 @@ def _install_band_mock() -> MagicMock:
 # Install the stub at collection time, before any test module imports the
 # adapter / tools package.
 _install_band_mock()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _register_band_platform():
+    """Register the ``band`` platform in the host registry before tests run.
+
+    The host's ``gateway.config.Platform`` is a *strict* enum: its ``_missing_``
+    hook only mints a pseudo-member (so ``Platform("band")`` resolves) once the
+    platform is present in ``platform_registry`` — which the gateway does at
+    plugin-load time, before any adapter is constructed. The unit tests build
+    ``BandAdapter`` directly, bypassing that load, so without this fixture
+    ``Platform("band")`` raises ``ValueError`` during construction.
+
+    We mirror the gateway's own ``register_platform`` → ``PlatformEntry`` path
+    by driving the plugin's real ``register()`` with a registry-forwarding
+    context. No-op if the host isn't importable (the adapter import would have
+    already failed in that case).
+    """
+    try:
+        from gateway.platform_registry import PlatformEntry, platform_registry
+    except Exception:
+        yield
+        return
+
+    if not platform_registry.is_registered("band"):
+        import hermes_band_platform
+
+        class _RegistryCtx:
+            """Forwards register_platform into platform_registry; ignores the rest."""
+
+            def register_platform(
+                self,
+                name,
+                label=None,
+                adapter_factory=None,
+                check_fn=None,
+                validate_config=None,
+                required_env=None,
+                install_hint=None,
+                **extra,
+            ):
+                extra.setdefault("plugin_name", "band")
+                platform_registry.register(
+                    PlatformEntry(
+                        name=name,
+                        label=label,
+                        adapter_factory=adapter_factory,
+                        check_fn=check_fn,
+                        validate_config=validate_config,
+                        required_env=required_env or [],
+                        install_hint=install_hint,
+                        source="plugin",
+                        **extra,
+                    )
+                )
+
+            def register_tool(self, **kwargs):
+                pass
+
+            def register_skill(self, *args, **kwargs):
+                pass
+
+        hermes_band_platform.register(_RegistryCtx())
+
+    yield

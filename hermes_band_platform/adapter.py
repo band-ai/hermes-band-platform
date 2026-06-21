@@ -343,12 +343,18 @@ class BandAdapter(BasePlatformAdapter):
         self._hub_failovers_done = 0
 
         if not BAND_AVAILABLE:
+            missing_sdk_msg = (
+                "band-sdk not installed. Directory plugin installs do not install "
+                "Python dependencies; install into the gateway Python with: "
+                "uv pip install --python <gateway-python> 'band-sdk>=1.0.0,<2.0.0'"
+            )
             logger.error(
-                "[band] band-sdk not installed. Run: pip install 'band-sdk>=1.0.0,<2.0.0'",
+                "[band] %s",
+                missing_sdk_msg,
             )
             self._set_fatal_error(
                 "dependency_missing",
-                "band-sdk not installed",
+                missing_sdk_msg,
                 retryable=False,
             )
             return False

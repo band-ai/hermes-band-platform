@@ -71,6 +71,33 @@ def verify_install() -> dict[str, Any]:
         "band_agent_id_present": agent_id_present,
         "band_api_key_present": api_key_present,
     }
+    missing = [name for name, ok in checks.items() if not ok]
+    actions: list[str] = []
+    if "package_importable" in missing or "entry_point" in missing:
+        actions.append(
+            "Install the package into the gateway Python: "
+            "uv pip install --python \"$HERMES_PY\" "
+            "\"hermes-band-platform @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}\""
+        )
+    if "sdk_importable" in missing:
+        actions.append(
+            "band-sdk is missing. Directory plugin installs do not install Python "
+            "dependencies; install it into the gateway Python with: "
+            "uv pip install --python \"$HERMES_PY\" 'band-sdk>=1.0.0,<2.0.0' "
+            "or \"$HERMES_PY\" -m pip install 'band-sdk>=1.0.0,<2.0.0'."
+        )
+    if "plugin_enabled" in missing:
+        actions.append(
+            "Enable the plugin with `hermes plugins enable band`; if the CLI does "
+            "not list entry-point plugins, add `band` to plugins.enabled in the "
+            "Hermes config."
+        )
+    if "band_agent_id_present" in missing or "band_api_key_present" in missing:
+        actions.append(
+            "Save agent-scoped credentials in Hermes env: BAND_AGENT_ID and "
+            "BAND_API_KEY. Use scripts/register_agent.py with BAND_USER_API_KEY, "
+            "or paste credentials from a pre-created Band external agent."
+        )
     return {
         "success": (
             sdk_importable
@@ -81,7 +108,8 @@ def verify_install() -> dict[str, Any]:
             and api_key_present
         ),
         "checks": checks,
-        "missing": [name for name, ok in checks.items() if not ok],
+        "missing": missing,
+        "actions": actions,
     }
 
 

@@ -165,7 +165,11 @@ async def _rest() -> Any:
         pass
 
     if not _load_sdk():
-        raise _ToolUnavailable("Band not available (band-sdk not installed)")
+        raise _ToolUnavailable(
+            "Band not available (band-sdk not installed in the gateway Python). "
+            "Directory plugin installs do not install dependencies; run: "
+            "uv pip install --python \"$HERMES_PY\" 'band-sdk>=1.0.0,<2.0.0'"
+        )
     from band.client.rest import AsyncRestClient
 
     api_key = os.getenv("BAND_API_KEY", "").strip()

@@ -30,6 +30,12 @@ jobs:
       - name: Standalone-load guard
         run: python scripts/standalone_import_check.py
 
+      - name: Root manifest sync guard
+        # The root plugin.yaml is generated from the packaged manifest (single
+        # source of truth). Fail if it drifted — regenerate with
+        # `python scripts/sync_root_manifest.py --write`.
+        run: python scripts/sync_root_manifest.py --check
+
       - name: Lint
         run: ruff check hermes_band_platform tests scripts __init__.py
 

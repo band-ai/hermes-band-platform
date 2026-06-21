@@ -7,8 +7,6 @@ import json
 import re
 from pathlib import Path
 
-import pytest
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = ROOT / "hermes_band_platform" / "skills" / "add-band"
@@ -81,24 +79,6 @@ def test_verify_install_reports_missing_requirements(monkeypatch):
     assert "sdk_importable" in result["missing"]
     assert "entry_point" in result["missing"]
     assert "band_api_key_present" in result["missing"]
-
-def test_register_agent_extracts_supported_response_shapes():
-    module = _load_script("register_agent.py")
-
-    agent_id, api_key = module._extract_credentials(
-        {"data": {"agent": {"id": "agent_123"}, "credentials": {"api_key": "key_123"}}}
-    )
-
-    assert agent_id == "agent_123"
-    assert api_key == "key_123"
-
-
-def test_register_agent_requires_user_key(monkeypatch):
-    module = _load_script("register_agent.py")
-    monkeypatch.delenv("BAND_USER_API_KEY", raising=False)
-
-    with pytest.raises(RuntimeError, match="BAND_USER_API_KEY"):
-        module.register_agent()
 
 
 def _stub_candidates(module, monkeypatch, banner=None, shebang=None, procs=()):

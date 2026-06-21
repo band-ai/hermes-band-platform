@@ -188,3 +188,15 @@ def test_gateway_python_fails_when_no_candidate_has_hermes_cli(monkeypatch):
     assert result["ok"] is False
     assert result["python"] is None
     assert "hermes_cli" in result["error"]
+
+
+def test_verify_roundtrip_requires_a_hub_room(monkeypatch, capsys):
+    module = _load_script("verify_roundtrip.py")
+    monkeypatch.setattr(module, "_env_value", lambda name: "")
+
+    rc = module.main([])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["success"] is False
+    assert "HUB_ROOM" in payload["error"]

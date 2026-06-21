@@ -13,11 +13,10 @@ commands and mutating Band actions are owner-only in every Band room.
 You need a **Band account** and one of these credential paths:
 
 1. **Recommended:** a Band user API key that can create external agents. The
-   bundled `add-band` setup skill includes a temporary registration helper that
-   reads it from `BAND_USER_API_KEY`, calls Band's registration API, then saves
-   only the returned agent-scoped `BAND_AGENT_ID` and `BAND_API_KEY`. Once
-   `band-sdk` publishes `band.cli.register_agent`, this helper should be replaced
-   by the SDK CLI.
+   SDK's `band-register-agent` CLI (`band.cli.register_agent`, installed with
+   `band-sdk`) reads it from `BAND_USER_API_KEY`, calls Band's registration API,
+   and prints the agent-scoped `BAND_AGENT_ID` and `BAND_API_KEY` for the caller
+   to save through Hermes's env writer.
 2. **Manual fallback:** a pre-created Band external agent. Go to the Band Agents
    page, create or open an external agent, then copy its Agent ID and one-time
    agent API key.
@@ -50,8 +49,8 @@ hpy="$(hermes --version 2>&1 | sed -n 's/^Project: //p')/venv/bin/python"
 # until the package is published and verified on PyPI.
 BAND_HERMES_REF="${BAND_HERMES_REF:-main}"
 uv pip install --python "$hpy" "hermes-band-platform @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF}"
-skill_dir="$("$hpy" -c 'import pathlib, hermes_band_platform; print(pathlib.Path(hermes_band_platform.__path__[0]) / "skills" / "add-band")')"
-"$hpy" "$skill_dir/scripts/register_agent.py"
+eval "$("$hpy" -m band.cli.register_agent)"   # SDK CLI: mints the agent, prints agent-scoped creds
+"$hpy" -c "import os; from hermes_cli.config import save_env_value as s; s('BAND_AGENT_ID', os.environ['BAND_AGENT_ID']); s('BAND_API_KEY', os.environ['BAND_API_KEY'])"
 unset BAND_USER_API_KEY
 hermes chat -s add-band < /dev/tty 2>/dev/null || { git clone --depth 1 https://github.com/band-ai/hermes-band-platform /tmp/hbp; cat /tmp/hbp/hermes_band_platform/skills/add-band/SKILL.md; }
 ```
@@ -109,12 +108,11 @@ hermes /add-band
 
 The skill walks the full setup: identifies the gateway's Python, installs and
 enables the plugin (with a `plugins.enabled` fallback for builds whose CLI does
-not list entry-point plugins), registers a remote Band agent via the bundled
-temporary `scripts/register_agent.py` helper, saves `BAND_AGENT_ID` and
-`BAND_API_KEY` through Hermes's env writer, reminds you to restart the gateway,
-then verifies the hub signals. The user API key is read from the environment and
-is never printed or stored. Replace the bundled helper with the SDK
-`band-register-agent` CLI after `band-sdk` publishes it.
+not list entry-point plugins), registers a remote Band agent via the SDK's
+`band-register-agent` CLI, saves `BAND_AGENT_ID` and `BAND_API_KEY` through
+Hermes's env writer, reminds you to restart the gateway, then verifies the hub
+signals. The user API key is read from the environment and is never printed or
+stored.
 
 On a **fresh box** where the plugin isn't installed yet (so `hermes /add-band`
 isn't registered), use the [Band web app flow](#quickest-the-band-web-app) above. To drive setup from a **different machine or a non-Hermes agent**, hand a
@@ -122,13 +120,14 @@ shell-capable agent the one-shot prompt in
 [`docs/INSTALL-PROMPT.md`](docs/INSTALL-PROMPT.md) — it clones this repo, then runs
 the same skill end to end.
 
-If you want to register directly before the SDK CLI is published, use the
-bundled helper from this repo:
+If you want to register directly, use the SDK CLI (the `band-sdk` dependency
+provides it):
 
 ```bash
 export BAND_USER_API_KEY=...
 HERMES_PY="$(hermes --version 2>&1 | sed -n 's/^Project: //p')/venv/bin/python"
-"$HERMES_PY" hermes_band_platform/skills/add-band/scripts/register_agent.py
+eval "$("$HERMES_PY" -m band.cli.register_agent)"
+"$HERMES_PY" -c "import os; from hermes_cli.config import save_env_value as s; s('BAND_AGENT_ID', os.environ['BAND_AGENT_ID']); s('BAND_API_KEY', os.environ['BAND_API_KEY'])"
 unset BAND_USER_API_KEY
 ```
 

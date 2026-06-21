@@ -33,7 +33,7 @@ Do not use this skill for ordinary Band chat troubleshooting after setup; inspec
 
 This skill installs the plugin and the Band SDK as part of the procedure — they need not be present beforehand.
 
-Never ask the user to paste a Band user API key into a command line, and never read it yourself. Until the SDK registration CLI is published, the key is consumed by the bundled `scripts/register_agent.py` helper (a small Python helper that reads it from the environment) — ideally by the bootstrapper *before* this skill runs, so it never enters the agent's environment. Only the resulting agent-scoped `BAND_AGENT_ID` + `BAND_API_KEY` are stored; the user key is never printed or persisted. Once `band.cli.register_agent` ships in `band-sdk`, replace this temporary helper with the SDK CLI. Have the user remove `BAND_USER_API_KEY` after the one registration step.
+Never ask the user to paste a Band user API key into a command line, and never read it yourself. The key is consumed by the SDK's `band-register-agent` CLI (`band.cli.register_agent`, a script that reads it from the environment) — ideally by the bootstrapper *before* this skill runs, so it never enters the agent's environment. Only the resulting agent-scoped `BAND_AGENT_ID` + `BAND_API_KEY` are stored; the user key is never printed or persisted. Have the user remove `BAND_USER_API_KEY` after the one registration step.
 
 ## How to Run
 
@@ -42,12 +42,11 @@ Use the `terminal` tool for commands and the helper scripts shipped with this sk
 Skill helper paths are relative to this skill directory:
 
 - `scripts/gateway_python.py` — resolve + validate the gateway interpreter
-- `scripts/register_agent.py` — temporary registration helper; replace with `band.cli.register_agent` after the SDK CLI is published
 - `scripts/verify_install.py`
 - `scripts/verify_gateway.py`
 - `scripts/verify_roundtrip.py` — prove the agent can post to its owner
 
-Registration temporarily ships as `scripts/register_agent.py` because the SDK CLI is not published yet. The helper saves `BAND_AGENT_ID` + `BAND_API_KEY` through Hermes's env writer and never prints the user key. When `band-register-agent` / `band.cli.register_agent` is available in `band-sdk`, switch registration to the SDK CLI and remove the bundled helper. The setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
+Registration is **not** a skill helper — it ships in the SDK as the `band-register-agent` CLI (`band.cli.register_agent`), installed with `band-sdk`. It reads `BAND_USER_API_KEY`, prints agent-scoped creds for the caller to persist through Hermes's env writer, and never prints the user key. The setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
 
 This skill is **resumable**: run `verify_install.py` first and act *only* on what's missing, so re-running after a partial failure never double-installs or re-registers.
 
@@ -78,10 +77,10 @@ uv pip install --python "$HERMES_PY" 'band-sdk>=1.0.0,<2.0.0'
 "$HERMES_PY" -c "import band" || { echo "band-sdk is still missing from the gateway Python. Band cannot start until you run: uv pip install --python \"$HERMES_PY\" 'band-sdk>=1.0.0,<2.0.0'" >&2; exit 1; }
 ```
 
-Register (temporary bundled helper — needs `BAND_USER_API_KEY`), then verify install / gateway / prove a round-trip (always with the gateway interpreter):
+Register (SDK CLI — needs `band-sdk` installed + `BAND_USER_API_KEY`), then verify install / gateway / prove a round-trip (always with the gateway interpreter):
 
 ```bash
-"$HERMES_PY" scripts/register_agent.py  # mints the agent and saves BAND_AGENT_ID + BAND_API_KEY
+eval "$("$HERMES_PY" -m band.cli.register_agent)"  # mints the agent; prints BAND_AGENT_ID + BAND_API_KEY (see step 5 to persist)
 "$HERMES_PY" scripts/verify_install.py
 "$HERMES_PY" scripts/verify_gateway.py
 "$HERMES_PY" scripts/verify_roundtrip.py  # connected != working: prove an outbound hub send
@@ -142,12 +141,13 @@ re-installs or re-registers what's already in place.
 5. Ensure agent credentials are present (`BAND_AGENT_ID` + `BAND_API_KEY` in Hermes's `.env`). `scripts/verify_install.py` reports whether they are.
    - Already saved (e.g. the bootstrapper registered the agent before handing off): continue.
    - Pre-created agent: have the user create one at `app.band.ai/agents/new` and save `BAND_AGENT_ID` + `BAND_API_KEY` with Hermes's env writer.
-   - Auto-register from a user key — a **script step, not an LLM step**. Until the SDK CLI is published, use the bundled `scripts/register_agent.py` helper. With `BAND_USER_API_KEY` set in a plain shell, the helper reads it from the environment, mints the agent, and saves agent-scoped creds through Hermes's env writer; it never prints or persists the *user* key:
+   - Auto-register from a user key — a **script step, not an LLM step**, provided by the SDK (`band-sdk` must be installed first; the plugin install in step 3 pulls it in). With `BAND_USER_API_KEY` set in a plain shell, the SDK's `band-register-agent` CLI reads it from the environment, mints the agent, and prints eval-able agent-scoped creds; it never prints the *user* key. Capture them and persist only the agent-scoped pair to Hermes's `.env`:
      ```bash
-     "$HERMES_PY" scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY through Hermes env writer
+     eval "$("$HERMES_PY" -m band.cli.register_agent)"   # sets BAND_AGENT_ID + BAND_API_KEY in this shell
+     "$HERMES_PY" -c "import os; from hermes_cli.config import save_env_value as s; s('BAND_AGENT_ID', os.environ['BAND_AGENT_ID']); s('BAND_API_KEY', os.environ['BAND_API_KEY'])"
      unset BAND_USER_API_KEY
      ```
-     This is **idempotent at the flow level**: step 2 only routes here when `verify_install` reports the credentials missing, so a re-run never mints a second agent. **Do not put `BAND_USER_API_KEY` into the agent's own environment or read it yourself** — let the bootstrapper or a plain shell consume it before/outside the agent, so the user key never reaches the LLM. After `band.cli.register_agent` is published in `band-sdk`, replace this helper call with `"$HERMES_PY" -m band.cli.register_agent`. Have the user remove `BAND_USER_API_KEY` afterward.
+     This is **idempotent at the flow level**: step 2 only routes here when `verify_install` reports the credentials missing, so a re-run never mints a second agent. **Do not put `BAND_USER_API_KEY` into the agent's own environment or read it yourself** — let the bootstrapper or a plain shell consume it before/outside the agent, so the user key never reaches the LLM. Have the user remove `BAND_USER_API_KEY` afterward.
 
 6. Restart the gateway.
    - Use the user's normal Hermes gateway restart command.
@@ -186,7 +186,7 @@ re-installs or re-registers what's already in place.
 - Saving `BAND_AGENT_ID` with generic config-setting commands can route it to config YAML instead of Hermes `.env`; use the setup wizard or Hermes env writer.
 - Treating a successful WebSocket connect as full setup is incomplete; the hub must also be created and persisted as `BAND_HUB_ROOM`, **and** the agent must be able to post to it — prove the latter with `scripts/verify_roundtrip.py`, since hub bootstrap runs in a `try/except` that never blocks connect.
 - Leaving `BAND_USER_API_KEY` in the environment after registration unnecessarily keeps a broad user credential live.
-- Exposing the Band *user* key to the LLM: registration is a script step — the temporary bundled `scripts/register_agent.py` helper reads `BAND_USER_API_KEY` from the environment and saves only agent-scoped credentials. Don't set the user key in the *agent's* own environment or echo it; run registration in the bootstrapper or a plain shell before the agent takes over. Replace the helper with the SDK CLI once `band.cli.register_agent` is published.
+- Exposing the Band *user* key to the LLM: registration is a script step — the SDK's `band-register-agent` CLI reads `BAND_USER_API_KEY` from the environment and prints only agent-scoped credentials. Don't set the user key in the *agent's* own environment or echo it; run registration in the bootstrapper or a plain shell before the agent takes over.
 - Setting `BAND_HOME_ROOM` to another room means cron and notifications use that room instead of the hub.
 
 ## Verification

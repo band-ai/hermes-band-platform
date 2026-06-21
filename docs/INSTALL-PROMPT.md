@@ -27,9 +27,8 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
      cat /tmp/hbp/hermes_band_platform/skills/add-band/SKILL.md
    Run the skill's helper scripts (gateway_python.py, verify_install.py, verify_gateway.py,
    verify_roundtrip.py) from /tmp/hbp/hermes_band_platform/skills/add-band with the gateway's
-   own Python (the skill shows how to derive it as HERMES_PY). Registration temporarily
-   uses the bundled `scripts/register_agent.py` helper; switch to the SDK
-   `band-register-agent` / `band.cli.register_agent` command after it is published.
+   own Python (the skill shows how to derive it as HERMES_PY). Registration uses the SDK's
+   `band-register-agent` command (`band.cli.register_agent`), installed with `band-sdk`.
 
 2. Ground rules — honor these even where a step is ambiguous:
    • Install the plugin into the SAME Python that runs `hermes`, never another venv.
@@ -46,8 +45,7 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
 
 3. Stop and ask me at the two human gates:
    • Credentials — I either create the Band agent at app.band.ai/agents/new and give you
-     BAND_AGENT_ID + BAND_API_KEY, or I set BAND_USER_API_KEY for the bundled
-     `scripts/register_agent.py` helper.
+     BAND_AGENT_ID + BAND_API_KEY, or I set BAND_USER_API_KEY for `band-register-agent`.
    • The live test — I @mention the agent in the "Hermes Agent Hub" room and confirm a reply.
 
 4. When done, report: plugin version, how you enabled it (CLI vs config), the BAND_HUB_ROOM id,

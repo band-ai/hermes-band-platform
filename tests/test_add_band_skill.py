@@ -143,3 +143,48 @@ def test_verify_install_reports_missing_requirements(monkeypatch):
     assert "sdk_importable" in result["missing"]
     assert "entry_point" in result["missing"]
     assert "band_api_key_present" in result["missing"]
+
+
+def _stub_candidates(module, monkeypatch, banner=None, shebang=None, procs=()):
+    monkeypatch.setattr(module, "_from_version_banner", lambda: banner)
+    monkeypatch.setattr(module, "_from_launcher_shebang", lambda: shebang)
+    monkeypatch.setattr(module, "_from_running_process", lambda: list(procs))
+
+
+def test_gateway_python_accepts_supported_interpreter(monkeypatch):
+    module = _load_script("gateway_python.py")
+    _stub_candidates(module, monkeypatch, banner="/gw/venv/bin/python")
+    # First candidate imports hermes_cli at a supported version → it wins.
+    monkeypatch.setattr(module, "_probe", lambda path: ((3, 12, 1), True))
+
+    result = module.resolve()
+
+    assert result["ok"] is True
+    assert result["python"] == "/gw/venv/bin/python"
+    assert result["method"] == "version-banner"
+    assert result["error"] is None
+
+
+def test_gateway_python_rejects_unsupported_version(monkeypatch):
+    module = _load_script("gateway_python.py")
+    _stub_candidates(module, monkeypatch, banner="/gw/venv/bin/python")
+    monkeypatch.setattr(module, "_probe", lambda path: ((3, 14, 0), True))
+
+    result = module.resolve()
+
+    assert result["ok"] is False
+    assert result["python"] == "/gw/venv/bin/python"  # found, but version-gated
+    assert "3.14" in result["error"]
+
+
+def test_gateway_python_fails_when_no_candidate_has_hermes_cli(monkeypatch):
+    module = _load_script("gateway_python.py")
+    _stub_candidates(module, monkeypatch, banner="/some/python")
+    # No candidate can import hermes_cli (incl. the self fallback).
+    monkeypatch.setattr(module, "_probe", lambda path: ((3, 12, 0), False))
+
+    result = module.resolve()
+
+    assert result["ok"] is False
+    assert result["python"] is None
+    assert "hermes_cli" in result["error"]

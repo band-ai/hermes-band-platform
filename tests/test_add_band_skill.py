@@ -253,9 +253,67 @@ def test_register_agent_extracts_supported_response_shapes():
 def test_register_agent_requires_user_key(monkeypatch):
     module = _load_script("register_agent.py")
     monkeypatch.delenv("BAND_USER_API_KEY", raising=False)
+    monkeypatch.delenv("BAND_API_KEY", raising=False)
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
 
-    with pytest.raises(RuntimeError, match="BAND_USER_API_KEY"):
+    with pytest.raises(RuntimeError, match="Band API key is required"):
         module.register_agent()
+
+
+def test_register_agent_reads_user_key_from_band_api_key(monkeypatch):
+    """The web app's onboarding snippet exports the user key as BAND_API_KEY."""
+    module = _load_script("register_agent.py")
+    monkeypatch.delenv("BAND_USER_API_KEY", raising=False)
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
+    monkeypatch.setenv("BAND_API_KEY", "user-key-from-snippet")
+
+    captured = {}
+    monkeypatch.setattr(module, "_registration_headers", lambda k: captured.update(key=k) or {})
+    monkeypatch.setattr(
+        module, "_save_credentials", lambda agent_id, api_key: captured.update(saved=(agent_id, api_key))
+    )
+
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return b'{"agent": {"id": "a1"}, "credentials": {"api_key": "agent-key"}}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **k: _Resp())
+
+    result = module.register_agent()
+
+    assert captured["key"] == "user-key-from-snippet"
+    assert captured["saved"] == ("a1", "agent-key")
+    assert result["success"] is True
+
+
+def test_register_agent_short_circuits_when_already_registered(monkeypatch):
+    """A re-run must not re-register (or misread the persisted agent key)."""
+    module = _load_script("register_agent.py")
+    monkeypatch.setenv("BAND_AGENT_ID", "existing-agent")
+    monkeypatch.setenv("BAND_API_KEY", "persisted-agent-key")
+    monkeypatch.delenv("BAND_USER_API_KEY", raising=False)
+
+    def _fail(*a, **k):  # registration must not be attempted
+        raise AssertionError("register_agent attempted a network call on a re-run")
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", _fail)
+
+    result = module.register_agent()
+
+    assert result == {
+        "success": True,
+        "already_registered": True,
+        "agent_id": "existing-agent",
+        "saved": [],
+    }
 
 def test_register_agent_headers_use_browser_like_fingerprint(monkeypatch):
     module = _load_script("register_agent.py")

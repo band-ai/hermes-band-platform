@@ -2,9 +2,16 @@
 """Register a Band external agent and save Hermes agent-scoped credentials.
 
 Temporary helper until ``band-sdk`` publishes ``band.cli.register_agent``. The
-Band *user* API key is read only from ``BAND_USER_API_KEY`` and is never printed.
-Only the returned agent-scoped ``BAND_AGENT_ID`` + ``BAND_API_KEY`` are persisted
-through Hermes's env writer.
+Band *user* API key is read from ``BAND_API_KEY`` (the name the Band web app's
+onboarding snippet exports) or ``BAND_USER_API_KEY``, and is never printed. Only
+the returned agent-scoped ``BAND_AGENT_ID`` + ``BAND_API_KEY`` are persisted to
+the gateway ``.env`` through Hermes's env writer — the user key in the shell env
+is the caller's to ``unset`` before any agent/LLM handoff (the bootstrap does).
+
+If ``BAND_AGENT_ID`` is already set, registration short-circuits (pass
+``--force`` to re-register). This keeps a re-run from minting a second agent and,
+because the user key and the persisted agent key share the ``BAND_API_KEY`` name,
+from misreading an already-registered agent key as a fresh user key.
 """
 
 from __future__ import annotations
@@ -83,10 +90,28 @@ def _save_credentials(agent_id: str, api_key: str) -> None:
     save_env_value("BAND_API_KEY", api_key)
 
 
-def register_agent() -> dict[str, Any]:
-    user_key = os.environ.get("BAND_USER_API_KEY", "").strip()
+def register_agent(force: bool = False) -> dict[str, Any]:
+    # A prior run already minted an agent. Don't register again — and don't
+    # misread the persisted agent key (also BAND_API_KEY) as a fresh user key.
+    existing_agent = os.environ.get("BAND_AGENT_ID", "").strip()
+    if existing_agent and not force:
+        return {
+            "success": True,
+            "already_registered": True,
+            "agent_id": existing_agent,
+            "saved": [],
+        }
+
+    # The web app's onboarding snippet exports the *user* key as BAND_API_KEY;
+    # the manual/docs path may name it BAND_USER_API_KEY. Accept either,
+    # preferring the explicit user-key name.
+    user_key = (
+        os.environ.get("BAND_USER_API_KEY")
+        or os.environ.get("BAND_API_KEY")
+        or ""
+    ).strip()
     if not user_key:
-        raise RuntimeError("BAND_USER_API_KEY is required")
+        raise RuntimeError("a Band API key is required (set BAND_API_KEY or BAND_USER_API_KEY)")
 
     base_url = os.environ.get("BAND_BASE_URL", "https://app.band.ai").rstrip("/")
     name = os.environ.get("BAND_AGENT_NAME", "Hermes Agent")
@@ -134,8 +159,9 @@ def register_agent() -> dict[str, Any]:
 
 
 def main() -> int:
+    force = "--force" in sys.argv[1:]
     try:
-        result = register_agent()
+        result = register_agent(force=force)
     except Exception as exc:
         print(json.dumps({"success": False, "error": str(exc)}, sort_keys=True))
         return 1

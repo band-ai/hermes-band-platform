@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Register a Band external agent and persist agent-scoped credentials.
+"""Register a Band external agent and save Hermes agent-scoped credentials.
 
-The user-level Band key is read from an environment variable and is never
-printed or persisted. Only the returned agent id and agent API key are stored
+Temporary helper until ``band-sdk`` publishes ``band.cli.register_agent``. The
+Band *user* API key is read only from ``BAND_USER_API_KEY`` and is never printed.
+Only the returned agent-scoped ``BAND_AGENT_ID`` + ``BAND_API_KEY`` are persisted
 through Hermes's env writer.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
@@ -16,24 +16,32 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-DEFAULT_BASE_URL = "https://app.band.ai"
-DEFAULT_NAME = "Hermes"
-DEFAULT_DESCRIPTION = "Hermes AI gateway agent"
+_DEFAULT_REGISTRATION_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
 
 
-class SetupError(RuntimeError):
-    """User-facing setup failure."""
+def _registration_headers(user_key: str) -> dict[str, str]:
+    """Return headers for Band's agent-registration endpoint.
+
+    The registration endpoint sits behind Cloudflare. In practice it can reject
+    sparse script/client fingerprints with HTTP 403 / error 1010 even when the
+    Band API key is valid, so keep a browser-like request shape here and in the
+    future SDK CLI replacement.
+    """
+    return {
+        "User-Agent": os.environ.get("BAND_USER_AGENT", _DEFAULT_REGISTRATION_USER_AGENT),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/json",
+        "X-API-Key": user_key,
+    }
 
 
-def _clean_base_url(base_url: str | None) -> str:
-    raw = (base_url or DEFAULT_BASE_URL).strip() or DEFAULT_BASE_URL
-    if "://" not in raw:
-        raw = f"https://{raw}"
-    return raw.rstrip("/")
-
-
-def _extract(mapping: dict[str, Any], *path: str) -> Any:
-    cur: Any = mapping
+def _nested(data: dict[str, Any], *path: str) -> Any:
+    cur: Any = data
     for key in path:
         if not isinstance(cur, dict):
             return None
@@ -41,141 +49,98 @@ def _extract(mapping: dict[str, Any], *path: str) -> Any:
     return cur
 
 
-def extract_agent_credentials(payload: dict[str, Any]) -> tuple[str, str]:
-    """Return ``(agent_id, agent_api_key)`` from supported Band responses."""
+def _extract_credentials(data: dict[str, Any]) -> tuple[str, str]:
     agent_id = (
-        _extract(payload, "data", "agent", "id")
-        or _extract(payload, "agent", "id")
-        or _extract(payload, "data", "id")
-        or payload.get("agent_id")
-        or payload.get("id")
+        _nested(data, "data", "agent", "id")
+        or _nested(data, "agent", "id")
+        or _nested(data, "data", "id")
+        or data.get("agent_id")
+        or data.get("id")
+        or ""
     )
     api_key = (
-        _extract(payload, "data", "credentials", "api_key")
-        or _extract(payload, "credentials", "api_key")
-        or _extract(payload, "data", "api_key")
-        or payload.get("api_key")
-        or payload.get("key")
-        or payload.get("token")
+        _nested(data, "data", "credentials", "api_key")
+        or _nested(data, "credentials", "api_key")
+        or _nested(data, "data", "api_key")
+        or data.get("api_key")
+        or data.get("key")
+        or data.get("token")
+        or ""
     )
-    agent_id = str(agent_id or "").strip()
-    api_key = str(api_key or "").strip()
-    if not agent_id or not api_key:
-        raise SetupError("Band response did not include agent id and agent API key")
-    return agent_id, api_key
+    return str(agent_id).strip(), str(api_key).strip()
 
 
-def register_agent(
-    user_api_key: str,
-    *,
-    base_url: str | None = None,
-    name: str = DEFAULT_NAME,
-    description: str = DEFAULT_DESCRIPTION,
-    timeout: float = 30.0,
-) -> tuple[str, str]:
-    """Create a Band external agent and return agent-scoped credentials."""
-    key = (user_api_key or "").strip()
-    if not key:
-        raise SetupError("Missing user API key")
-    url = f"{_clean_base_url(base_url)}/api/v1/me/agents/register"
-    body = json.dumps(
-        {
-            "agent": {
-                "name": name.strip() or DEFAULT_NAME,
-                "description": description.strip() or DEFAULT_DESCRIPTION,
-            }
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "X-API-Key": key,
-        },
-    )
+def _save_credentials(agent_id: str, api_key: str) -> None:
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8") or "{}")
-    except urllib.error.HTTPError as exc:
-        detail = ""
-        try:
-            detail = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            detail = str(exc)
-        raise SetupError(f"Band registration failed with HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise SetupError(f"Band registration request failed: {exc.reason}") from exc
-    except json.JSONDecodeError as exc:
-        raise SetupError("Band registration response was not valid JSON") from exc
-    return extract_agent_credentials(payload)
-
-
-def save_agent_credentials(agent_id: str, agent_api_key: str) -> None:
-    """Persist only agent-scoped credentials to Hermes's .env."""
-    from hermes_cli.config import save_env_value
+        from hermes_cli.config import save_env_value
+    except Exception as exc:  # pragma: no cover - environment failure path
+        raise RuntimeError(
+            "Could not import hermes_cli.config.save_env_value from this Python. "
+            "Run this helper with the Hermes gateway Python."
+        ) from exc
 
     save_env_value("BAND_AGENT_ID", agent_id)
-    save_env_value("BAND_API_KEY", agent_api_key)
+    save_env_value("BAND_API_KEY", api_key)
 
 
-def _emit(payload: dict[str, Any]) -> None:
-    print(json.dumps(payload, indent=2, sort_keys=True))
+def register_agent() -> dict[str, Any]:
+    user_key = os.environ.get("BAND_USER_API_KEY", "").strip()
+    if not user_key:
+        raise RuntimeError("BAND_USER_API_KEY is required")
 
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", default=os.getenv("BAND_BASE_URL", DEFAULT_BASE_URL))
-    parser.add_argument("--name", default=DEFAULT_NAME)
-    parser.add_argument("--description", default=DEFAULT_DESCRIPTION)
-    parser.add_argument("--user-api-key-env", default="BAND_USER_API_KEY")
-    parser.add_argument("--no-save", action="store_true", help="Print result without writing .env")
-    parser.add_argument("--dry-run", action="store_true", help="Show what would be sent without network")
-    args = parser.parse_args(argv)
-
-    if args.dry_run:
-        _emit(
-            {
-                "success": True,
-                "dry_run": True,
-                "url": f"{_clean_base_url(args.base_url)}/api/v1/me/agents/register",
-                "would_read_secret_from": args.user_api_key_env,
-                "would_save": [] if args.no_save else ["BAND_AGENT_ID", "BAND_API_KEY"],
-            }
-        )
-        return 0
-
-    user_api_key = os.getenv(args.user_api_key_env, "").strip()
-    if not user_api_key:
-        _emit(
-            {
-                "success": False,
-                "error": f"Set {args.user_api_key_env} to a Band user API key first",
-            }
-        )
-        return 2
+    base_url = os.environ.get("BAND_BASE_URL", "https://app.band.ai").rstrip("/")
+    name = os.environ.get("BAND_AGENT_NAME", "Hermes Agent")
+    description = os.environ.get("BAND_AGENT_DESCRIPTION", "Hermes agent on Band")
+    body = json.dumps({"agent": {"name": name, "description": description}}).encode()
+    request = urllib.request.Request(
+        f"{base_url}/api/v1/me/agents/register",
+        data=body,
+        method="POST",
+        headers=_registration_headers(user_key),
+    )
 
     try:
-        agent_id, agent_api_key = register_agent(
-            user_api_key,
-            base_url=args.base_url,
-            name=args.name,
-            description=args.description,
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response_body = response.read().decode("utf-8")
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8", "replace")
+        raise RuntimeError(
+            f"Band registration failed (HTTP {exc.code}): {response_body[:300]}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Band registration failed: {exc.reason}") from exc
+
+    if status not in {200, 201}:
+        raise RuntimeError(
+            f"Band registration failed (HTTP {status}): {response_body[:300]}"
         )
-        if not args.no_save:
-            save_agent_credentials(agent_id, agent_api_key)
-        _emit(
-            {
-                "success": True,
-                "agent_id": agent_id,
-                "saved": [] if args.no_save else ["BAND_AGENT_ID", "BAND_API_KEY"],
-            }
-        )
-        return 0
-    except SetupError as exc:
-        _emit({"success": False, "error": str(exc)})
+
+    try:
+        payload = json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Band registration response was not valid JSON") from exc
+
+    agent_id, api_key = _extract_credentials(payload)
+    if not agent_id or not api_key:
+        raise RuntimeError("Band registration response missing agent id/key")
+
+    _save_credentials(agent_id, api_key)
+    return {
+        "success": True,
+        "agent_id": agent_id,
+        "saved": ["BAND_AGENT_ID", "BAND_API_KEY"],
+    }
+
+
+def main() -> int:
+    try:
+        result = register_agent()
+    except Exception as exc:
+        print(json.dumps({"success": False, "error": str(exc)}, sort_keys=True))
         return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":

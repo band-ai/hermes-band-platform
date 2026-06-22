@@ -64,9 +64,20 @@ def verify_gateway(log_path: Path | None = None) -> dict[str, Any]:
         pattern.pattern for pattern in FAILURE_PATTERNS if pattern.search(log_text)
     ]
     hub_room = _env_value("BAND_HUB_ROOM").strip()
+    home_room = _env_value("BAND_HOME_ROOM").strip()
+    owner_id = _env_value("BAND_OWNER_ID").strip()
+    # A working setup has a resolved main channel — normally the auto-persisted
+    # hub (BAND_HUB_ROOM), but an explicit BAND_HOME_ROOM override is equally
+    # valid. Gating on the hub alone would report failure for a fully functional
+    # gateway whose owner pinned a home room instead.
+    main_channel = hub_room or home_room
     return {
-        "success": bool(hub_room and success_hits and not failure_hits),
+        "success": bool(main_channel and success_hits and not failure_hits),
         "band_hub_room_present": bool(hub_room),
+        "band_home_room_present": bool(home_room),
+        # The agent knows its owner: resolved from /me on connect and persisted.
+        # Empty here usually pairs with the "Owner unresolved" failure signal.
+        "band_owner_present": bool(owner_id),
         "gateway_log": str(gateway_log),
         "success_signals": success_hits,
         "failure_signals": failure_hits,

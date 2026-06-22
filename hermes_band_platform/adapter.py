@@ -97,6 +97,16 @@ except ImportError:
     ParticipantRequest = None
     DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
 
+# Reuse the SDK's pure mention renderer (``@[[uuid]]`` → ``@handle``) rather than
+# re-deriving it. Imported *independently* of the guard above so an older
+# band-sdk without ``band.runtime.formatters`` never disables the whole adapter;
+# falls back to a passthrough when unavailable.
+try:
+    from band.runtime.formatters import replace_uuid_mentions
+except ImportError:
+    def replace_uuid_mentions(content, participants):  # passthrough fallback
+        return content
+
 
 # Default Band host — matches the SDK's own BandLink defaults
 # (wss://app.band.ai/api/v1/socket/websocket, https://app.band.ai).
@@ -195,6 +205,59 @@ def _derive_urls(base_url: str) -> tuple[str, str]:
     ws_url = f"wss://{host}/api/v1/socket/websocket"
     rest_url = f"https://{host}"
     return ws_url, rest_url
+
+
+def _mention_items(
+    participants: List[Dict[str, Any]],
+    *,
+    agent_id: Optional[str],
+    explicit_ids: Optional[List[str]] = None,
+    preferred: Optional[Dict[str, Any]] = None,
+) -> List[Any]:
+    """Build Band's mandatory mention list (Band requires ≥1 per message).
+
+    Single source of mention semantics, shared by the adapter's outbound ``send``
+    and the ``band_send_message`` tool so both behave identically. Precedence:
+
+      1. ``explicit_ids`` — one item per id (handle/name resolved from
+         *participants* when present).
+      2. ``preferred`` — a single recipient (the reply auto-mention, e.g. the
+         last human sender).
+      3. otherwise — every non-agent participant in the room.
+
+    Returns a possibly-empty list; the caller decides whether empty is an error
+    (the tool raises; the adapter lets Band reject the send).
+    """
+    by_id = {p["id"]: p for p in participants if p.get("id")}
+    ids = [str(m).strip() for m in (explicit_ids or []) if str(m).strip()]
+    if ids:
+        return [
+            ChatMessageRequestMentionsItem(
+                id=mid,
+                handle=(by_id.get(mid) or {}).get("handle"),
+                name=(by_id.get(mid) or {}).get("name"),
+            )
+            for mid in ids
+        ]
+    if preferred and preferred.get("id"):
+        return [
+            ChatMessageRequestMentionsItem(
+                id=preferred["id"],
+                handle=preferred.get("handle"),
+                name=preferred.get("name"),
+            )
+        ]
+    items: List[Any] = []
+    for p in participants:
+        pid = p.get("id")
+        if not pid or pid == agent_id or (p.get("type") or "") == "Agent":
+            continue
+        items.append(
+            ChatMessageRequestMentionsItem(
+                id=pid, handle=p.get("handle"), name=p.get("name")
+            )
+        )
+    return items
 
 
 class BandAdapter(BasePlatformAdapter):
@@ -1303,6 +1366,10 @@ class BandAdapter(BasePlatformAdapter):
             return None
 
         items = getattr(ctx, "data", None) or []
+        # Render ``@[[uuid]]`` mentions as ``@handle`` for readability when we
+        # already hold this room's participants (warm cache only — never force a
+        # fetch on this best-effort path).
+        cached_participants = self._participants_cache.get(room_id) or []
         lines: List[str] = []
         for item in items:
             message_type = getattr(item, "message_type", "text") or "text"
@@ -1317,7 +1384,7 @@ class BandAdapter(BasePlatformAdapter):
                 or getattr(item, "sender_type", None)
                 or "?"
             )
-            lines.append(f"{who}: {text.strip()}")
+            lines.append(f"{who}: {replace_uuid_mentions(text.strip(), cached_participants)}")
 
         if not lines:
             return None
@@ -1685,26 +1752,14 @@ class BandAdapter(BasePlatformAdapter):
         """Build the mandatory mention list for a send.
 
         Prefer the cached last-human-sender; otherwise mention every non-agent
-        participant in the room.
+        participant in the room. Shares mention semantics with the
+        ``band_send_message`` tool via :func:`_mention_items`.
         """
-        items: List[Any] = []
-
         last = self._last_human_sender.get(room_id)
         if last and last.get("id"):
-            items.append(
-                ChatMessageRequestMentionsItem(id=last["id"], handle=last.get("handle"))
-            )
-            return items
-
+            return _mention_items([], agent_id=self._agent_id, preferred=last)
         participants = await self._get_participants(room_id)
-        for p in participants:
-            pid = p.get("id")
-            if not pid or pid == self._agent_id:
-                continue
-            if p.get("type") == "Agent":
-                continue
-            items.append(ChatMessageRequestMentionsItem(id=pid, handle=p.get("handle")))
-        return items
+        return _mention_items(participants, agent_id=self._agent_id)
 
     def _record_sent_id(self, sent_id: str) -> None:
         """Track a sent message id for the inbound self-echo backstop.

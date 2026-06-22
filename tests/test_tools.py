@@ -715,6 +715,44 @@ class TestCheckBandToolsAvailable:
 # 9. Registry tuple shape
 # ---------------------------------------------------------------------------
 
+class TestMentionItems:
+    """The shared mention builder used by both the adapter send and the tool."""
+
+    @staticmethod
+    def _ids(items):
+        return [i.id for i in items]
+
+    def test_explicit_ids_resolve_handle_from_participants(self):
+        from hermes_band_platform.adapter import _mention_items
+
+        parts = [{"id": "u1", "handle": "alice", "name": "Alice"}]
+        items = _mention_items(parts, agent_id="me", explicit_ids=["u1", "u2"])
+        assert self._ids(items) == ["u1", "u2"]
+        assert items[0].handle == "alice"   # resolved
+        assert items[1].handle is None      # unknown id → bare mention
+
+    def test_preferred_wins_over_fallback(self):
+        from hermes_band_platform.adapter import _mention_items
+
+        items = _mention_items(
+            [{"id": "x", "handle": "x"}],  # would be the fallback
+            agent_id="me",
+            preferred={"id": "human", "handle": "bob"},
+        )
+        assert self._ids(items) == ["human"]
+
+    def test_fallback_excludes_agent_and_other_agents(self):
+        from hermes_band_platform.adapter import _mention_items
+
+        parts = [
+            {"id": "me", "handle": "bot", "type": "Agent"},      # self
+            {"id": "a2", "handle": "peer", "type": "Agent"},     # other agent
+            {"id": "h1", "handle": "alice", "type": "User"},     # human
+        ]
+        items = _mention_items(parts, agent_id="me")
+        assert self._ids(items) == ["h1"]
+
+
 class TestBandToolsTuple:
 
     def test_all_tools_present(self):

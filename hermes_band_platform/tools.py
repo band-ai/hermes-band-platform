@@ -47,6 +47,7 @@ from tools.registry import tool_error, tool_result
 from .adapter import (
     DEFAULT_REQUEST_OPTIONS,
     _derive_urls,
+    _mention_items,
     _short_id,
     check_band_requirements,
 )
@@ -393,36 +394,13 @@ async def _mentions_for(
     if not _load_sdk():
         raise _ToolUnavailable("Band not available (band-sdk not installed)")
 
-    # Fetch participants once for handle resolution / fallback mentions.
+    # Fetch participants once for handle resolution / fallback mentions, then
+    # delegate to the shared builder (same semantics as the adapter's send).
     participants = await _list_participants(rest, room_id)
-    by_id = {p["id"]: p for p in participants if p.get("id")}
-
-    ids = [str(m).strip() for m in (mention_ids or []) if str(m).strip()]
-    items: List[Any] = []
-    if ids:
-        for mid in ids:
-            p = by_id.get(mid)
-            items.append(
-                ChatMessageRequestMentionsItem(
-                    id=mid,
-                    handle=(p.get("handle") if p else None),
-                    name=(p.get("name") if p else None),
-                )
-            )
-    else:
-        # Resolve the running agent's id so we don't @mention ourselves.
-        agent_id = await _agent_id_or_none(rest)
-        for p in participants:
-            pid = p.get("id")
-            if not pid or pid == agent_id:
-                continue
-            if (p.get("type") or "") == "Agent":
-                continue
-            items.append(
-                ChatMessageRequestMentionsItem(
-                    id=pid, handle=p.get("handle"), name=p.get("name")
-                )
-            )
+    # Resolve the running agent's id so the fallback never @mentions ourselves
+    # (irrelevant when explicit mention_ids are given).
+    agent_id = None if mention_ids else await _agent_id_or_none(rest)
+    items = _mention_items(participants, agent_id=agent_id, explicit_ids=mention_ids)
 
     if not items:
         raise _ToolError(

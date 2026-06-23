@@ -1,3 +1,6 @@
+# GENERATED FILE — do not edit.
+# Source of truth: hermes_band_platform/plugin.yaml
+# Regenerate with: python scripts/sync_root_manifest.py --write
 name: band
 label: Band
 kind: platform
@@ -57,8 +60,8 @@ optional_env:
     prompt: "Allow all users? (true/false)"
     password: false
   - name: BAND_TOOL_OWNERS
-    description: "Comma-separated platform:user_id identities allowed to drive Band actions (e.g. telegram:<tg-id>). The resolved Band owner is always authorized from Band rooms; this allowlist grants others (fail-closed otherwise)."
-    prompt: "Band tool owners (comma-separated platform:user_id)"
+    description: "Optional. Band action tools are loose by default (Band owns access control and enforces roles server-side). Set this to a comma-separated platform:user_id allowlist (e.g. telegram:<tg-id>) to restrict the tools to specific callers; the resolved Band owner always passes. Leave empty to allow anyone the agent is conversing with."
+    prompt: "Band tool owners (comma-separated platform:user_id, or empty for loose)"
     password: false
   - name: BAND_GROUP_SESSIONS_PER_USER
     description: "Split a group room into a separate session per participant (true) or keep one shared session for the whole room (false). Default false — a Band room is one shared channel."

@@ -71,6 +71,16 @@ def _install_band_mock() -> MagicMock:
         def __init__(self, task_id=None):
             self.task_id = task_id
 
+    # band.runtime.formatters — pure helper the adapter reuses. Faithful
+    # stand-in for replace_uuid_mentions so the adapter's independent import
+    # binds the stub rather than its passthrough fallback.
+    def _fake_replace_uuid_mentions(content, participants):
+        for p in participants or []:
+            pid, handle = p.get("id"), p.get("handle")
+            if pid and handle:
+                content = content.replace(f"@[[{pid}]]", f"@{handle}")
+        return content
+
     band_mod = MagicMock()
     band_platform_mod = MagicMock()
     band_platform_link_mod = MagicMock()
@@ -83,6 +93,9 @@ def _install_band_mock() -> MagicMock:
     band_client_rest_mod.ParticipantRequest = _FakeParticipantRequest
     band_client_rest_mod.ChatRoomRequest = _FakeChatRoomRequest
     band_client_rest_mod.DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
+    band_runtime_mod = MagicMock()
+    band_runtime_formatters_mod = MagicMock()
+    band_runtime_formatters_mod.replace_uuid_mentions = _fake_replace_uuid_mentions
 
     sys.modules["band"] = band_mod
     sys.modules["band.platform"] = band_platform_mod
@@ -90,6 +103,8 @@ def _install_band_mock() -> MagicMock:
     sys.modules["band.platform.event"] = band_platform_event_mod
     sys.modules["band.client"] = band_client_mod
     sys.modules["band.client.rest"] = band_client_rest_mod
+    sys.modules["band.runtime"] = band_runtime_mod
+    sys.modules["band.runtime.formatters"] = band_runtime_formatters_mod
 
     return band_mod
 

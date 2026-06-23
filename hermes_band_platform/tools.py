@@ -17,12 +17,14 @@ Design anchors (see ``Drafts/hermes-band-tools-events-buildplan.md``):
     when absent they default to the current Band room resolved from session
     context (``HERMES_SESSION_PLATFORM`` / ``HERMES_SESSION_CHAT_ID``).  An
     explicit id always wins (cross-room / off-platform / freshly-created rooms).
-  * **Owner-gated mutation.** Creating rooms and adding/removing/messaging are
-    mutating and outward-facing, and may be exposed on other platforms, so every
-    mutating handler enforces an owner gate, **fail-closed**.  The gate uses the
-    explicit ``BAND_TOOL_OWNERS`` allowlist when set; when unset it falls back to
-    the calling platform's own ``<PLATFORM>_ALLOWED_USERS`` (so a single-operator
-    setup needs no second allowlist).  Read-only tools (find/get) bypass the gate.
+  * **Loose outbound, Band owns access.** Creating rooms and
+    adding/removing/messaging are the agent's own outbound actions; Band itself
+    is the ACL (it admits participants and enforces member/admin/owner roles
+    server-side), so Hermes does not re-gate them — they are loose by default.
+    The one owner-only surface is Hermes slash commands, gated in ``adapter.py``.
+    Optional tightening: set ``BAND_TOOL_OWNERS`` (``platform:user_id`` list) to
+    restrict these tools to specific callers (the resolved Band owner always
+    passes).  Read-only tools (find/get) are never gated.
 
 Conventions mirrored from ``adapter.py``: lazy SDK import (the module imports
 cleanly when ``band-sdk`` is absent), ``_short_id`` for low-cardinality logs,
@@ -45,6 +47,7 @@ from tools.registry import tool_error, tool_result
 from .adapter import (
     DEFAULT_REQUEST_OPTIONS,
     _derive_urls,
+    _mention_items,
     _short_id,
     check_band_requirements,
 )
@@ -165,7 +168,11 @@ async def _rest() -> Any:
         pass
 
     if not _load_sdk():
-        raise _ToolUnavailable("Band not available (band-sdk not installed)")
+        raise _ToolUnavailable(
+            "Band not available (band-sdk not installed in the gateway Python). "
+            "Directory plugin installs do not install dependencies; run: "
+            "uv pip install --python \"$HERMES_PY\" 'band-sdk>=1.0.0,<2.0.0'"
+        )
     from band.client.rest import AsyncRestClient
 
     api_key = os.getenv("BAND_API_KEY", "").strip()
@@ -193,24 +200,25 @@ def _resolve_room(args: Dict[str, Any]) -> str:
     raise _ToolError("room_id required (no current Band room in this conversation)")
 
 
-def _platform_allows_user(platform: str, user_id: str) -> bool:
-    """Whether ``platform``'s own allowed-users config admits ``user_id``.
+def _resolve_room_for_send(args: Dict[str, Any]) -> tuple[str, bool]:
+    """Resolve the send target, allowing a fallback to the owner's hub/home.
 
-    Mirrors the gateway's per-platform gating env: ``<PLATFORM>_ALLOWED_USERS``
-    (a comma-separated id list) plus an allow-all flag (``<PLATFORM>_ALLOW_ALL``
-    or ``<PLATFORM>_ALLOW_ALL_USERS``). Used only as the ``BAND_TOOL_OWNERS``
-    fallback below — it reuses whatever allowlist the platform already trusts.
+    Returns ``(room_id, fell_back_to_home)``. Precedence matches
+    ``_resolve_room`` (explicit ``room_id`` → current Band room) but, instead of
+    erroring when neither is present, falls back to the owner's hub/home room so
+    "send a message to me" works from a non-Band session. Raises only when no
+    room is in context AND no home room is configured yet (hub not bootstrapped).
     """
-    up = platform.upper()
-    allow_all = (
-        os.getenv(f"{up}_ALLOW_ALL_USERS") or os.getenv(f"{up}_ALLOW_ALL") or ""
-    ).strip().lower()
-    if allow_all in {"1", "true", "yes", "on"}:
-        return True
-    allowed = {
-        u.strip() for u in os.getenv(f"{up}_ALLOWED_USERS", "").split(",") if u.strip()
-    }
-    return bool(user_id) and user_id in allowed
+    try:
+        return _resolve_room(args), False
+    except _ToolError:
+        home = _home_room()
+        if home:
+            return home, True
+        raise _ToolError(
+            "no target room: pass room_id, send from a Band room, or connect the "
+            "gateway so the owner hub (home channel) is created"
+        )
 
 
 def _owner_identity() -> Optional[str]:
@@ -233,56 +241,63 @@ def _owner_identity() -> Optional[str]:
     return owner or (os.getenv("BAND_OWNER_ID", "").strip() or None)
 
 
-def _require_owner() -> None:
-    """Authorize the calling session for a mutating Band action.
+def _home_room() -> Optional[str]:
+    """Resolve the owner's hub / home room id — live adapter first, env fallback.
 
-    Owner bypass (checked first): the agent's resolved Band owner calling
-    from *any* Band room is the platform's designated operator, so it needs
-    no allowlist entry — owner implies authority (fail-closed when the owner
-    is unresolved).
-
-    Primary gate: the explicit ``BAND_TOOL_OWNERS`` allowlist (comma-separated
-    ``platform:user_id`` identities). When set, only those identities pass.
-
-    Fallback (when ``BAND_TOOL_OWNERS`` is unset/empty): defer to the *calling
-    platform's own* allowed-users config (``<PLATFORM>_ALLOWED_USERS`` and the
-    allow-all flag). This lets a single-operator setup work without a second
-    allowlist — whoever the platform already trusts to talk to the agent may
-    also drive Band. It is broader than the explicit gate (it inherits the
-    platform's chat allowlist), so set ``BAND_TOOL_OWNERS`` to tighten.
-
-    There is no built-in cross-platform owner in Hermes, so either way the Band
-    tools carry their own gate; if neither path authorizes the caller (or the
-    caller has no identity), the action refuses — fail-closed.
+    This is where the agent reaches its owner: the private owner↔agent hub, also
+    wired as the Band home (main) channel. Prefer the connected adapter's
+    ``_hub_room_id``; fall back to ``BAND_HOME_ROOM`` then ``BAND_HUB_ROOM`` for
+    out-of-process callers. Never raises.
     """
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(Platform("band")) if runner else None
+        hub = getattr(adapter, "_hub_room_id", None) if adapter is not None else None
+        if hub:
+            return str(hub)
+    except Exception:
+        pass
+    return (
+        os.getenv("BAND_HOME_ROOM", "").strip()
+        or os.getenv("BAND_HUB_ROOM", "").strip()
+        or None
+    )
+
+
+def _authorize_band_action() -> None:
+    """Authorize a mutating Band action.
+
+    Policy: outbound Band actions are **loose** by default. Band itself owns
+    access control — it decides who is admitted to a room and enforces role
+    permissions (member/admin/owner) server-side — so Hermes does not re-gate
+    the agent's own outbound actions. The one owner-only surface is Hermes
+    slash commands, gated separately in ``adapter.py``.
+
+    Optional tightening: set ``BAND_TOOL_OWNERS`` (comma-separated
+    ``platform:user_id`` identities) to restrict Band actions to specific
+    callers. When it is set, the resolved Band owner is always allowed (owner
+    implies authority) and everyone else must appear in the allowlist; when it
+    is unset (the default), any caller passes and Band enforces the real
+    permissions.
+    """
+    owners = {o.strip() for o in os.getenv("BAND_TOOL_OWNERS", "").split(",") if o.strip()}
+    if not owners:
+        return  # loose default — Band's own ACL/roles are the authority
+
     platform = (get_session_env("HERMES_SESSION_PLATFORM") or "").strip()
     user_id = (get_session_env("HERMES_SESSION_USER_ID") or "").strip()
+
+    # Owner-implies-authority: the resolved Band owner is always allowed.
+    if platform == "band" and user_id and user_id == _owner_identity():
+        return
+
     who = f"{platform}:{user_id}"
-
-    # Owner-implies-authority: the resolved Band owner → authorized from any
-    # Band room, no env needed.
-    if platform == "band" and user_id:
-        owner_uuid = _owner_identity()
-        if owner_uuid and user_id == owner_uuid:
-            return
-
-    owners = {o.strip() for o in os.getenv("BAND_TOOL_OWNERS", "").split(",") if o.strip()}
-    if owners:
-        if who not in owners:
-            raise _ToolError(f"Band actions are owner-only; {who} is not authorized")
-        return
-
-    # Fallback: BAND_TOOL_OWNERS unset -> inherit the calling platform's allowlist.
-    if not platform or not user_id:
+    if who not in owners:
         raise _ToolError(
-            "Band actions are owner-only; no caller identity and BAND_TOOL_OWNERS is unset"
+            f"Band actions are restricted by BAND_TOOL_OWNERS; {who} is not authorized"
         )
-    if _platform_allows_user(platform, user_id):
-        return
-    raise _ToolError(
-        f"Band actions are owner-only; {who} is not on BAND_TOOL_OWNERS "
-        f"nor {platform.upper()}_ALLOWED_USERS"
-    )
 
 
 def _peer_to_dict(p: Any) -> Dict[str, Any]:
@@ -379,36 +394,13 @@ async def _mentions_for(
     if not _load_sdk():
         raise _ToolUnavailable("Band not available (band-sdk not installed)")
 
-    # Fetch participants once for handle resolution / fallback mentions.
+    # Fetch participants once for handle resolution / fallback mentions, then
+    # delegate to the shared builder (same semantics as the adapter's send).
     participants = await _list_participants(rest, room_id)
-    by_id = {p["id"]: p for p in participants if p.get("id")}
-
-    ids = [str(m).strip() for m in (mention_ids or []) if str(m).strip()]
-    items: List[Any] = []
-    if ids:
-        for mid in ids:
-            p = by_id.get(mid)
-            items.append(
-                ChatMessageRequestMentionsItem(
-                    id=mid,
-                    handle=(p.get("handle") if p else None),
-                    name=(p.get("name") if p else None),
-                )
-            )
-    else:
-        # Resolve the running agent's id so we don't @mention ourselves.
-        agent_id = await _agent_id_or_none(rest)
-        for p in participants:
-            pid = p.get("id")
-            if not pid or pid == agent_id:
-                continue
-            if (p.get("type") or "") == "Agent":
-                continue
-            items.append(
-                ChatMessageRequestMentionsItem(
-                    id=pid, handle=p.get("handle"), name=p.get("name")
-                )
-            )
+    # Resolve the running agent's id so the fallback never @mentions ourselves
+    # (irrelevant when explicit mention_ids are given).
+    agent_id = None if mention_ids else await _agent_id_or_none(rest)
+    items = _mention_items(participants, agent_id=agent_id, explicit_ids=mention_ids)
 
     if not items:
         raise _ToolError(
@@ -472,7 +464,7 @@ async def _handle_create_room(args: dict, **kwargs) -> str:
     first message.
     """
     try:
-        _require_owner()
+        _authorize_band_action()
         if not _load_sdk():
             raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
@@ -611,13 +603,22 @@ async def _handle_find_contact(args: dict, **kwargs) -> str:
 # ---------------------------------------------------------------------------
 
 async def _handle_send_message(args: dict, **kwargs) -> str:
-    """Send a message into a room (mandatory @mention; chunked at the cap)."""
+    """Send a message into a room (mandatory @mention; chunked at the cap).
+
+    Targeting precedence: explicit ``room_id`` → current Band room → the owner's
+    hub/home room. The last fallback is what makes "send a message to me"
+    (the owner) work from a non-Band session (CLI / web / another platform),
+    where there is no current Band room: the message lands in the owner↔agent
+    hub and @mentions the owner by default.
+    """
     try:
-        _require_owner()
+        _authorize_band_action()
         if not _load_sdk():
             raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
-        room_id = _resolve_room(args)
+        # Send may fall back to the owner's hub when no room is in context, so
+        # the agent can reach its owner from anywhere.
+        room_id, fell_back_to_home = _resolve_room_for_send(args)
 
         content = str(args.get("content") or "")
         if not content.strip():
@@ -626,6 +627,12 @@ async def _handle_send_message(args: dict, **kwargs) -> str:
         mention_ids = args.get("mention_ids")
         if mention_ids is not None and not isinstance(mention_ids, list):
             mention_ids = [mention_ids]
+        # When reaching the owner via the hub fallback with no explicit mentions,
+        # @mention the owner specifically so "message me" always pings the owner.
+        if mention_ids is None and fell_back_to_home:
+            owner = _owner_identity()
+            if owner:
+                mention_ids = [owner]
         mentions = await _mentions_for(rest, room_id, mention_ids)
 
         chunks = BasePlatformAdapter.truncate_message(content, _MAX_MESSAGE_LENGTH)
@@ -649,7 +656,7 @@ async def _handle_send_message(args: dict, **kwargs) -> str:
 async def _handle_add_participant(args: dict, **kwargs) -> str:
     """Add a participant (by UUID) to a room."""
     try:
-        _require_owner()
+        _authorize_band_action()
         if not _load_sdk():
             raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
@@ -680,7 +687,7 @@ async def _handle_add_participant(args: dict, **kwargs) -> str:
 async def _handle_remove_participant(args: dict, **kwargs) -> str:
     """Remove a participant (by UUID) from a room."""
     try:
-        _require_owner()
+        _authorize_band_action()
         if not _load_sdk():
             raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
@@ -748,7 +755,7 @@ BAND_CREATE_ROOM_SCHEMA = {
     "description": (
         "Create a new Band room. Use `person` + `message` to spin up a room and message "
         "someone in one step (the room title is derived by the server from the first "
-        "message — there is no title argument). Owner-only."
+        "message — there is no title argument)."
     ),
     "parameters": {
         "type": "object",
@@ -811,7 +818,10 @@ BAND_SEND_MESSAGE_SCHEMA = {
     "description": (
         "Send a message to a Band room. Band requires at least one @mention per message: pass "
         "`mention_ids` to choose recipients, otherwise all non-agent participants are mentioned. "
-        "Defaults to the current Band room; pass `room_id` to target another. Owner-only."
+        "Targets the current Band room by default; pass `room_id` to target another. To message "
+        "your owner ('me' / 'the owner') from anywhere — including a non-Band session — omit "
+        "`room_id`: with no current Band room the message goes to your owner's hub (home channel) "
+        "and @mentions the owner."
     ),
     "parameters": {
         "type": "object",
@@ -832,7 +842,7 @@ BAND_ADD_PARTICIPANT_SCHEMA = {
     "name": "band_add_participant",
     "description": (
         "Add a participant (by UUID) to a Band room. Defaults to the current Band room; pass "
-        "`room_id` to target another. Owner-only."
+        "`room_id` to target another."
     ),
     "parameters": {
         "type": "object",
@@ -853,7 +863,7 @@ BAND_REMOVE_PARTICIPANT_SCHEMA = {
     "name": "band_remove_participant",
     "description": (
         "Remove a participant (by UUID) from a Band room. Defaults to the current Band room; "
-        "pass `room_id` to target another. Owner-only."
+        "pass `room_id` to target another."
     ),
     "parameters": {
         "type": "object",

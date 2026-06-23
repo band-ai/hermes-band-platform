@@ -515,6 +515,78 @@ class TestRoomResolution:
             clear_session_vars(tokens)
 
 
+class TestSendToOwnerFallback:
+    """`band_send_message` reaches the owner's hub when no room is in context.
+
+    This is what makes "send a message to me" work from a non-Band session
+    (CLI / web / another platform), where `_resolve_room` finds no current room.
+    """
+
+    @pytest.mark.asyncio
+    async def test_non_band_session_falls_back_to_home_and_mentions_owner(self, monkeypatch):
+        monkeypatch.setenv("BAND_TOOL_OWNERS", "telegram:u-owner")
+        monkeypatch.setenv("BAND_HOME_ROOM", "hub-home")
+        monkeypatch.setenv("BAND_OWNER_ID", "owner-uuid")
+        tokens = set_session_vars(platform="telegram", chat_id="tg-1", user_id="u-owner")
+        rest = _make_rest()
+        try:
+            with _patch_rest(rest), _patch_agent_id("agent-self"):
+                out = _parse(await band_tools._handle_send_message({"content": "ping"}))
+        finally:
+            clear_session_vars(tokens)
+        assert out["success"] is True
+        assert out["room_id"] == "hub-home"
+        call = rest.agent_api_messages.create_agent_chat_message.await_args
+        mentions = call.kwargs["message"].mentions
+        assert [m.id for m in mentions] == ["owner-uuid"]  # owner pinged by default
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_hub_room_when_no_home(self, monkeypatch):
+        # Only BAND_HUB_ROOM set (no BAND_HOME_ROOM) -> still resolves.
+        monkeypatch.setenv("BAND_TOOL_OWNERS", "telegram:u-owner")
+        monkeypatch.delenv("BAND_HOME_ROOM", raising=False)
+        monkeypatch.setenv("BAND_HUB_ROOM", "hub-1")
+        monkeypatch.setenv("BAND_OWNER_ID", "owner-uuid")
+        tokens = set_session_vars(platform="telegram", chat_id="tg-1", user_id="u-owner")
+        rest = _make_rest()
+        try:
+            with _patch_rest(rest), _patch_agent_id("agent-self"):
+                out = _parse(await band_tools._handle_send_message({"content": "ping"}))
+        finally:
+            clear_session_vars(tokens)
+        assert out["success"] is True
+        assert out["room_id"] == "hub-1"
+
+    @pytest.mark.asyncio
+    async def test_no_home_configured_errors(self, monkeypatch):
+        monkeypatch.setenv("BAND_TOOL_OWNERS", "telegram:u-owner")
+        monkeypatch.delenv("BAND_HOME_ROOM", raising=False)
+        monkeypatch.delenv("BAND_HUB_ROOM", raising=False)
+        tokens = set_session_vars(platform="telegram", chat_id="tg-1", user_id="u-owner")
+        rest = _make_rest()
+        try:
+            with _patch_rest(rest), _patch_agent_id("agent-self"):
+                out = _parse(await band_tools._handle_send_message({"content": "ping"}))
+        finally:
+            clear_session_vars(tokens)
+        assert "error" in out
+        assert "no target room" in out["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_band_session_does_not_fall_back(self, owner_session, monkeypatch):
+        # In a Band room the current room wins — no home fallback.
+        monkeypatch.setenv("BAND_HOME_ROOM", "hub-home")
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[_peer("u-human", handle="alice")])
+        )
+        with _patch_rest(rest), _patch_agent_id("agent-self"):
+            out = _parse(await band_tools._handle_send_message({"content": "hi"}))
+        assert out["success"] is True
+        assert out["room_id"] == "room-current"  # not hub-home
+
+
 # ---------------------------------------------------------------------------
 # 7. Owner gate
 # ---------------------------------------------------------------------------
@@ -522,33 +594,45 @@ class TestRoomResolution:
 class TestOwnerGate:
 
     @pytest.mark.asyncio
-    async def test_unset_owners_and_no_platform_allowlist_refuses(self, monkeypatch):
-        # Owners unset AND the calling platform has no allowlist -> still refuses
-        # (the fallback inherits the platform allowlist; with none, fail-closed).
+    async def test_unset_owners_allows_any_caller(self, monkeypatch):
+        # Loose by default: with BAND_TOOL_OWNERS unset, the mutating tools are
+        # allowed for any caller — Band owns access control and enforces roles
+        # server-side, so Hermes does not re-gate the agent's outbound actions.
         monkeypatch.delenv("BAND_TOOL_OWNERS", raising=False)
-        monkeypatch.delenv("BAND_ALLOWED_USERS", raising=False)
-        monkeypatch.delenv("BAND_ALLOW_ALL", raising=False)
-        monkeypatch.delenv("BAND_ALLOW_ALL_USERS", raising=False)
         tokens = set_session_vars(platform="band", chat_id="room-1", user_id="u1")
         rest = _make_rest()
         try:
             with _patch_rest(rest):
                 for handler, args in (
                     (band_tools._handle_create_room, {}),
-                    (band_tools._handle_send_message, {"content": "hi"}),
+                    (band_tools._handle_send_message, {"content": "hi", "mention_ids": ["p-1"]}),
                     (band_tools._handle_add_participant, {"participant_id": "p"}),
                     (band_tools._handle_remove_participant, {"participant_id": "p"}),
                 ):
                     out = _parse(await handler(args))
-                    assert "error" in out
-                    assert "owner-only" in out["error"]
+                    assert out.get("success") is True, out
         finally:
             clear_session_vars(tokens)
-        # Nothing mutated.
-        rest.agent_api_chats.create_agent_chat.assert_not_called()
-        rest.agent_api_participants.add_agent_chat_participant.assert_not_called()
-        rest.agent_api_participants.remove_agent_chat_participant.assert_not_called()
-        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unset_owners_allows_offplatform_caller(self, monkeypatch):
+        # Loose applies to off-Band callers too (Telegram / CLI / cron); no
+        # platform allowlist is consulted.
+        monkeypatch.delenv("BAND_TOOL_OWNERS", raising=False)
+        monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+        tokens = set_session_vars(platform="telegram", chat_id="c", user_id="rando")
+        rest = _make_rest()
+        try:
+            with _patch_rest(rest):
+                out = _parse(
+                    await band_tools._handle_add_participant(
+                        {"participant_id": "p", "room_id": "r"}
+                    )
+                )
+        finally:
+            clear_session_vars(tokens)
+        assert out["success"] is True
+        rest.agent_api_participants.add_agent_chat_participant.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_wrong_platform_user_refused(self, monkeypatch):
@@ -587,71 +671,10 @@ class TestOwnerGate:
         rest.agent_api_participants.add_agent_chat_participant.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_unset_owners_falls_back_to_platform_allowlist(self, monkeypatch):
-        # BAND_TOOL_OWNERS unset -> defer to the calling platform's allowlist.
-        # telegram:78986112 is admitted because 78986112 is in TELEGRAM_ALLOWED_USERS.
-        monkeypatch.delenv("BAND_TOOL_OWNERS", raising=False)
-        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "78986112")
-        tokens = set_session_vars(platform="telegram", chat_id="c", user_id="78986112")
-        rest = _make_rest()
-        try:
-            with _patch_rest(rest):
-                out = _parse(
-                    await band_tools._handle_add_participant(
-                        {"participant_id": "p", "room_id": "r"}
-                    )
-                )
-        finally:
-            clear_session_vars(tokens)
-        assert out["success"] is True
-        rest.agent_api_participants.add_agent_chat_participant.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_unset_owners_platform_allowlist_denies_nonmember(self, monkeypatch):
-        # Fallback active, but the caller isn't in the platform allowlist -> refuse.
-        monkeypatch.delenv("BAND_TOOL_OWNERS", raising=False)
-        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "78986112")
-        monkeypatch.delenv("TELEGRAM_ALLOW_ALL_USERS", raising=False)
-        monkeypatch.delenv("TELEGRAM_ALLOW_ALL", raising=False)
-        tokens = set_session_vars(platform="telegram", chat_id="c", user_id="rando")
-        rest = _make_rest()
-        try:
-            with _patch_rest(rest):
-                out = _parse(
-                    await band_tools._handle_add_participant(
-                        {"participant_id": "p", "room_id": "r"}
-                    )
-                )
-        finally:
-            clear_session_vars(tokens)
-        assert "error" in out
-        assert "owner-only" in out["error"]
-        rest.agent_api_participants.add_agent_chat_participant.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_unset_owners_honors_platform_allow_all(self, monkeypatch):
-        # Fallback honors the platform's allow-all flag.
-        monkeypatch.delenv("BAND_TOOL_OWNERS", raising=False)
-        monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
-        monkeypatch.setenv("TELEGRAM_ALLOW_ALL_USERS", "true")
-        tokens = set_session_vars(platform="telegram", chat_id="c", user_id="anyone")
-        rest = _make_rest()
-        try:
-            with _patch_rest(rest):
-                out = _parse(
-                    await band_tools._handle_add_participant(
-                        {"participant_id": "p", "room_id": "r"}
-                    )
-                )
-        finally:
-            clear_session_vars(tokens)
-        assert out["success"] is True
-        rest.agent_api_participants.add_agent_chat_participant.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_readonly_tools_bypass_gate(self, monkeypatch):
-        # Owners unset + non-owner session: read-only tools still work.
-        monkeypatch.delenv("BAND_TOOL_OWNERS", raising=False)
+    async def test_readonly_tools_never_gated(self, monkeypatch):
+        # Read-only tools work even when BAND_TOOL_OWNERS restricts and the
+        # caller is not on the allowlist.
+        monkeypatch.setenv("BAND_TOOL_OWNERS", "band:someone-else")
         tokens = set_session_vars(platform="telegram", chat_id="c", user_id="rando")
         rest = _make_rest()
         rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
@@ -692,6 +715,44 @@ class TestCheckBandToolsAvailable:
 # 9. Registry tuple shape
 # ---------------------------------------------------------------------------
 
+class TestMentionItems:
+    """The shared mention builder used by both the adapter send and the tool."""
+
+    @staticmethod
+    def _ids(items):
+        return [i.id for i in items]
+
+    def test_explicit_ids_resolve_handle_from_participants(self):
+        from hermes_band_platform.adapter import _mention_items
+
+        parts = [{"id": "u1", "handle": "alice", "name": "Alice"}]
+        items = _mention_items(parts, agent_id="me", explicit_ids=["u1", "u2"])
+        assert self._ids(items) == ["u1", "u2"]
+        assert items[0].handle == "alice"   # resolved
+        assert items[1].handle is None      # unknown id → bare mention
+
+    def test_preferred_wins_over_fallback(self):
+        from hermes_band_platform.adapter import _mention_items
+
+        items = _mention_items(
+            [{"id": "x", "handle": "x"}],  # would be the fallback
+            agent_id="me",
+            preferred={"id": "human", "handle": "bob"},
+        )
+        assert self._ids(items) == ["human"]
+
+    def test_fallback_excludes_agent_and_other_agents(self):
+        from hermes_band_platform.adapter import _mention_items
+
+        parts = [
+            {"id": "me", "handle": "bot", "type": "Agent"},      # self
+            {"id": "a2", "handle": "peer", "type": "Agent"},     # other agent
+            {"id": "h1", "handle": "alice", "type": "User"},     # human
+        ]
+        items = _mention_items(parts, agent_id="me")
+        assert self._ids(items) == ["h1"]
+
+
 class TestBandToolsTuple:
 
     def test_all_tools_present(self):
@@ -721,14 +782,12 @@ class TestBandToolsTuple:
 class TestOwnerAuthority:
 
     @pytest.fixture(autouse=True)
-    def _clean_gate_env(self, monkeypatch):
-        """Strip every gate env so only the owner bypass can authorize."""
-        for var in (
-            "BAND_TOOL_OWNERS",
-            "BAND_ALLOWED_USERS",
-            "BAND_ALLOW_ALL",
-            "BAND_ALLOW_ALL_USERS",
-        ):
+    def _restrict_to_allowlist(self, monkeypatch):
+        """Restrict Band tools to an allowlist that excludes the test callers,
+        so only the owner bypass can authorize. (With BAND_TOOL_OWNERS unset the
+        tools are loose and the owner bypass would be moot.)"""
+        monkeypatch.setenv("BAND_TOOL_OWNERS", "band:not-a-test-user")
+        for var in ("BAND_ALLOWED_USERS", "BAND_ALLOW_ALL", "BAND_ALLOW_ALL_USERS"):
             monkeypatch.delenv(var, raising=False)
         yield
 
@@ -741,7 +800,7 @@ class TestOwnerAuthority:
         assert band_tools._owner_identity() is None
 
     @pytest.mark.asyncio
-    async def test_owner_in_hub_authorized_without_allowlist(self, monkeypatch):
+    async def test_owner_in_hub_authorized_despite_allowlist(self, monkeypatch):
         monkeypatch.setenv("BAND_OWNER_ID", "owner-1")
         tokens = set_session_vars(platform="band", chat_id="hub-1", user_id="owner-1")
         rest = _make_rest()
@@ -774,7 +833,8 @@ class TestOwnerAuthority:
         rest.agent_api_participants.add_agent_chat_participant.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_non_owner_in_hub_refused(self, monkeypatch):
+    async def test_non_owner_not_in_allowlist_refused(self, monkeypatch):
+        # A non-owner who isn't on the restricting allowlist is refused.
         monkeypatch.setenv("BAND_OWNER_ID", "owner-1")
         tokens = set_session_vars(platform="band", chat_id="hub-1", user_id="someone")
         rest = _make_rest()
@@ -786,11 +846,13 @@ class TestOwnerAuthority:
         finally:
             clear_session_vars(tokens)
         assert "error" in out
-        assert "owner-only" in out["error"]
+        assert "not authorized" in out["error"]
         rest.agent_api_participants.add_agent_chat_participant.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_unresolved_owner_fail_closed(self, monkeypatch):
+    async def test_unresolved_owner_not_in_allowlist_refused(self, monkeypatch):
+        # With an allowlist set and the owner unresolved, the caller has no
+        # bypass and is not listed -> refused.
         monkeypatch.delenv("BAND_OWNER_ID", raising=False)
         tokens = set_session_vars(platform="band", chat_id="hub-1", user_id="owner-1")
         rest = _make_rest()
@@ -802,6 +864,7 @@ class TestOwnerAuthority:
         finally:
             clear_session_vars(tokens)
         assert "error" in out
+        assert "not authorized" in out["error"]
         rest.agent_api_participants.add_agent_chat_participant.assert_not_called()
 
     @pytest.mark.asyncio

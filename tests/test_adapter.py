@@ -129,6 +129,78 @@ class TestBandAdapterInit:
         assert adapter.name == "Band"
 
 
+class TestBandAccessPolicy:
+    """The gateway authorizes inbound Band traffic via the adapter's own policy.
+
+    ``gateway.authz_mixin._is_user_authorized`` only trusts an own-policy
+    adapter's intake when BOTH ``enforces_own_access_policy`` is True AND the
+    effective policy for the chat type is ``"allowlist"`` (the #34515 fail-open
+    fix). Band has no DMs, so every source is ``chat_type="group"`` and the host
+    reads ``_group_policy``. If these drift, a fresh install default-denies every
+    sender — including the owner — and the agent replies "not an authorized
+    user". These tests pin the contract so a host/plugin coupling regression
+    fails here instead of in production.
+    """
+
+    def test_enforces_own_access_policy_is_true(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.enforces_own_access_policy is True
+
+    def test_group_policy_is_allowlist(self, monkeypatch):
+        # Band traffic is all chat_type="group"; the host reads _group_policy.
+        adapter = _make_adapter(monkeypatch)
+        assert adapter._group_policy == "allowlist"
+
+    def test_dm_policy_is_allowlist(self, monkeypatch):
+        # Band has no DMs, but pin _dm_policy too for forward-compat with any
+        # host path that reads it.
+        adapter = _make_adapter(monkeypatch)
+        assert adapter._dm_policy == "allowlist"
+
+    def test_host_authorizes_band_traffic_without_env_allowlist(self, monkeypatch):
+        """End-to-end: the real host ``_is_user_authorized`` admits a Band user.
+
+        Drives ``gateway.authz_mixin.GatewayAuthorizationMixin._is_user_authorized``
+        — the exact gate that produced "not an authorized user" — with no env
+        allowlist and no pairing, proving the adapter's policy attrs carry the
+        intake decision. Skips if the host mixin isn't importable (e.g. tests run
+        without a host on the path).
+        """
+        authz = pytest.importorskip("gateway.authz_mixin")
+        from gateway.session import SessionSource
+
+        # Strip every env opt-in so only the adapter's own policy can authorize.
+        for var in (
+            "BAND_ALLOWED_USERS",
+            "BAND_ALLOW_ALL",
+            "GATEWAY_ALLOWED_USERS",
+            "GATEWAY_ALLOW_ALL_USERS",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        adapter = _make_adapter(monkeypatch)
+        band = adapter.platform
+
+        host = authz.GatewayAuthorizationMixin()
+        host.adapters = {band: adapter}
+        host.pairing_store = SimpleNamespace(is_approved=lambda *_: False)
+        host.config = SimpleNamespace(platforms={band: adapter.config})
+
+        src = SessionSource(
+            platform=band,
+            user_id="some-band-user",
+            chat_id="room-123",
+            chat_type="group",
+        )
+        assert host._is_user_authorized(src) is True
+
+        # Negative control: drop the policy attrs and the same gate default-denies
+        # — i.e. the bug this fix closes.
+        del adapter._group_policy
+        del adapter._dm_policy
+        assert host._is_user_authorized(src) is False
+
+
 # ---------------------------------------------------------------------------
 # 2. check_band_requirements
 # ---------------------------------------------------------------------------
@@ -1633,6 +1705,8 @@ class TestHubBootstrap:
         assert adapter.config.home_channel is not None
         assert adapter.config.home_channel.chat_id == "hub-new-1"
         assert adapter.config.home_channel.name == "Hermes Hub"
+        # Home is persisted (not just in-memory) so every config reader sees it.
+        assert adapter._test_saved_env.get("BAND_HOME_ROOM") == "hub-new-1"
 
     @pytest.mark.asyncio
     async def test_never_adopts_existing_owner_room(self, adapter):
@@ -1690,10 +1764,11 @@ class TestHubBootstrap:
         await adapter._ensure_hub()
 
         # Hub still bootstrapped + persisted, but the operator's main-channel
-        # override is respected.
+        # override is respected — and NOT overwritten with the hub id.
         assert adapter._hub_room_id == "hub-new-1"
         assert adapter._test_saved_env.get("BAND_HUB_ROOM") == "hub-new-1"
         assert adapter.config.home_channel is None
+        assert "BAND_HOME_ROOM" not in adapter._test_saved_env
 
     @pytest.mark.asyncio
     async def test_hub_create_failure_is_non_fatal(self, adapter):
@@ -1708,6 +1783,84 @@ class TestHubBootstrap:
         assert adapter._hub_room_id is None
         assert adapter.config.home_channel is None
         assert "BAND_HUB_ROOM" not in adapter._test_saved_env
+
+
+class TestPersistOwner:
+    """The owner resolved from /me is persisted so it survives the process."""
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
+        a = _make_adapter(monkeypatch)
+        saved = {}
+        import hermes_cli.config as _hcfg
+
+        monkeypatch.setattr(_hcfg, "save_env_value", lambda k, v: saved.__setitem__(k, v))
+        a._test_saved_env = saved
+        return a
+
+    def test_persists_owner_to_env_and_extra(self, adapter, monkeypatch):
+        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
+        adapter._persist_owner("owner-uuid")
+        assert adapter._test_saved_env.get("BAND_OWNER_ID") == "owner-uuid"
+        assert adapter.config.extra.get("owner_id") == "owner-uuid"
+
+    def test_persist_owner_idempotent_when_env_matches(self, adapter, monkeypatch):
+        monkeypatch.setenv("BAND_OWNER_ID", "owner-uuid")
+        adapter._persist_owner("owner-uuid")
+        # Already in env → no redundant .env write (extra still mirrored).
+        assert "BAND_OWNER_ID" not in adapter._test_saved_env
+        assert adapter.config.extra.get("owner_id") == "owner-uuid"
+
+
+class TestWireHomeChannel:
+    """Direct coverage of the hub→home wiring + persistence rules."""
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        monkeypatch.delenv("BAND_HOME_ROOM", raising=False)
+        a = _make_adapter(monkeypatch)
+        saved = {}
+        import hermes_cli.config as _hcfg
+
+        monkeypatch.setattr(_hcfg, "save_env_value", lambda k, v: saved.__setitem__(k, v))
+        a._test_saved_env = saved
+        return a
+
+    def test_wires_and_persists_when_no_override(self, adapter, monkeypatch):
+        monkeypatch.delenv("BAND_HOME_ROOM", raising=False)
+        adapter._wire_home_channel("hub-1")
+        assert adapter.config.home_channel.chat_id == "hub-1"
+        assert adapter._test_saved_env.get("BAND_HOME_ROOM") == "hub-1"
+
+    def test_operator_override_respected_and_not_persisted(self, adapter, monkeypatch):
+        monkeypatch.setenv("BAND_HOME_ROOM", "operator-room")
+        adapter._wire_home_channel("hub-1")
+        # A home pointing at a non-hub room is an operator choice — untouched.
+        assert adapter.config.home_channel is None
+        assert "BAND_HOME_ROOM" not in adapter._test_saved_env
+
+    def test_previous_hub_is_not_an_override(self, adapter, monkeypatch):
+        # Failover: BAND_HOME_ROOM still points at the old hub (our own auto-home),
+        # so re-home to the new hub rather than treating it as an override.
+        monkeypatch.setenv("BAND_HOME_ROOM", "old-hub")
+        adapter._wire_home_channel("new-hub", previous_hub="old-hub")
+        assert adapter.config.home_channel.chat_id == "new-hub"
+        assert adapter._test_saved_env.get("BAND_HOME_ROOM") == "new-hub"
+
+    def test_operator_override_survives_failover(self, adapter, monkeypatch):
+        # Operator pinned a non-hub home; a failover must not steal it.
+        monkeypatch.setenv("BAND_HOME_ROOM", "operator-room")
+        adapter._wire_home_channel("new-hub", previous_hub="old-hub")
+        assert adapter.config.home_channel is None
+        assert "BAND_HOME_ROOM" not in adapter._test_saved_env
+
+    def test_idempotent_when_home_already_hub(self, adapter, monkeypatch):
+        monkeypatch.setenv("BAND_HOME_ROOM", "hub-1")
+        adapter._wire_home_channel("hub-1")
+        assert adapter.config.home_channel.chat_id == "hub-1"
+        # Already equal → no redundant write.
+        assert "BAND_HOME_ROOM" not in adapter._test_saved_env
 
 
 # ---------------------------------------------------------------------------
@@ -2179,6 +2332,8 @@ class TestHubFailover:
         assert adapter._test_saved_env.get("BAND_HUB_ROOM") == "new-hub-1"
         assert adapter.config.home_channel is not None
         assert adapter.config.home_channel.chat_id == "new-hub-1"
+        # Home re-persisted to follow the new hub.
+        assert adapter._test_saved_env.get("BAND_HOME_ROOM") == "new-hub-1"
         # Counter reset; one failover counted.
         assert adapter._hub_send_failures == 0
         assert adapter._hub_failovers_done == 1

@@ -52,6 +52,28 @@ jobs:
           manifest-file: .release-please-manifest.json
           target-branch: main
 
+      - name: Sync generated root manifest into the release PR
+        # release-please bumps only the packaged manifest (single source of
+        # truth); the root plugin.yaml is generated from it. When a release PR
+        # is open, regenerate the root file on the PR branch so it lands with
+        # the version bump and `main` is never stale.
+        if: ${{ steps.release.outputs.pr }}
+        env:
+          GH_TOKEN: ${{ steps.app_token_generator.outputs.token }}
+        run: |
+          set -euo pipefail
+          BRANCH='${{ fromJSON(steps.release.outputs.pr).headBranchName }}'
+          git fetch origin "$BRANCH"
+          git checkout "$BRANCH"
+          python3 scripts/sync_root_manifest.py --write
+          if ! git diff --quiet -- plugin.yaml; then
+            git config user.name "thenvoi-release-bot"
+            git config user.email "release-bot@users.noreply.github.com"
+            git add plugin.yaml
+            git commit -m "chore: regenerate root plugin.yaml from packaged manifest"
+            git -c http.extraheader="AUTHORIZATION: bearer $GH_TOKEN" push origin "HEAD:$BRANCH"
+          fi
+
   publish:
     needs: [release]
     if: needs.release.outputs.release_created == 'true'

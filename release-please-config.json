@@ -13,10 +13,6 @@
         },
         {
           "type": "generic",
-          "path": "plugin.yaml"
-        },
-        {
-          "type": "generic",
           "path": "flake.nix"
         },
         {

@@ -1647,6 +1647,13 @@ class BandAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Post to a Band room on the link's own event loop. See ``send``."""
+        # Re-check here, not just in send(): when marshalled across loops this
+        # runs later on the link loop, where a concurrent disconnect() may have
+        # dropped the link. Return a clean SendResult instead of letting the
+        # participants/mentions REST calls AttributeError on a None link.
+        if not self._link:
+            return SendResult(success=False, error="Not connected", retryable=True)
+
         room_id = chat_id
 
         mention_items = await self._build_mentions(room_id)

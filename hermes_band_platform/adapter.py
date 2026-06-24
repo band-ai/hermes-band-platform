@@ -35,8 +35,9 @@ Scope notes:
 import asyncio
 import logging
 import os
+import time
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 from urllib.parse import urlsplit
 
 from gateway.config import HomeChannel, Platform, PlatformConfig  # noqa: E402
@@ -258,6 +259,64 @@ def _mention_items(
             )
         )
     return items
+
+
+class _TranscriptRow(TypedDict):
+    """The stable, documented subset of a Hermes session-transcript row.
+
+    We deliberately restrict seeded rows to the columns the gateway's
+    ``messages`` table actually persists (``role``/``content``/``timestamp``).
+    The gateway's ``append_to_transcript`` accepts extra keys
+    (``platform_message_id``, ``observed``, …), but those are NOT in the
+    persisted schema across versions, so depending on them would be fragile.
+    """
+
+    role: str
+    content: str
+    timestamp: float
+
+
+def _seed_role_for(sender_type: str, sender_id: Optional[str], agent_id: str) -> str:
+    """Map a Band message's sender to a transcript role.
+
+    Our own past replies must be replayed as ``assistant`` turns — otherwise the
+    rehydrated transcript reads as a run of unanswered user messages and the
+    model re-answers questions it already handled. Everyone else (humans and
+    peer agents) is a ``user`` turn from this agent's point of view.
+    """
+    if sender_type == "Agent" and sender_id and sender_id == agent_id:
+        return "assistant"
+    return "user"
+
+
+def _seed_epoch(inserted_at: Any) -> float:
+    """Best-effort Unix-epoch float for a row's ``timestamp`` column.
+
+    Band timestamps are datetimes; the gateway stores ``timestamp REAL`` as a
+    Unix epoch. Fall back to "now" when the value is missing or unparseable so a
+    seeded row is never dropped over a timestamp quirk.
+    """
+    try:
+        return float(inserted_at.timestamp())
+    except (AttributeError, TypeError, ValueError, OSError):
+        return time.time()
+
+
+def _can_seed_sessions(store: Any) -> bool:
+    """Whether the wired session store exposes the public seed API we need.
+
+    Guards the durable-seed path so an older gateway (without these methods)
+    degrades gracefully to the legacy ``channel_context`` blob instead of
+    raising.
+    """
+    return store is not None and all(
+        hasattr(store, method)
+        for method in (
+            "get_or_create_session",
+            "load_transcript",
+            "append_to_transcript",
+        )
+    )
 
 
 class BandAdapter(BasePlatformAdapter):
@@ -905,10 +964,15 @@ class BandAdapter(BasePlatformAdapter):
                 if room_id in self._known_rooms or room_id in self._left_rooms:
                     self._left_rooms.discard(room_id)
                     self._known_rooms.add(room_id)
-                    self._rehydrate_rooms.add(room_id)
+                    # Only a genuinely cold room needs rehydration. A spurious
+                    # room_added for a room with a live session (e.g. a
+                    # server-side re-subscribe replay, which arrives after the
+                    # connect-time pre-subscribe populated _known_rooms) must not
+                    # re-inject stale history over good local state.
+                    if not self._has_active_session(room_id):
+                        self._rehydrate_rooms.add(room_id)
                     logger.debug(
-                        "[band] Re-joined known room %s — flagged for rehydration",
-                        _short_id(room_id),
+                        "[band] Re-joined known room %s", _short_id(room_id)
                     )
                 else:
                     self._known_rooms.add(room_id)
@@ -1127,15 +1191,16 @@ class BandAdapter(BasePlatformAdapter):
 
         # Rehydration: if this room is flagged — re-joined (room_removed reset
         # its session) or returning with no local session (agent restart / lost
-        # DB, flagged by _catch_up_all_rooms) — pull recent agent-relevant Band
-        # context into channel_context so the session rebuilds from the room's
-        # server-side state rather than empty history. Best-effort — never block
-        # the message on a hydration failure; the flag is consumed once
-        # regardless so we don't refetch on every subsequent message.
+        # DB, flagged by _catch_up_all_rooms) — rebuild context from the room's
+        # server-side Band history. Preferred path durably seeds the gateway
+        # session transcript (Band is the source of truth, survives restarts);
+        # an older gateway falls back to a one-shot channel_context blob.
+        # Best-effort — never block the message on a hydration failure; the flag
+        # is consumed once regardless so we don't refetch on every message.
         channel_context: Optional[str] = None
         if room_id in self._rehydrate_rooms:
             self._rehydrate_rooms.discard(room_id)
-            channel_context = await self._fetch_rehydration_context(room_id)
+            channel_context = await self._rehydrate_room(source, room_id, msg_id)
 
         if msg_id:
             self._seen_inbound_ids.add(msg_id)
@@ -1353,53 +1418,227 @@ class BandAdapter(BasePlatformAdapter):
             )
             return False
 
-    async def _fetch_rehydration_context(self, room_id: str) -> Optional[str]:
-        """Pull recent agent-relevant Band messages to rebuild a room's context.
+    async def _rehydrate_room(
+        self, source: Any, room_id: str, trigger_msg_id: Optional[str]
+    ) -> Optional[str]:
+        """Rebuild a cold room's context from Band's server-side history.
 
-        Used when local history is missing — a room re-join or an agent that
-        came back online with no stored session. Returns a plain-text blob
-        suitable for ``MessageEvent.channel_context``, or None when nothing
-        useful was retrieved. Best-effort: any failure is swallowed (logged at
-        debug) so a hydration miss never blocks the triggering message.
+        Preferred path: durably **seed the gateway session transcript** so the
+        recovered history persists across this turn and future restarts — Band
+        is the source of truth. Falls back to a one-shot ``channel_context``
+        text blob only when the session store can't be seeded (older gateway).
+
+        Returns the ``channel_context`` to attach to the triggering message, or
+        ``None`` when the durable seed handled it (nothing to attach).
         """
+        if await self._seed_session_from_band(source, room_id, trigger_msg_id):
+            return None
+        return await self._rehydration_context_blob(room_id)
+
+    async def _seed_session_from_band(
+        self, source: Any, room_id: str, trigger_msg_id: Optional[str]
+    ) -> bool:
+        """Seed the room's Hermes session transcript from Band history.
+
+        Returns True when the durable-seed path owns rehydration for this room
+        (so the caller skips the ``channel_context`` fallback), False when the
+        session store lacks the public API and the caller should fall back.
+
+        Idempotent: seeds only into an *empty* transcript, so a re-join over a
+        live session — or a second message before the flag clears — never
+        duplicates rows (``append_to_transcript`` is append-only, no de-dup).
+        """
+        store = getattr(self, "_session_store", None)
+        if not _can_seed_sessions(store):
+            return False
         try:
-            ctx = await self._link.rest.agent_api_context.get_agent_chat_context(
-                chat_id=room_id,
-                request_options=DEFAULT_REQUEST_OPTIONS,
+            entry = store.get_or_create_session(source)
+            if store.load_transcript(entry.session_id):
+                # Warm session — history already present; nothing to rebuild.
+                return True
+            # Messages the live/catch-up path will answer as their own turns
+            # (the trigger + the actionable mention backlog) must not also be
+            # seeded as history, or the agent would see them twice.
+            exclude = await self._actionable_answer_ids(room_id)
+            if trigger_msg_id:
+                exclude.add(trigger_msg_id)
+            participants = self._participants_cache.get(room_id) or []
+            rows = self._build_seed_rows(
+                await self._fetch_room_context(room_id), exclude, participants
             )
+            for row in rows:
+                store.append_to_transcript(entry.session_id, row)
+            if rows:
+                logger.info(
+                    "[band] Seeded %d history row(s) into room %s session",
+                    len(rows),
+                    _short_id(room_id),
+                )
+            return True
+        except Exception as e:
+            # Best-effort: a seed failure must never block the triggering
+            # message. The durable API existed, so don't double up via the
+            # text-blob fallback — just proceed without recovered context.
+            logger.debug(
+                "[band] Session seed failed for room %s: %s", _short_id(room_id), e
+            )
+            return True
+
+    def _build_seed_rows(
+        self,
+        items: List[Any],
+        exclude_ids: set,
+        participants: List[Dict[str, Any]],
+    ) -> List[_TranscriptRow]:
+        """Convert Band context items into transcript rows (chronological order).
+
+        Own replies become ``assistant`` turns; everyone else becomes a ``user``
+        turn prefixed ``[name]`` — mirroring how the gateway renders a live
+        shared-room message — so the model can attribute speakers and never
+        re-answers a question it already handled. Non-text items, empty content,
+        and anything in ``exclude_ids`` are skipped.
+        """
+        rows: List[_TranscriptRow] = []
+        for item in items:
+            mid = getattr(item, "id", None)
+            if mid and mid in exclude_ids:
+                continue
+            if (getattr(item, "message_type", "text") or "text") != "text":
+                continue
+            text = (getattr(item, "content", None) or "").strip()
+            if not text:
+                continue
+            role = _seed_role_for(
+                getattr(item, "sender_type", "") or "",
+                getattr(item, "sender_id", None),
+                self._agent_id,
+            )
+            content = replace_uuid_mentions(text, participants)
+            if role == "user":
+                who = getattr(item, "sender_name", None) or "someone"
+                content = f"[{who}] {content}"
+            rows.append(
+                {
+                    "role": role,
+                    "content": content,
+                    "timestamp": _seed_epoch(getattr(item, "inserted_at", None)),
+                }
+            )
+        return rows
+
+    async def _actionable_answer_ids(self, room_id: str) -> set:
+        """Ids of messages the answer path will handle as their own turns.
+
+        These are the not-yet-``processed`` messages that @mention the agent —
+        the trigger and the offline backlog the ``/next`` drain re-answers.
+        Excluding them from the seed keeps history and answered turns disjoint
+        (no double-answer). ``list_agent_messages`` with no status filter returns
+        everything not processed (chronological, paginated); we keep the
+        mentions, since only those are ever answered.
+        """
+        ids: set = set()
+        if self._link is None:
+            return ids
+        cursor: Optional[str] = None
+        try:
+            while True:
+                kwargs: Dict[str, Any] = {
+                    "chat_id": room_id,
+                    "request_options": DEFAULT_REQUEST_OPTIONS,
+                }
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = await self._link.rest.agent_api_messages.list_agent_messages(
+                    **kwargs
+                )
+                for msg in getattr(resp, "data", None) or []:
+                    mid = getattr(msg, "id", None)
+                    if mid and self._is_agent_mentioned(msg):
+                        ids.add(mid)
+                cursor, has_more = self._next_page(resp)
+                if not has_more:
+                    break
         except Exception as e:
             logger.debug(
-                "[band] Rehydration context fetch failed for room %s: %s",
+                "[band] Backlog enumeration failed for room %s: %s",
                 _short_id(room_id),
                 e,
             )
-            return None
+        return ids
 
-        items = getattr(ctx, "data", None) or []
-        # Render ``@[[uuid]]`` mentions as ``@handle`` for readability when we
-        # already hold this room's participants (warm cache only — never force a
-        # fetch on this best-effort path).
+    async def _fetch_room_context(self, room_id: str) -> List[Any]:
+        """Page through Band's chat-context endpoint (oldest first).
+
+        This is the rehydration view — every message relevant to the agent for
+        execution context. Best-effort: any failure yields what we have so far
+        so a hydration miss never blocks the triggering message.
+        """
+        items: List[Any] = []
+        if self._link is None:
+            return items
+        cursor: Optional[str] = None
+        try:
+            while True:
+                kwargs: Dict[str, Any] = {
+                    "chat_id": room_id,
+                    "request_options": DEFAULT_REQUEST_OPTIONS,
+                }
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = await self._link.rest.agent_api_context.get_agent_chat_context(
+                    **kwargs
+                )
+                items.extend(getattr(resp, "data", None) or [])
+                cursor, has_more = self._next_page(resp)
+                if not has_more:
+                    break
+        except Exception as e:
+            logger.debug(
+                "[band] Context fetch failed for room %s: %s", _short_id(room_id), e
+            )
+        return items
+
+    @staticmethod
+    def _next_page(resp: Any) -> tuple:
+        """Extract ``(next_cursor, has_more)`` from a paginated REST response.
+
+        Returns ``has_more=True`` only when the cursor is a real non-empty
+        string *and* the response flags more pages — so a response whose
+        ``metadata`` is absent or a test double never spins the paging loop.
+        """
+        meta = getattr(resp, "metadata", None)
+        cursor = getattr(meta, "next_cursor", None)
+        has_more = getattr(meta, "has_more", False)
+        if isinstance(cursor, str) and cursor and has_more is True:
+            return cursor, True
+        return None, False
+
+    async def _rehydration_context_blob(self, room_id: str) -> Optional[str]:
+        """Fallback: a one-shot ``channel_context`` text blob (legacy path).
+
+        Used only when the session store can't be durably seeded (older
+        gateway). Returns a plain-text transcript suitable for
+        ``MessageEvent.channel_context``, or None when nothing useful was found.
+        """
+        items = await self._fetch_room_context(room_id)
         cached_participants = self._participants_cache.get(room_id) or []
         lines: List[str] = []
         for item in items:
-            message_type = getattr(item, "message_type", "text") or "text"
-            if message_type != "text":
+            if (getattr(item, "message_type", "text") or "text") != "text":
                 continue
-            text = getattr(item, "content", None) or ""
-            if not text.strip():
+            text = (getattr(item, "content", None) or "").strip()
+            if not text:
                 continue
             who = (
                 getattr(item, "sender_name", None)
-                or getattr(item, "name", None)
                 or getattr(item, "sender_type", None)
                 or "?"
             )
-            lines.append(f"{who}: {replace_uuid_mentions(text.strip(), cached_participants)}")
-
+            lines.append(f"{who}: {replace_uuid_mentions(text, cached_participants)}")
         if not lines:
             return None
         logger.debug(
-            "[band] Rehydrated %d context message(s) for room %s",
+            "[band] Rehydrated %d context message(s) for room %s (fallback blob)",
             len(lines),
             _short_id(room_id),
         )

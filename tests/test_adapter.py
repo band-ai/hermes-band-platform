@@ -1043,8 +1043,20 @@ class TestRoomAddedRejoinFlagsRehydration:
         event = SimpleNamespace(type="room_added", room_id="known-room")
         await adapter._handle_event(event)
         adapter._link.subscribe_room.assert_called_once_with("known-room")
-        # Re-join: flagged for rehydration, no synthetic wake.
+        # Re-join of a cold room: flagged for rehydration, no synthetic wake.
         assert "known-room" in adapter._rehydrate_rooms
+
+    @pytest.mark.asyncio
+    async def test_rejoin_room_with_live_session_not_flagged(self, adapter):
+        # A room_added for a room that already has a live session (e.g. a
+        # server-side re-subscribe replay) must NOT re-inject stale history.
+        adapter._known_rooms.add("warm-room")
+        adapter._session_store = _FakeSessionStore(
+            active_keys=["agent:main:band:group:warm-room"]
+        )
+        event = SimpleNamespace(type="room_added", room_id="warm-room")
+        await adapter._handle_event(event)
+        assert "warm-room" not in adapter._rehydrate_rooms
 
 
 class TestRehydrationOnNextMessage:
@@ -1132,6 +1144,218 @@ class TestRehydrationOnNextMessage:
         evt = adapter.handle_message.call_args[0][0]
         assert evt.channel_context is None
         assert "rejoined-room" not in adapter._rehydrate_rooms
+
+
+class _SeedingSessionStore(_FakeSessionStore):
+    """Session store stand-in exposing the public durable-seed API.
+
+    Records every row passed to ``append_to_transcript`` so tests can assert
+    what was seeded. ``load_transcript`` starts empty (cold) unless seeded with
+    ``existing_transcript`` (warm).
+    """
+
+    def __init__(self, *, existing_transcript=None, session_id="sess-1", **kw):
+        super().__init__(**kw)
+        self._session_id = session_id
+        self._transcripts = {session_id: list(existing_transcript or [])}
+        self.appended = []
+
+    def get_or_create_session(self, source):
+        return SimpleNamespace(session_id=self._session_id, session_key="k")
+
+    def load_transcript(self, session_id):
+        return list(self._transcripts.get(session_id, []))
+
+    def append_to_transcript(self, session_id, message, skip_db=False):
+        self._transcripts.setdefault(session_id, []).append(message)
+        self.appended.append(message)
+
+
+class TestDurableSeedRehydration:
+    """Cold rooms seed the gateway transcript from Band (Band as source of truth)."""
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
+        a._agent_id = "agent-self-id"
+        a.handle_message = AsyncMock()
+        a._link = MagicMock()
+        # No actionable backlog by default.
+        a._link.rest.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[], metadata=SimpleNamespace(next_cursor=None, has_more=False)
+            )
+        )
+        return a
+
+    def _event(self, room_id="rejoined-room", msg_id="msg-r1"):
+        payload = SimpleNamespace(
+            id=msg_id,
+            content="hey, you back?",
+            message_type="text",
+            sender_id="human-1",
+            sender_type="User",
+            sender_name="Alice",
+            chat_room_id=room_id,
+            metadata=SimpleNamespace(
+                mentions=[SimpleNamespace(id="agent-self-id", handle=None)]
+            ),
+        )
+        return SimpleNamespace(type="message_created", room_id=room_id, payload=payload)
+
+    def _ctx(self, items):
+        return AsyncMock(
+            return_value=SimpleNamespace(
+                data=items, metadata=SimpleNamespace(next_cursor=None, has_more=False)
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_cold_room_seeds_transcript_with_roles_and_no_channel_context(
+        self, adapter
+    ):
+        adapter._session_store = _SeedingSessionStore()  # cold (empty transcript)
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(
+                    id="h1", message_type="text", content="what's the weather?",
+                    sender_id="human-1", sender_type="User", sender_name="Alice",
+                    inserted_at=None,
+                ),
+                SimpleNamespace(
+                    id="h2", message_type="text", content="It's sunny.",
+                    sender_id="agent-self-id", sender_type="Agent", sender_name="Bot",
+                    inserted_at=None,
+                ),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        store = adapter._session_store
+        # Durable path used → message carries no one-shot channel_context.
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is None
+        # Own reply seeded as assistant (prevents re-answering); peer as user.
+        assert store.appended == [
+            {"role": "user", "content": "[Alice] what's the weather?",
+             "timestamp": store.appended[0]["timestamp"]},
+            {"role": "assistant", "content": "It's sunny.",
+             "timestamp": store.appended[1]["timestamp"]},
+        ]
+        assert "rejoined-room" not in adapter._rehydrate_rooms
+
+    @pytest.mark.asyncio
+    async def test_warm_session_is_not_reseeded(self, adapter):
+        adapter._session_store = _SeedingSessionStore(
+            existing_transcript=[{"role": "user", "content": "prior"}]
+        )
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx([])
+
+        await adapter._handle_message_created(self._event())
+
+        # Transcript already had history → no new rows, no context fetch needed.
+        assert adapter._session_store.appended == []
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is None
+
+    @pytest.mark.asyncio
+    async def test_trigger_and_backlog_excluded_from_seed(self, adapter):
+        adapter._session_store = _SeedingSessionStore()
+        adapter._rehydrate_rooms.add("rejoined-room")
+        # Actionable backlog: an unprocessed message that @mentions the agent.
+        adapter._link.rest.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[
+                    SimpleNamespace(
+                        id="backlog-1",
+                        metadata={"mentions": [{"id": "agent-self-id"}]},
+                    )
+                ],
+                metadata=SimpleNamespace(next_cursor=None, has_more=False),
+            )
+        )
+        # Context includes the trigger (msg-r1), the backlog (backlog-1), and
+        # one genuine history item (h1). Only h1 should be seeded.
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text", content="older context",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+                SimpleNamespace(id="backlog-1", message_type="text", content="unanswered Q",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+                SimpleNamespace(id="msg-r1", message_type="text", content="hey, you back?",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        seeded = [r["content"] for r in adapter._session_store.appended]
+        assert seeded == ["[Alice] older context"]
+
+    @pytest.mark.asyncio
+    async def test_no_seed_api_falls_back_to_channel_context(self, adapter):
+        # Store lacks the seed API → legacy one-shot channel_context blob.
+        adapter._session_store = _FakeSessionStore()
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text", content="earlier note",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is not None
+        assert "earlier note" in evt.channel_context
+
+    @pytest.mark.asyncio
+    async def test_seed_failure_still_delivers_message(self, adapter):
+        adapter._session_store = _SeedingSessionStore()
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = AsyncMock(
+            side_effect=RuntimeError("context boom")
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        # Best-effort: message delivered, no rows, no fallback double-up.
+        adapter.handle_message.assert_called_once()
+        assert adapter._session_store.appended == []
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is None
+
+
+class TestSeedHelpers:
+    """Pure helpers behind the durable seed."""
+
+    def test_role_own_agent_is_assistant(self):
+        assert _band_mod._seed_role_for("Agent", "me", "me") == "assistant"
+
+    def test_role_peer_agent_is_user(self):
+        assert _band_mod._seed_role_for("Agent", "other", "me") == "user"
+
+    def test_role_human_is_user(self):
+        assert _band_mod._seed_role_for("User", "human-1", "me") == "user"
+
+    def test_can_seed_sessions_requires_full_api(self):
+        assert _band_mod._can_seed_sessions(None) is False
+        partial = SimpleNamespace(get_or_create_session=lambda *a: None)
+        assert _band_mod._can_seed_sessions(partial) is False
+        full = SimpleNamespace(
+            get_or_create_session=lambda *a: None,
+            load_transcript=lambda *a: [],
+            append_to_transcript=lambda *a, **k: None,
+        )
+        assert _band_mod._can_seed_sessions(full) is True
 
 
 # ---------------------------------------------------------------------------

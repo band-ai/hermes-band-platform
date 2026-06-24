@@ -197,20 +197,31 @@ seed model, and add coverage per pitfall:
 
 Run: `uv run pytest tests/ -v` and the `ruff`/`pyrefly` pre-commit checks.
 
-## 9. To verify against the pinned gateway/SDK before coding
+## 9. Verification — RESOLVED
 
-1. **`list_agent_messages` status enumeration** — can we list *all non-`processed`*
-   ids in one or few calls (no `status` = all, or query pending+processing+failed)? If
-   not, fall back to `exclude = {trigger_id} | _seen_inbound_ids` and accept the
-   narrower boundary.
-2. **Role enum accepted by replay** — `user`/`assistant` confirmed; confirm `tool`/
-   `system` if we ever seed tool turns.
-3. **Group-turn storage shape** — does the gateway store/replay group messages with an
-   embedded `[name]:` prefix (P7)? Match that exactly so seeded rows read identically to
-   native ones.
-4. **`SessionSource` key parity** — confirm `get_or_create_session(source)` yields the
-   same `session_id` the gateway computes from the live `MessageEvent` (group session,
-   `group_sessions_per_user=False`).
+Verified against the real gateway (`hermes-agent 0.17.0`, PyPI) and REST client
+(`band-client-rest 0.0.10`).
+
+1. **Backlog enumeration → one call.** `list_agent_messages(chat_id)` with **no
+   `status`** returns "everything NOT processed" (chronological, cursor-paginated) — the
+   trigger + offline backlog. We keep the mentions (only those are answered). No
+   per-status enumeration needed; the context endpoint carries no per-item status, so
+   this is the boundary source.
+2. **Role enum.** `get_messages_as_conversation()` returns OpenAI `user`/`assistant`;
+   the gateway also writes `system`/`session_meta`/tool rows. Text seeding uses
+   `user`/`assistant` — confirmed accepted by the replay path.
+3. **Group-turn shape.** For a shared multi-user session the gateway renders a live
+   peer message as `"[{user_name}] {text}"` (`run.py`; space, **no colon**). Band group
+   rooms are shared (`is_shared_multi_user_session` → True), so seeded peer rows mirror
+   `"[name] content"`; own rows stay bare `assistant` content.
+4. **Session-key parity — guaranteed.** `get_or_create_session(source)` →
+   `_generate_session_key` → `build_session_key`. Passing the **same `source`** object
+   the gateway uses for the live message yields the identical key (we no longer
+   hand-rebuild it), so the seeded session is exactly the one the trigger lands in.
+
+Transcript-row schema confirmed: stable columns are `role`, `content`, `tool_*`,
+`timestamp`; `platform_message_id`/`observed` are accepted by `append_to_transcript`
+but **not persisted columns**, so the implementation never depends on them.
 
 ## 10. Out of scope / related
 

@@ -317,6 +317,12 @@ class BandAdapter(BasePlatformAdapter):
 
         # Runtime state
         self._link: Optional[Any] = None
+        # The event loop connect() opened the link on. The link's phoenix
+        # websocket primitives (asyncio.Event/Future) bind to it, so a send()
+        # invoked from a *different* loop — e.g. the gateway's startup-restore
+        # replay path — is marshalled back onto it instead of raising
+        # "<Event> is bound to a different event loop" (INT-899).
+        self._link_loop: Optional[asyncio.AbstractEventLoop] = None
         self._consumer_task: Optional[asyncio.Task] = None
         # Background /next catch-up drain (Route A). Started on connect and on
         # every link reconnect to pull messages missed while the agent was
@@ -479,6 +485,9 @@ class BandAdapter(BasePlatformAdapter):
         try:
             self._link = BandLink(self._cfg_agent_id, self._api_key, ws_url, rest_url)
             await self._link.connect()
+            # Pin the loop the link (and its asyncio primitives) live on, so a
+            # cross-loop send() can be marshalled back here rather than failing.
+            self._link_loop = asyncio.get_running_loop()
 
             # Resolve identity — the authoritative agent UUID + handle + owner.
             me = await self._link.rest.agent_api_identity.get_agent_me(
@@ -592,6 +601,7 @@ class BandAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("[band] Error disconnecting link: %s", e)
         self._link = None
+        self._link_loop = None
 
         self._release_lock()
         # _running is already cleared by _mark_disconnected() at the top.
@@ -1609,6 +1619,35 @@ class BandAdapter(BasePlatformAdapter):
         if not self._link:
             return SendResult(success=False, error="Not connected", retryable=True)
 
+        # The link's phoenix websocket primitives are bound to the loop connect()
+        # ran on. If send() is invoked from a different running loop — e.g. the
+        # gateway's startup-restore replay path — awaiting them raises "<Event>
+        # is bound to a different event loop". Marshal the send back onto the
+        # link's own loop (a distinct running loop implies a distinct thread, so
+        # run_coroutine_threadsafe is safe and won't deadlock). (INT-899)
+        link_loop = self._link_loop
+        if link_loop is not None and link_loop.is_running():
+            try:
+                running = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            if running is not link_loop:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._send_on_link(chat_id, content, reply_to, metadata),
+                    link_loop,
+                )
+                return await asyncio.wrap_future(future)
+
+        return await self._send_on_link(chat_id, content, reply_to, metadata)
+
+    async def _send_on_link(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Post to a Band room on the link's own event loop. See ``send``."""
         room_id = chat_id
 
         mention_items = await self._build_mentions(room_id)

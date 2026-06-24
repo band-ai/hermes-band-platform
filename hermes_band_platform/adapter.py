@@ -1626,17 +1626,16 @@ class BandAdapter(BasePlatformAdapter):
         # link's own loop (a distinct running loop implies a distinct thread, so
         # run_coroutine_threadsafe is safe and won't deadlock). (INT-899)
         link_loop = self._link_loop
-        if link_loop is not None and link_loop.is_running():
-            try:
-                running = asyncio.get_running_loop()
-            except RuntimeError:
-                running = None
-            if running is not link_loop:
-                future = asyncio.run_coroutine_threadsafe(
-                    self._send_on_link(chat_id, content, reply_to, metadata),
-                    link_loop,
-                )
-                return await asyncio.wrap_future(future)
+        if (
+            link_loop is not None
+            and link_loop.is_running()
+            and asyncio.get_running_loop() is not link_loop
+        ):
+            future = asyncio.run_coroutine_threadsafe(
+                self._send_on_link(chat_id, content, reply_to, metadata),
+                link_loop,
+            )
+            return await asyncio.wrap_future(future)
 
         return await self._send_on_link(chat_id, content, reply_to, metadata)
 

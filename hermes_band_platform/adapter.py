@@ -414,6 +414,10 @@ class BandAdapter(BasePlatformAdapter):
         # Per-room catch-up drains spawned on a live re-join (see
         # _schedule_room_catch_up). Held so the tasks aren't GC'd mid-flight.
         self._room_catch_up_tasks: set = set()
+        # Per-room locks serialising a cold-room seed against same-room
+        # (non-command) dispatch, so no NEW turn starts while we seed (see
+        # _seed_lock_for / _handle_message_created).
+        self._seed_locks: Dict[str, asyncio.Lock] = {}
         # The agent's own UUID + handle, resolved from get_agent_me on connect.
         # ``_cfg_agent_id`` is the configured id used to open the link; the
         # resolved ``_agent_id`` is authoritative for self-filtering.
@@ -1045,22 +1049,19 @@ class BandAdapter(BasePlatformAdapter):
         rebuilds context from the room's own server-side state (rehydration)
         rather than silently resuming stale history. Every Band room keys to a
         single ``_SESSION_CHAT_TYPE`` session (see the constant), so there is
-        exactly one key to reset — no per-room chat-type bookkeeping, and
-        ``group_sessions_per_user=False`` matches Band's locked one-channel model.
+        exactly one key to reset. The key is derived via the shared
+        ``_session_key_for`` so it matches exactly what the gateway/seed use —
+        otherwise, on a gateway whose ``group_sessions_per_user``/profile differs
+        from the old hard-coded assumption, the reset would target the wrong key
+        and silently fail, letting stale history resume on re-join.
         """
         store = getattr(self, "_session_store", None)
         if not store:
             return
         try:
-            key = build_session_key(
-                SessionSource(
-                    platform=self.platform,
-                    chat_id=room_id,
-                    chat_type=_SESSION_CHAT_TYPE,
-                ),
-                group_sessions_per_user=False,
-            )
-            store.reset_session(key)
+            key = self._session_key_for(room_id)
+            if key is not None:
+                store.reset_session(key)
         except Exception:
             pass
 
@@ -1222,35 +1223,47 @@ class BandAdapter(BasePlatformAdapter):
             thread_id=None,  # Band uses rooms, not threads — always None.
         )
 
-        # Rehydration: if this room is flagged — re-joined (room_removed reset
-        # its session) or returning with no local session (agent restart / lost
-        # DB, flagged by _catch_up_all_rooms) — rebuild context from the room's
-        # server-side Band history. Preferred path durably seeds the gateway
-        # session transcript (Band is the source of truth, survives restarts);
-        # an older gateway falls back to a one-shot channel_context blob.
-        # Best-effort — never block the message on a hydration failure; the flag
-        # is consumed once regardless so we don't refetch on every message.
-        channel_context: Optional[str] = None
-        if room_id in self._rehydrate_rooms:
-            self._rehydrate_rooms.discard(room_id)
-            channel_context = await self._rehydrate_room(source, room_id, msg_id)
-
         if msg_id:
             self._seen_inbound_ids.add(msg_id)
             if len(self._seen_inbound_ids) > _SENT_IDS_MAX:
                 for _ in range(_SENT_IDS_MAX // 2):
                     self._seen_inbound_ids.pop()
 
-        await self.handle_message(
-            MessageEvent(
-                text=content,
-                message_type=MessageType.TEXT,
-                source=source,
-                message_id=msg_id,
-                raw_message=payload,
-                channel_context=channel_context,
-            )
+        out = MessageEvent(
+            text=content,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=msg_id,
+            raw_message=payload,
         )
+
+        # Owner commands dispatch immediately and are NEVER gated by the seed
+        # lock: the gateway dispatches an active-session command INLINE (it
+        # awaits the turn — e.g. /stop, /approve, which would otherwise
+        # deadlock), so holding a lock across it would stall control commands.
+        # A command also never starts a fresh turn, so it can't be the racing
+        # writer; the rehydrate flag is left intact for the next real message.
+        if is_command:
+            await self.handle_message(out)
+            return True
+
+        # Rehydration + dispatch under the per-room seed lock. If this room is
+        # flagged — re-joined or returning with no local session — rebuild
+        # context from Band history (durable transcript seed; falls back to a
+        # one-shot channel_context blob on an older gateway). Holding the lock
+        # across the seed AND the dispatch serialises seeding with any other
+        # non-command dispatch for the room, so no NEW turn can start mid-seed
+        # (closing the reachable cross-thread clobber; a turn already in flight
+        # is the documented residual the upstream atomic primitive closes).
+        # Best-effort — a hydration failure never blocks the message, and the
+        # flag is consumed once so we don't refetch on every message.
+        async with self._seed_lock_for(room_id):
+            if room_id in self._rehydrate_rooms:
+                self._rehydrate_rooms.discard(room_id)
+                out.channel_context = await self._rehydrate_room(
+                    source, room_id, msg_id
+                )
+            await self.handle_message(out)
         return True
 
     # ── Route A: server-cursor ack + missed-message catch-up ──────────────
@@ -1478,6 +1491,26 @@ class BandAdapter(BasePlatformAdapter):
             )
             return False
 
+    def _seed_lock_for(self, room_id: str) -> "asyncio.Lock":
+        """Per-room lock serialising a cold-room seed against same-room dispatch.
+
+        Bounded like the other per-room caches; eviction only drops *unheld*
+        locks so a lock currently in use is never swapped out from under a
+        waiter (which would silently break the serialisation it provides).
+        """
+        lock = self._seed_locks.get(room_id)
+        if lock is not None:
+            return lock
+        lock = asyncio.Lock()
+        self._seed_locks[room_id] = lock
+        if len(self._seed_locks) > _ROOM_CACHE_MAX:
+            for rid in list(self._seed_locks):
+                if rid != room_id and not self._seed_locks[rid].locked():
+                    del self._seed_locks[rid]
+                    if len(self._seed_locks) <= _ROOM_CACHE_MAX // 2:
+                        break
+        return lock
+
     async def _rehydrate_room(
         self, source: Any, room_id: str, trigger_msg_id: Optional[str]
     ) -> Optional[str]:
@@ -1505,16 +1538,21 @@ class BandAdapter(BasePlatformAdapter):
         store lacks the seed API *or* an error prevented seeding — in both of
         those cases the caller falls back to the one-shot blob.
 
-        Atomic and race-safe by construction:
+        Write path, best → fallback:
 
-          * The two paginated fetches (the only ``await`` points) run *before*
-            we touch the session, concurrently.
-          * The empty-transcript re-check and the ``rewrite_transcript`` write
-            run back-to-back with NO ``await`` between them, so a concurrent live
-            turn for the same room can't interleave and be clobbered, and a room
-            that filled during the fetches is left untouched.
-          * ``rewrite_transcript`` is a single replace, so a failure can't leave
-            a half-seeded transcript that future seeds would short-circuit on.
+          * If the gateway exposes ``seed_transcript_if_empty`` (atomic
+            count-then-insert in one transaction), use it — immune to a
+            cross-thread turn-append.
+          * Otherwise re-check ``load_transcript`` then ``rewrite_transcript``
+            with no ``await`` between (loop-atomic only). The per-room seed lock
+            around dispatch (see ``_handle_message_created``) closes the
+            reachable two-lane path; a turn already in flight from another thread
+            is the documented residual the atomic primitive closes.
+
+        Either write is a single transaction, so a failure can't leave a
+        half-seeded transcript that future seeds would short-circuit on. The two
+        paginated fetches (the only ``await`` points) run concurrently *before*
+        the session is touched.
         """
         store = getattr(self, "_session_store", None)
         if not _can_seed_sessions(store):
@@ -1539,21 +1577,43 @@ class BandAdapter(BasePlatformAdapter):
             rows = self._build_seed_rows(items, exclude, participants)
             if not rows:
                 return True
-            # Re-check emptiness right before writing: a live turn may have
-            # written during the fetches above. No await between here and the
-            # write closes the window on *this* event loop.
-            #
-            # KNOWN RESIDUAL RACE (accepted; low severity — see the design doc's
-            # "future work"): this check→write pair is two separate SessionDB
-            # transactions, so it is NOT atomic against a gateway turn-append
-            # that commits on *another thread* in the gap. Worst case is rare
-            # and self-healing: a concurrent turn for this same no-history room
-            # could be answered cold, the seed could be skipped (deferred to the
-            # next cold boundary), or this rewrite could clobber one turn's rows
-            # once. Band stays the source of truth, so the next cold boundary
-            # re-seeds. A real fix needs an atomic "seed only if empty" under a
-            # single store lock (ideally a gateway-side primitive).
+            # Preferred write path: an atomic "seed only if empty" exposed by the
+            # gateway (count-then-insert in one BEGIN IMMEDIATE transaction). It
+            # is immune to the cross-thread TOCTOU below because it is atomic
+            # against a concurrent turn-append at the SQLite layer. Used when the
+            # gateway exposes it; older gateways fall through to the best-effort
+            # path. (See docs/rehydration-seed-race-design.md.)
+            seed_if_empty = getattr(store, "seed_transcript_if_empty", None)
+            if seed_if_empty is not None:
+                wrote = seed_if_empty(entry.session_id, rows)
+                if wrote:
+                    logger.info(
+                        "[band] Seeded %d history row(s) into room %s session",
+                        len(rows),
+                        _short_id(room_id),
+                    )
+                else:
+                    logger.info(
+                        "[band] Seed skipped for room %s — session filled "
+                        "concurrently (atomic guard)",
+                        _short_id(room_id),
+                    )
+                return True
+            # Best-effort fallback (older gateway, no atomic primitive). Re-check
+            # emptiness right before writing: a live turn may have written during
+            # the fetches above. No await between here and the write closes the
+            # window on *this* event loop; the per-room seed lock around dispatch
+            # closes the reachable two-lane path. RESIDUAL: the check→write pair
+            # is two SessionDB transactions, so it is NOT atomic against a turn
+            # that commits from another thread in the gap — rare and self-healing
+            # (Band re-seeds on the next cold boundary). The atomic primitive
+            # above is the provable fix. (See the design doc.)
             if store.load_transcript(entry.session_id):
+                logger.info(
+                    "[band] Seed skipped for room %s — transcript filled during "
+                    "fetch (best-effort path)",
+                    _short_id(room_id),
+                )
                 return True
             store.rewrite_transcript(entry.session_id, rows)
             logger.info(
@@ -1564,8 +1624,8 @@ class BandAdapter(BasePlatformAdapter):
             return True
         except Exception as e:
             # Best-effort: a seed failure must never block the triggering
-            # message. Fall back to the one-shot blob (return False) — the
-            # atomic write above guarantees no partial transcript was left.
+            # message. Fall back to the one-shot blob (return False) — both write
+            # paths above are atomic, so no partial transcript is left behind.
             logger.debug(
                 "[band] Session seed failed for room %s: %s", _short_id(room_id), e
             )
@@ -1810,6 +1870,35 @@ class BandAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[band] Could not send command-gate notice: %s", e)
 
+    def _session_key_for(self, room_id: str) -> Optional[str]:
+        """The Hermes session key for a Band room, derived the way the store does.
+
+        Single source of key derivation for the cold-room hint
+        (``_has_active_session``) and close-on-leave reset (``_reset_room_session``)
+        so they can never diverge. Prefers the store's own
+        ``_generate_session_key`` — which matches exactly what
+        ``get_or_create_session`` (and therefore the gateway) compute, including
+        the profile namespace and the store's ``group_sessions_per_user`` setting
+        on a multiplexing gateway — and falls back to the public
+        ``build_session_key``. Returns None when no store is wired.
+        """
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return None
+        source = SessionSource(
+            platform=self.platform,
+            chat_id=room_id,
+            chat_type=_SESSION_CHAT_TYPE,
+        )
+        gen = getattr(store, "_generate_session_key", None)
+        if gen is not None:
+            return gen(source)
+        store_cfg = getattr(store, "config", None)
+        gspu = (
+            getattr(store_cfg, "group_sessions_per_user", False) if store_cfg else False
+        )
+        return build_session_key(source, group_sessions_per_user=gspu)
+
     def _has_active_session(self, room_id: str) -> bool:
         """Whether the room has a Hermes session with *real* history.
 
@@ -1828,29 +1917,9 @@ class BandAdapter(BasePlatformAdapter):
         if not session_store:
             return False
         try:
-            from gateway.session import SessionSource, build_session_key
-
-            # Use the same constant chat_type every other call site uses so this
-            # key matches how the room's session was stored. Band has one shared
-            # session per room regardless of participant count.
-            source = SessionSource(
-                platform=self.platform,
-                chat_id=room_id,
-                chat_type=_SESSION_CHAT_TYPE,
-            )
-            # Prefer the store's own key generator so the key matches exactly
-            # what get_or_create_session derives (incl. profile namespace on a
-            # multiplexing gateway); fall back to the shared builder.
-            if hasattr(session_store, "_generate_session_key"):
-                session_key = session_store._generate_session_key(source)
-            else:
-                store_cfg = getattr(session_store, "config", None)
-                gspu = (
-                    getattr(store_cfg, "group_sessions_per_user", False)
-                    if store_cfg
-                    else False
-                )
-                session_key = build_session_key(source, group_sessions_per_user=gspu)
+            session_key = self._session_key_for(room_id)
+            if session_key is None:
+                return False
             session_store._ensure_loaded()
             entry = session_store._entries.get(session_key)
             if entry is None:

@@ -1226,13 +1226,20 @@ class _SeedingSessionStore(_FakeSessionStore):
         existing_transcript=None,
         session_id="sess-1",
         on_rewrite=None,
+        atomic=False,
         **kw,
     ):
         super().__init__(**kw)
         self._session_id = session_id
         self._transcripts = {session_id: list(existing_transcript or [])}
         self.seeded = None
+        self.atomic_seeded = None  # rows passed to seed_transcript_if_empty
         self._on_rewrite = on_rewrite
+        if atomic:
+            # Expose the gateway's atomic primitive (W2). Single-step
+            # count-then-insert, so it never clobbers a concurrently-filled
+            # transcript.
+            self.seed_transcript_if_empty = self._seed_transcript_if_empty
 
     def get_or_create_session(self, source):
         # Mirror the real store side effect: materialize an (empty) entry.
@@ -1247,6 +1254,13 @@ class _SeedingSessionStore(_FakeSessionStore):
             self._on_rewrite()
         self._transcripts[session_id] = list(messages)
         self.seeded = list(messages)
+
+    def _seed_transcript_if_empty(self, session_id, messages):
+        self.atomic_seeded = list(messages)
+        if self._transcripts.get(session_id):
+            return False
+        self._transcripts[session_id] = list(messages)
+        return True
 
 
 class TestDurableSeedRehydration:
@@ -1505,6 +1519,172 @@ class TestDurableSeedRehydration:
         # rewrite_transcript never ran (re-check found the live turn).
         assert store.seeded is None
         assert store.load_transcript("sess-1") == [{"role": "user", "content": "live turn"}]
+
+    @pytest.mark.asyncio
+    async def test_uses_atomic_primitive_when_available(self, adapter):
+        # When the gateway exposes seed_transcript_if_empty, the seed uses it
+        # (the race-immune path) and does NOT fall back to load+rewrite.
+        store = _SeedingSessionStore(atomic=True)
+        adapter._session_store = store
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text", content="older context",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        assert [(r["role"], r["content"]) for r in store.atomic_seeded] == [
+            ("user", "[Alice] older context"),
+        ]
+        assert store.seeded is None  # the non-atomic rewrite path was not used
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is None
+
+    @pytest.mark.asyncio
+    async def test_atomic_primitive_skip_is_safe(self, adapter):
+        # If the atomic primitive reports the session filled concurrently
+        # (returns False), the message is still delivered and nothing is clobbered.
+        store = _SeedingSessionStore(
+            atomic=True, existing_transcript=[{"role": "user", "content": "live"}]
+        )
+        adapter._session_store = store
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx([])
+
+        await adapter._handle_message_created(self._event())
+
+        # Warm session short-circuits before the primitive; transcript intact.
+        adapter.handle_message.assert_called_once()
+        assert store.load_transcript("sess-1") == [{"role": "user", "content": "live"}]
+
+
+class TestSeedLock:
+    """The per-room seed lock serialises seeding vs same-room non-command dispatch."""
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
+        a._agent_id = "agent-self-id"
+        a._owner_uuid = "owner-1"
+        a.handle_message = AsyncMock()
+        a._link = MagicMock()
+        return a
+
+    def _msg(self, msg_id, content="hi there", sender_id="human-1", room="r1"):
+        payload = SimpleNamespace(
+            id=msg_id, content=content, message_type="text",
+            sender_id=sender_id, sender_type="User", sender_name="Alice",
+            chat_room_id=room,
+            metadata=SimpleNamespace(
+                mentions=[SimpleNamespace(id="agent-self-id", handle=None)]
+            ),
+        )
+        return SimpleNamespace(type="message_created", room_id=room, payload=payload)
+
+    @pytest.mark.asyncio
+    async def test_noncommand_dispatch_waits_for_in_progress_seed(self, adapter):
+        # A flagged room's seed holds the room lock; a second non-command
+        # message for the same room must not dispatch until the seed completes.
+        gate = asyncio.Event()
+
+        async def _blocking_rehydrate(source, room_id, trigger_msg_id):
+            await gate.wait()
+            return None
+
+        adapter._rehydrate_room = _blocking_rehydrate
+        adapter._rehydrate_rooms.add("r1")
+
+        a_task = asyncio.create_task(adapter._handle_message_created(self._msg("m1")))
+        await asyncio.sleep(0)  # let A acquire the lock and block in the seed
+        b_task = asyncio.create_task(adapter._handle_message_created(self._msg("m2")))
+        await asyncio.sleep(0)
+
+        # A is blocked seeding; B is blocked on the lock → neither dispatched.
+        adapter.handle_message.assert_not_called()
+
+        gate.set()
+        await asyncio.gather(a_task, b_task)
+        # Both dispatched once the seed released the lock.
+        assert adapter.handle_message.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_owner_command_not_gated_by_seed(self, adapter):
+        # An owner command for the same room dispatches immediately even while a
+        # seed holds the lock (commands inline-await in the gateway; gating them
+        # would stall /stop, /approve).
+        gate = asyncio.Event()
+
+        async def _blocking_rehydrate(source, room_id, trigger_msg_id):
+            await gate.wait()
+            return None
+
+        adapter._rehydrate_room = _blocking_rehydrate
+        adapter._rehydrate_rooms.add("r1")
+
+        a_task = asyncio.create_task(adapter._handle_message_created(self._msg("m1")))
+        await asyncio.sleep(0)  # A holds the lock, blocked seeding
+        # Owner command for the same room — must not wait on the lock.
+        await adapter._handle_message_created(
+            self._msg("c1", content="/help", sender_id="owner-1")
+        )
+        assert adapter.handle_message.call_count == 1  # the command dispatched
+
+        gate.set()
+        await a_task
+
+    @pytest.mark.asyncio
+    async def test_seed_lock_is_per_room(self, adapter):
+        # A seed holding r1's lock must not block dispatch for a different room.
+        gate = asyncio.Event()
+
+        async def _blocking_rehydrate(source, room_id, trigger_msg_id):
+            await gate.wait()
+            return None
+
+        adapter._rehydrate_room = _blocking_rehydrate
+        adapter._rehydrate_rooms.add("r1")
+
+        a_task = asyncio.create_task(adapter._handle_message_created(self._msg("m1", room="r1")))
+        await asyncio.sleep(0)
+        # Different room — proceeds despite r1's seed holding r1's lock.
+        await adapter._handle_message_created(self._msg("m2", room="r2"))
+        assert adapter.handle_message.call_count == 1
+
+        gate.set()
+        await a_task
+
+
+class TestSessionKeyParity:
+    """_reset_room_session and _has_active_session derive the SAME key as the store."""
+
+    @pytest.mark.asyncio
+    async def test_reset_targets_the_real_session_key(self, monkeypatch, tmp_path):
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionSource, SessionStore
+        from hermes_state import SessionDB
+
+        a = _make_adapter(monkeypatch)
+        store = SessionStore(tmp_path, GatewayConfig())
+        store._db = SessionDB(db_path=tmp_path / "s.db")
+        a._session_store = store
+
+        # _session_key_for must match the store's own derivation (single source).
+        src = SessionSource(platform=a.platform, chat_id="room-x", chat_type="group")
+        assert a._session_key_for("room-x") == store._generate_session_key(src)
+
+        # Create + warm the room's session, then reset via the adapter (leave
+        # path) and confirm it actually targeted that session (now cold).
+        entry = store.get_or_create_session(src)
+        store.rewrite_transcript(
+            entry.session_id, [{"role": "user", "content": "hi", "timestamp": 1.0}]
+        )
+        assert a._has_active_session("room-x") is True
+        a._reset_room_session("room-x")
+        assert a._has_active_session("room-x") is False
 
 
 class TestSeedHelpers:

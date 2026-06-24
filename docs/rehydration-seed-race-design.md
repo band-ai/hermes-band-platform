@@ -139,6 +139,11 @@ So the canonical fix is **not** a loop-level guard — it's a single
 
 ## 5. Chosen design
 
+> **Superseded by §0.** This section is the original phased plan, kept for rationale.
+> What shipped is the terminal Phase B (the atomic write) done as an in-plugin helper,
+> which made the Phase C/D interim steps unnecessary — they were **not** shipped (the
+> instrumentation and the per-room lock were removed/never landed).
+
 Phased: **D → C → B**. Each phase is shippable on its own and strictly improves on the
 last; B is the terminal, correct state.
 
@@ -210,17 +215,19 @@ otherwise the capability ladder degrades as above.
 
 ---
 
-## 7. Test plan
+## 7. Test plan — as shipped
 
-- **Concurrency test against the real `SessionDB`** (already proven instantiable on a
-  temp DB): start the seed's check, then from a second thread `append_message` a turn
-  row, then complete the seed. With Phase B's `seed_transcript_if_empty`: assert no
-  clobber and no duplicate (the conditional insert no-ops because the row exists).
-  Without it (today's path): the same harness demonstrates the clobber — keep it as a
-  regression characterization, xfail-marked until B lands.
-- **Capability ladder**: store with `seed_transcript_if_empty` → used; without it but
-  with `rewrite_transcript` → Phase-C fallback; with neither → `channel_context` blob.
-- Phase C: per-room lock serialises seed vs dispatch (no new dispatch observed mid-seed).
+(`tests/test_adapter.py::TestAtomicSeedTranscript` + `TestDurableSeedRehydration`.)
+
+- **Concurrency against the real `SessionDB`**: a second thread `append_message`s a
+  turn row while the seed runs → the atomic write no-ops (append preserved, no clobber);
+  40-session stress with zero clobbers/corruption.
+- **Atomic helper, real DB**: seeds an empty session with correct `message_count`;
+  no-ops on a non-empty session; idempotent; special-char content round-trips;
+  returns `None` (→ blob) when the store has no `_db`.
+- **Capability ladder**: store with the atomic write → used; store with neither the
+  primitive nor `_db` → `channel_context` blob.
+- The Phase-C per-room-lock tests were **removed** with the lock.
 
 ---
 

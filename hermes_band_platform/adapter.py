@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, TypedDict
 from urllib.parse import urlsplit
@@ -437,6 +438,20 @@ def _atomic_seed_transcript(
     return db._execute_write(_do)
 
 
+@dataclass
+class _Inbound:
+    """A normalized inbound Band message (after the leading self-mention strip)."""
+
+    payload: Any
+    room_id: str
+    msg_id: Optional[str]
+    content: str
+    message_type: str
+    sender_id: Optional[str]
+    sender_type: str
+    sender_name: Optional[str]
+
+
 class BandAdapter(BasePlatformAdapter):
     """Async Band adapter implementing the BasePlatformAdapter interface.
 
@@ -607,101 +622,24 @@ class BandAdapter(BasePlatformAdapter):
 
     async def connect(self) -> bool:
         """Open the Band link, resolve identity, subscribe, start consuming."""
-        # Reset per-connect hub failover state so a reconnect starts clean.
-        self._hub_send_failures = 0
-        self._failover_in_progress = False
-        self._hub_failovers_done = 0
-
-        if not BAND_AVAILABLE:
-            missing_sdk_msg = (
-                "band-sdk not installed. Directory plugin installs do not install "
-                "Python dependencies; install into the gateway Python with: "
-                "uv pip install --python <gateway-python> 'band-sdk>=1.0.0,<2.0.0'"
-            )
-            logger.error(
-                "[band] %s",
-                missing_sdk_msg,
-            )
-            self._set_fatal_error(
-                "dependency_missing",
-                missing_sdk_msg,
-                retryable=False,
-            )
+        self._reset_failover_state()
+        if not self._preflight_ok():
             return False
-
-        if not self._cfg_agent_id or not self._api_key:
-            logger.error("[band] BAND_AGENT_ID and BAND_API_KEY must be set")
-            self._set_fatal_error(
-                "config_missing",
-                "BAND_AGENT_ID and BAND_API_KEY must be set",
-                retryable=False,
-            )
+        if not self._acquire_agent_lock():
             return False
-
-        # Prevent two profiles from driving the same Band agent identity.
-        # Best-effort: skip gracefully if the scoped-lock helper isn't present
-        # (e.g. in some test harnesses).
-        try:
-            from gateway.status import acquire_scoped_lock
-
-            acquired, existing = acquire_scoped_lock(
-                "band", self._cfg_agent_id, metadata={"platform": "band"}
-            )
-            if not acquired:
-                owner_pid = existing.get("pid") if isinstance(existing, dict) else None
-                msg = (
-                    f"Band agent {_short_id(self._cfg_agent_id)} already in use"
-                    + (f" (PID {owner_pid})" if owner_pid else "")
-                    + ". Stop the other gateway first."
-                )
-                logger.error("[band] %s", msg)
-                self._set_fatal_error("band_lock", msg, retryable=False)
-                return False
-            self._lock_identity = self._cfg_agent_id
-        except ImportError:
-            self._lock_identity = None
 
         ws_url, rest_url = _derive_urls(self._base_url)
-
         try:
             self._link = BandLink(self._cfg_agent_id, self._api_key, ws_url, rest_url)
             await self._link.connect()
-            # Pin the loop the link (and its asyncio primitives) live on, so a
-            # cross-loop send() can be marshalled back here rather than failing.
+            # Pin the loop the link's asyncio primitives bind to, so a cross-loop
+            # send() (e.g. the gateway's startup-restore replay) is marshalled
+            # back here rather than raising — see _send_on_link.
             self._link_loop = asyncio.get_running_loop()
-
-            # Resolve identity — the authoritative agent UUID + handle + owner.
-            me = await self._link.rest.agent_api_identity.get_agent_me(
-                request_options=DEFAULT_REQUEST_OPTIONS,
-            )
-            agent = getattr(me, "data", None)
-            if agent is not None:
-                self._agent_id = getattr(agent, "id", None) or self._cfg_agent_id
-                self._handle = getattr(agent, "handle", "") or ""
-                # Owner used later for guardrails — store it now (env override wins).
-                self._owner_uuid = self._owner_uuid or getattr(agent, "owner_uuid", None)
-                # Persist so the owner is durable and visible to OUT-OF-PROCESS
-                # callers (standalone cron senders have no gateway runner ref, so
-                # _owner_identity() falls back to BAND_OWNER_ID) and to fresh
-                # config loads. Mirrors _persist_hub_room / BAND_HOME_ROOM.
-                if self._owner_uuid:
-                    self._persist_owner(self._owner_uuid)
-
-            # Subscribe to agent-level room events (room_added / room_removed).
+            await self._resolve_identity()
             await self._link.subscribe_agent_rooms(self._cfg_agent_id)
-
-            # Subscribe to rooms already known to the server so we relay messages
-            # in existing rooms without waiting for a room_added event.
             await self._subscribe_known_rooms()
-
-            # Ensure the owner hub exists and is wired as the main channel.
-            # Best-effort: a hub failure must never block messaging (the
-            # command gate then stays fail-closed instead).
-            try:
-                await self._ensure_hub()
-            except Exception as e:
-                logger.warning("[band] Hub bootstrap failed — continuing without hub: %s", e)
-
+            await self._bootstrap_hub_safe()
             self._consumer_task = asyncio.create_task(self._consume())
             self._mark_connected()
             logger.info(
@@ -710,17 +648,101 @@ class BandAdapter(BasePlatformAdapter):
                 self._handle or "<unknown>",
                 _short_id(self._owner_uuid),
             )
-            # Route A catch-up: drain each known room's server-side backlog of
-            # messages missed while offline. Runs in the background so a large
-            # backlog never delays connect() or blocks the live consumer.
+            # Background drain of each known room's offline backlog (Route A);
+            # never delays connect() or blocks the live consumer.
             self._schedule_catch_up()
             return True
         except Exception as e:
             logger.error("[band] Failed to connect: %s", e)
             self._set_fatal_error("connect_failed", str(e), retryable=True)
-            # Release the lock we may have taken so a retry isn't blocked.
-            self._release_lock()
+            self._release_lock()  # so a retry isn't blocked by our own lock
             return False
+
+    def _reset_failover_state(self) -> None:
+        """Clear per-connect hub-failover counters so a reconnect starts clean."""
+        self._hub_send_failures = 0
+        self._failover_in_progress = False
+        self._hub_failovers_done = 0
+
+    def _preflight_ok(self) -> bool:
+        """Require the SDK to be installed and credentials present (fail-closed)."""
+        if not BAND_AVAILABLE:
+            msg = (
+                "band-sdk not installed. Directory plugin installs do not install "
+                "Python dependencies; install into the gateway Python with: "
+                "uv pip install --python <gateway-python> 'band-sdk>=1.0.0,<2.0.0'"
+            )
+            logger.error("[band] %s", msg)
+            self._set_fatal_error("dependency_missing", msg, retryable=False)
+            return False
+        if not self._cfg_agent_id or not self._api_key:
+            logger.error("[band] BAND_AGENT_ID and BAND_API_KEY must be set")
+            self._set_fatal_error(
+                "config_missing",
+                "BAND_AGENT_ID and BAND_API_KEY must be set",
+                retryable=False,
+            )
+            return False
+        return True
+
+    def _acquire_agent_lock(self) -> bool:
+        """Take the scoped lock so two profiles can't drive the same Band agent.
+
+        Best-effort: if the gateway lock helper isn't importable (some test
+        harnesses), proceed unlocked. Returns False (fatal) only on a real
+        conflict with another live holder.
+        """
+        try:
+            from gateway.status import acquire_scoped_lock
+        except ImportError:
+            self._lock_identity = None
+            return True
+        acquired, existing = acquire_scoped_lock(
+            "band", self._cfg_agent_id, metadata={"platform": "band"}
+        )
+        if not acquired:
+            owner_pid = existing.get("pid") if isinstance(existing, dict) else None
+            msg = (
+                f"Band agent {_short_id(self._cfg_agent_id)} already in use"
+                + (f" (PID {owner_pid})" if owner_pid else "")
+                + ". Stop the other gateway first."
+            )
+            logger.error("[band] %s", msg)
+            self._set_fatal_error("band_lock", msg, retryable=False)
+            return False
+        self._lock_identity = self._cfg_agent_id
+        return True
+
+    async def _resolve_identity(self) -> None:
+        """Resolve the authoritative agent UUID + handle + owner via get_agent_me.
+
+        Persists the owner so it's durable for out-of-process callers (cron
+        senders fall back to BAND_OWNER_ID) and fresh config loads.
+        """
+        me = await self._link.rest.agent_api_identity.get_agent_me(
+            request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+        agent = getattr(me, "data", None)
+        if agent is None:
+            return
+        self._agent_id = getattr(agent, "id", None) or self._cfg_agent_id
+        self._handle = getattr(agent, "handle", "") or ""
+        self._owner_uuid = self._owner_uuid or getattr(agent, "owner_uuid", None)
+        if self._owner_uuid:
+            self._persist_owner(self._owner_uuid)
+
+    async def _bootstrap_hub_safe(self) -> None:
+        """Ensure the owner hub exists and is the main channel — never fatal.
+
+        A hub failure must not block messaging; the command gate then stays
+        fail-closed instead.
+        """
+        try:
+            await self._ensure_hub()
+        except Exception as e:
+            logger.warning(
+                "[band] Hub bootstrap failed — continuing without hub: %s", e
+            )
 
     async def _subscribe_known_rooms(self) -> None:
         """Subscribe to rooms the agent is already a participant of.
@@ -1193,159 +1215,138 @@ class BandAdapter(BasePlatformAdapter):
         )
 
     async def _handle_message_created(self, event: Any) -> bool:
-        """Normalize an inbound Band message into a Hermes MessageEvent.
+        """Normalize an inbound Band message and forward it to the gateway.
 
-        Returns ``True`` when the message was forwarded to the gateway (its ack
-        is then driven by the processing-lifecycle hooks), ``False`` when it was
-        filtered/dropped. The caught-up drain uses this to decide whether to
-        make a drained message terminal itself (see ``_drain_room``); the live
-        consumer ignores the return value.
+        Returns ``True`` when forwarded (the ack is then driven by the
+        processing-lifecycle hooks), ``False`` when filtered/dropped — the
+        caught-up drain uses this to decide whether to terminally-ack a dropped
+        message (see ``_drain_room``); the live consumer ignores the return.
         """
-        payload = getattr(event, "payload", None)
-        if payload is None:
+        inb = self._normalize_inbound(event)
+        if inb is None:
             return False
 
-        room_id = getattr(event, "room_id", None) or getattr(payload, "chat_room_id", None)
-        if not room_id:
+        # Self-filter: our own posts (and any platform echo of them) are never
+        # offered by /next, so just drop — nothing to ack.
+        if inb.sender_type == "Agent" and inb.sender_id == self._agent_id:
             return False
-
-        msg_id = getattr(payload, "id", None)
-        content = getattr(payload, "content", None) or ""
-        # Band embeds the addressed mention inline at the FRONT of the content
-        # (``@[[<agent-id>]] /help``). The gateway detects slash commands with
-        # ``text.startswith("/")``, so strip our own leading self-mention here —
-        # otherwise an addressed command never dispatches (the mention precedes
-        # the slash). Also de-noises ordinary prose.
-        content = self._strip_self_mention(content)
-        message_type = getattr(payload, "message_type", "") or ""
-        sender_id = getattr(payload, "sender_id", None)
-        sender_type = getattr(payload, "sender_type", "") or ""
-        sender_name = getattr(payload, "sender_name", None)
-
-        # Self-filter: skip our own agent messages (primary), and use the
-        # sent-id set as a backstop in case the platform echoes a post we made.
-        # Neither is offered by /next (the agent's own posts don't @mention it),
-        # so there is nothing to ack — just drop.
-        if sender_type == "Agent" and sender_id == self._agent_id:
+        if inb.msg_id and inb.msg_id in self._sent_ids:
             return False
-        if msg_id and msg_id in self._sent_ids:
-            return False
-
-        # Inbound dedup: if we already forwarded this id this process-lifetime
-        # (live-vs-catch-up race, or a server re-offer), its first turn owns the
-        # ack — don't double-process. Report it as forwarded so the drain leaves
-        # settling to that first turn.
-        if msg_id and msg_id in self._seen_inbound_ids:
+        # Inbound dedup: already forwarded this id this lifetime (live-vs-catch-up
+        # race / server re-offer) → its first turn owns the ack. Report forwarded
+        # so the drain leaves settling to that turn.
+        if inb.msg_id and inb.msg_id in self._seen_inbound_ids:
             return True
-
-        # Only relay user/text content. tool_call / thought / tool_result /
-        # error / task etc. are event-type messages, not conversational text.
-        # /next returns text only, so these never appear in a drain.
-        if message_type and message_type != "text":
+        # Only conversational text reaches the agent — tool/thought/task etc. are
+        # event rows, and /next returns text only, so these never appear in a drain.
+        if inb.message_type and inb.message_type != "text":
             logger.debug(
                 "[band] Skipping non-text message_type=%s in room %s",
-                message_type,
-                _short_id(room_id),
+                inb.message_type,
+                _short_id(inb.room_id),
             )
             return False
 
-        # Participants drive @mention-handle resolution and last-human-sender
-        # tracking (fetched on first sight). chat_type is NOT derived from them:
-        # every Band room is one shared, mention-gated session keyed on room_id
-        # (see _SESSION_CHAT_TYPE) so the conversation can't re-key when the
-        # roster changes.
-        participants = await self._get_participants(room_id)
-        chat_type = _SESSION_CHAT_TYPE
-
-        # Track the last human sender so replies can @mention them (mentions are
-        # mandatory on send).
-        if sender_id and sender_type != "Agent":
-            handle = self._handle_for_participant(participants, sender_id)
-            self._last_human_sender[room_id] = {
-                "id": sender_id,
-                "handle": handle,
-                "name": sender_name,
+        # Participants drive @mention resolution + last-human-sender. chat_type is
+        # the constant _SESSION_CHAT_TYPE, so a roster change can never re-key the
+        # room's single shared session.
+        participants = await self._get_participants(inb.room_id)
+        if inb.sender_id and inb.sender_type != "Agent":
+            self._last_human_sender[inb.room_id] = {
+                "id": inb.sender_id,
+                "handle": self._handle_for_participant(participants, inb.sender_id),
+                "name": inb.sender_name,
             }
             self._cap_cache(self._last_human_sender, _ROOM_CACHE_MAX)
 
-        # Owner command gate: slash commands are accepted ONLY from the owner,
-        # in any Band room. Command-shaped text from anyone else is dropped
-        # here — before the gateway ever sees it — silently for other agents
-        # (a notice would invite bot↔bot ping-pong), with a one-time per-room
-        # notice for humans. Fail-closed: no resolved owner means no Band
-        # slash commands at all. Plain chat is unaffected (runs after the
-        # last-human-sender update so the notice can @mention the sender).
-        is_command = self._is_command_text(content)
-        if is_command and not self._is_owner_command(sender_id):
-            if sender_type != "Agent":
-                await self._notify_command_blocked(room_id)
-            # A blocked command is command-shaped @mention text, so /next WOULD
-            # re-offer it. We've adjudicated it (dropped) — mark it processed so
-            # the server cursor advances and it isn't redelivered on reconnect.
-            await self._ack_consumed(room_id, msg_id)
+        # Owner-command gate: slash commands are owner-only, in any room. Others'
+        # command-shaped text is dropped here (one-time notice for humans, silent
+        # for agents to avoid bot↔bot ping-pong); fail-closed when no owner is
+        # resolved. Runs after the last-sender update so a notice can @mention them.
+        is_command = self._is_command_text(inb.content)
+        if is_command and not self._is_owner_command(inb.sender_id):
+            if inb.sender_type != "Agent":
+                await self._notify_command_blocked(inb.room_id)
+            # /next would re-offer this @mention text — ack so it isn't redelivered.
+            await self._ack_consumed(inb.room_id, inb.msg_id)
             return False
 
-        # Gating: Band has no DMs — every room is a mention-gated group room, so
-        # the agent wakes ONLY when it's @mentioned. The platform already routes
-        # by mention (/next offers only mentioned messages); we mirror that on the
-        # live path rather than inventing our own routing — no hub bypass, no
-        # active-session stickiness, so live and catch-up behave identically. The
-        # one always-pass case is a validated owner slash command (any
-        # command-shaped text still here has cleared the owner gate above), so the
-        # owner never has to @mention the agent to run a command.
-        if not (is_command or self._is_agent_mentioned(payload)):
+        # Mention gate: every Band room is mention-gated (no DMs), so wake only on
+        # an @mention — mirroring /next, which offers mentioned messages only. A
+        # validated owner command always passes (no @mention required).
+        if not (is_command or self._is_agent_mentioned(inb.payload)):
             logger.debug(
-                "[band] Ignoring un-addressed message in room %s",
-                _short_id(room_id),
+                "[band] Ignoring un-addressed message in room %s", _short_id(inb.room_id)
             )
-            # Not an @mention, so /next never offers it (its filter is
-            # mention-only) — nothing to ack, just drop.
             return False
-
-        room_name = self._room_name_for(room_id) or room_id
 
         source = self.build_source(
-            chat_id=room_id,
-            chat_name=room_name,
-            chat_type=chat_type,
-            user_id=sender_id,
-            user_name=sender_name,
-            thread_id=None,  # Band uses rooms, not threads — always None.
+            chat_id=inb.room_id,
+            chat_name=self._room_name_for(inb.room_id) or inb.room_id,
+            chat_type=_SESSION_CHAT_TYPE,
+            user_id=inb.sender_id,
+            user_name=inb.sender_name,
+            thread_id=None,  # Band uses rooms, not threads.
+        )
+        return await self._forward_inbound(inb, source, is_command)
+
+    def _normalize_inbound(self, event: Any) -> Optional[_Inbound]:
+        """Extract a normalized inbound message, or None if it lacks payload/room.
+
+        Band prepends the addressed self-mention inline (``@[[agent]] /help``);
+        strip it so a leading slash-command is detected and prose is de-noised.
+        """
+        payload = getattr(event, "payload", None)
+        if payload is None:
+            return None
+        room_id = getattr(event, "room_id", None) or getattr(
+            payload, "chat_room_id", None
+        )
+        if not room_id:
+            return None
+        return _Inbound(
+            payload=payload,
+            room_id=room_id,
+            msg_id=getattr(payload, "id", None),
+            content=self._strip_self_mention(getattr(payload, "content", None) or ""),
+            message_type=getattr(payload, "message_type", "") or "",
+            sender_id=getattr(payload, "sender_id", None),
+            sender_type=getattr(payload, "sender_type", "") or "",
+            sender_name=getattr(payload, "sender_name", None),
         )
 
-        if msg_id:
-            self._seen_inbound_ids.add(msg_id)
+    async def _forward_inbound(
+        self, inb: _Inbound, source: Any, is_command: bool
+    ) -> bool:
+        """Build the ``MessageEvent`` and hand it to the gateway.
+
+        Commands dispatch immediately and skip the seed (they may inline-await in
+        the gateway — e.g. /stop, /approve — and never start a fresh turn; the
+        rehydrate flag is left for the next real message). A flagged cold room
+        otherwise rebuilds context from Band first (atomic durable seed, blob
+        fallback; best-effort, flag consumed once — see _rehydrate_room).
+        """
+        if inb.msg_id:
+            self._seen_inbound_ids.add(inb.msg_id)
             if len(self._seen_inbound_ids) > _SENT_IDS_MAX:
                 for _ in range(_SENT_IDS_MAX // 2):
                     self._seen_inbound_ids.pop()
 
         out = MessageEvent(
-            text=content,
+            text=inb.content,
             message_type=MessageType.TEXT,
             source=source,
-            message_id=msg_id,
-            raw_message=payload,
+            message_id=inb.msg_id,
+            raw_message=inb.payload,
         )
-
-        # Owner commands dispatch immediately and skip the seed: they don't need
-        # recovered history, the gateway may dispatch an active-session command
-        # INLINE (e.g. /stop, /approve), so adding the seed's fetch latency would
-        # stall control commands — and a command never starts a fresh turn. The
-        # rehydrate flag is left intact for the next real message.
         if is_command:
             await self.handle_message(out)
             return True
-
-        # Rehydration: if this room is flagged — re-joined or returning with no
-        # local session — rebuild context from Band history. The durable path
-        # seeds the gateway transcript atomically (race-free; see
-        # _atomic_seed_transcript) and falls back to a one-shot channel_context
-        # blob on a store that can't be seeded. Best-effort — a hydration failure
-        # never blocks the message, and the flag is consumed once so we don't
-        # refetch on every message.
-        if room_id in self._rehydrate_rooms:
-            self._rehydrate_rooms.discard(room_id)
-            out.channel_context = await self._rehydrate_room(source, room_id, msg_id)
+        if inb.room_id in self._rehydrate_rooms:
+            self._rehydrate_rooms.discard(inb.room_id)
+            out.channel_context = await self._rehydrate_room(
+                source, inb.room_id, inb.msg_id
+            )
         await self.handle_message(out)
         return True
 

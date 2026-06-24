@@ -55,11 +55,7 @@ def _make_adapter(monkeypatch, agent_id="agent-uuid-1234", api_key="secret-key",
 class TestBandAdapterInit:
 
     def test_init_reads_agent_id_from_env(self, monkeypatch):
-        monkeypatch.setenv("BAND_AGENT_ID", "env-agent-id")
-        monkeypatch.setenv("BAND_API_KEY", "env-api-key")
-        monkeypatch.delenv("BAND_BASE_URL", raising=False)
-        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
-        adapter = BandAdapter(_make_config())
+        adapter = _make_adapter(monkeypatch, agent_id="env-agent-id", api_key="env-api-key")
         assert adapter._cfg_agent_id == "env-agent-id"
         assert adapter._api_key == "env-api-key"
 
@@ -81,20 +77,12 @@ class TestBandAdapterInit:
         assert adapter._cfg_agent_id == "env-wins"
 
     def test_init_sets_band_platform_identity(self, monkeypatch):
-        monkeypatch.setenv("BAND_AGENT_ID", "x")
-        monkeypatch.setenv("BAND_API_KEY", "y")
-        monkeypatch.delenv("BAND_BASE_URL", raising=False)
-        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
-        adapter = BandAdapter(_make_config())
+        adapter = _make_adapter(monkeypatch)
         # platform is a Platform enum with value "band"
         assert adapter.platform.value == "band"
 
     def test_init_base_url_from_env(self, monkeypatch):
-        monkeypatch.setenv("BAND_AGENT_ID", "a")
-        monkeypatch.setenv("BAND_API_KEY", "b")
-        monkeypatch.setenv("BAND_BASE_URL", "https://custom.host")
-        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
-        adapter = BandAdapter(_make_config())
+        adapter = _make_adapter(monkeypatch, base_url="https://custom.host")
         assert adapter._base_url == "https://custom.host"
 
     def test_init_base_url_from_extra(self, monkeypatch):
@@ -109,11 +97,7 @@ class TestBandAdapterInit:
         assert adapter._base_url == "https://extra.host"
 
     def test_init_runtime_state_is_empty(self, monkeypatch):
-        monkeypatch.setenv("BAND_AGENT_ID", "a")
-        monkeypatch.setenv("BAND_API_KEY", "b")
-        monkeypatch.delenv("BAND_BASE_URL", raising=False)
-        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
-        adapter = BandAdapter(_make_config())
+        adapter = _make_adapter(monkeypatch)
         assert adapter._link is None
         assert adapter._consumer_task is None
         assert adapter._sent_ids == set()
@@ -121,12 +105,7 @@ class TestBandAdapterInit:
         assert adapter._last_human_sender == {}
 
     def test_name_property(self, monkeypatch):
-        monkeypatch.setenv("BAND_AGENT_ID", "a")
-        monkeypatch.setenv("BAND_API_KEY", "b")
-        monkeypatch.delenv("BAND_BASE_URL", raising=False)
-        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
-        adapter = BandAdapter(_make_config())
-        assert adapter.name == "Band"
+        assert _make_adapter(monkeypatch).name == "Band"
 
 
 class TestBandAccessPolicy:
@@ -877,15 +856,17 @@ class TestHandleEvent:
         adapter._link.unsubscribe_room.assert_called_once_with("del-room")
 
     @pytest.mark.asyncio
-    async def test_unknown_event_type_is_ignored(self, adapter):
-        # Should not raise
-        event = SimpleNamespace(type="participant_added", room_id="some-room")
+    async def test_unhandled_event_type_is_ignored(self, adapter):
+        # An event the router has no branch for (e.g. a future contact_* event)
+        # falls through silently: no raise, no room subscribe/unsubscribe.
+        event = SimpleNamespace(type="contact_request_received", room_id="some-room")
         await adapter._handle_event(event)
         adapter._link.subscribe_room.assert_not_called()
+        adapter._link.unsubscribe_room.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# 15. Tools-pass event handling — participant changes, session close, rehydrate
+# 12. Room & participant lifecycle events — participant changes, leave-reset, re-join
 # ---------------------------------------------------------------------------
 
 class _FakeSessionStore:
@@ -1087,6 +1068,10 @@ class TestRoomAddedRejoinFlagsRehydration:
         adapter._link.get_next_message.assert_not_called()
         adapter._catch_up_task.cancel()
 
+
+# ---------------------------------------------------------------------------
+# 13. Cold-room rehydration & durable transcript seeding (Band as source of truth)
+# ---------------------------------------------------------------------------
 
 class TestHasActiveSession:
     """'Warm' means a session with real history, not a bare (empty) entry."""
@@ -1777,7 +1762,7 @@ class TestSeedHelpers:
 
 
 # ---------------------------------------------------------------------------
-# 15b. Route A — server-cursor ack lifecycle + /next missed-message catch-up
+# 14. Route A — server-cursor ack lifecycle + /next missed-message catch-up
 # ---------------------------------------------------------------------------
 
 def _ack_link():
@@ -2131,7 +2116,7 @@ class TestMentionParsingDictMetadata:
 
 
 # ---------------------------------------------------------------------------
-# 12. connect/disconnect lifecycle
+# 15. connect/disconnect lifecycle
 # ---------------------------------------------------------------------------
 
 class TestConnectDisconnect:
@@ -2258,7 +2243,7 @@ class TestConnectDisconnect:
 
 
 # ---------------------------------------------------------------------------
-# 13. _record_sent_id eviction
+# 16. _record_sent_id eviction
 # ---------------------------------------------------------------------------
 
 class TestRecordSentId:
@@ -2276,7 +2261,7 @@ class TestRecordSentId:
 
 
 # ---------------------------------------------------------------------------
-# 14. get_chat_info
+# 17. get_chat_info
 # ---------------------------------------------------------------------------
 
 class TestGetChatInfo:
@@ -2329,7 +2314,7 @@ class TestGetChatInfo:
 
 
 # ---------------------------------------------------------------------------
-# 15. Hub bootstrap (_ensure_hub) + main-channel wiring
+# 18. Hub bootstrap (_ensure_hub) + main-channel wiring
 # ---------------------------------------------------------------------------
 
 def _make_hub_link(rooms=None, created_room_id="hub-new-1"):
@@ -2558,7 +2543,7 @@ class TestWireHomeChannel:
 
 
 # ---------------------------------------------------------------------------
-# 16. Owner slash-command gate
+# 19. Owner slash-command gate
 # ---------------------------------------------------------------------------
 
 class TestIsCommandText:
@@ -2771,7 +2756,7 @@ class TestOwnerCommandGate:
 
 
 # ---------------------------------------------------------------------------
-# 17. _env_enablement — hub / home-channel seeding
+# 20. _env_enablement — hub / home-channel seeding
 # ---------------------------------------------------------------------------
 
 class TestEnvEnablementHubSeeds:
@@ -2812,7 +2797,7 @@ class TestEnvEnablementHubSeeds:
 
 
 # ---------------------------------------------------------------------------
-# 18. Hub installation announcement (first designation must be owner-visible)
+# 21. Hub installation announcement (first designation must be owner-visible)
 # ---------------------------------------------------------------------------
 
 class TestHubAnnouncement:
@@ -2870,7 +2855,7 @@ class TestHubAnnouncement:
 
 
 # ---------------------------------------------------------------------------
-# 19. Hub greeting builder (clean title + owner-facing body)
+# 22. Hub greeting builder (clean title + owner-facing body)
 # ---------------------------------------------------------------------------
 
 class TestHubGreeting:
@@ -2913,7 +2898,7 @@ class TestHubGreeting:
 
 
 # ---------------------------------------------------------------------------
-# 20. Hub failover — repeated hub send failures create + re-wire a fresh hub
+# 23. Hub failover — repeated hub send failures create + re-wire a fresh hub
 # ---------------------------------------------------------------------------
 
 class TestHubFailover:

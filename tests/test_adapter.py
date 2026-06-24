@@ -895,6 +895,33 @@ class _FakeSessionStore:
         return None
 
 
+def _history_store(transcripts):
+    """Session-store stand-in whose 'warm' verdict is history-based.
+
+    ``transcripts`` maps session_key -> transcript list. Unlike ``_FakeSessionStore``
+    (which has no ``load_transcript`` so ``_has_active_session`` falls back to the
+    legacy entry-presence branch), this exposes ``load_transcript`` and entries
+    carrying ``session_id`` — so a test exercises the real history-based rule
+    (empty transcript == cold), the behavior this change introduced.
+    """
+    entries = {key: SimpleNamespace(session_id=f"sid::{key}") for key in transcripts}
+    by_sid = {f"sid::{key}": list(t) for key, t in transcripts.items()}
+
+    class _Store:
+        config = SimpleNamespace(group_sessions_per_user=False)
+
+        def __init__(self):
+            self._entries = entries
+
+        def _ensure_loaded(self):
+            pass
+
+        def load_transcript(self, session_id):
+            return list(by_sid.get(session_id, []))
+
+    return _Store()
+
+
 class TestParticipantChangeEvents:
     """participant_added / participant_removed surfacing (decision #3)."""
 
@@ -1032,13 +1059,29 @@ class TestRoomAddedRejoinFlagsRehydration:
     async def test_rejoin_room_with_live_session_not_flagged(self, adapter):
         # A room_added for a room that already has a live session (e.g. a
         # server-side re-subscribe replay) must NOT re-inject stale history.
+        # Uses a load_transcript-bearing store so this exercises the real
+        # history-based _has_active_session, not the entry-presence fallback.
         adapter._known_rooms.add("warm-room")
-        adapter._session_store = _FakeSessionStore(
-            active_keys=["agent:main:band:group:warm-room"]
+        adapter._session_store = _history_store(
+            {"agent:main:band:group:warm-room": [{"role": "user", "content": "prior"}]}
         )
         event = SimpleNamespace(type="room_added", room_id="warm-room")
         await adapter._handle_event(event)
         assert "warm-room" not in adapter._rehydrate_rooms
+
+    @pytest.mark.asyncio
+    async def test_rejoin_room_with_empty_session_is_flagged(self, adapter):
+        # The new history-based rule: a bare session entry with an EMPTY
+        # transcript counts as cold, so a re-join still flags it for rehydration.
+        # (Under the old entry-presence logic this room would be seen as warm and
+        # NOT flagged — so this test fails if the history-based change is reverted.)
+        adapter._known_rooms.add("empty-room")
+        adapter._session_store = _history_store(
+            {"agent:main:band:group:empty-room": []}
+        )
+        event = SimpleNamespace(type="room_added", room_id="empty-room")
+        await adapter._handle_event(event)
+        assert "empty-room" in adapter._rehydrate_rooms
 
     @pytest.mark.asyncio
     async def test_rejoin_cold_room_actually_drains_backlog(self, adapter):
@@ -1715,6 +1758,32 @@ class TestAtomicSeedTranscript:
         assert _band_mod._atomic_seed_transcript(store, e.session_id, rows) is True
         assert _band_mod._atomic_seed_transcript(store, e.session_id, rows) is False
         assert store._db.message_count(e.session_id) == 1
+
+    def test_seeds_session_with_only_soft_deleted_rows(self, tmp_path):
+        # A rewind/undo soft-deletes rows (active=0). load_transcript filters
+        # active=1, so the gateway replays the session as empty/cold and the room
+        # is flagged for rehydration. The atomic guard must agree — count only
+        # ACTIVE rows — or it sees the inactive rows, no-ops (returns False), the
+        # caller treats that as "handled" and skips the blob, and the room answers
+        # cold with nothing seeded.
+        store, Src = self._store(tmp_path)
+        from gateway.config import Platform
+        e = store.get_or_create_session(
+            Src(platform=Platform("telegram"), chat_id="r6", chat_type="group")
+        )
+        store._db.append_message(e.session_id, role="user", content="OLD", timestamp=1.0)
+        # Soft-delete every row, as a full rewind would.
+        store._db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE messages SET active = 0 WHERE session_id = ?", (e.session_id,)
+            )
+        )
+        assert store.load_transcript(e.session_id) == []  # cold to the gateway
+        wrote = _band_mod._atomic_seed_transcript(
+            store, e.session_id, [{"role": "user", "content": "[Al] hi", "timestamp": 2.0}]
+        )
+        assert wrote is True  # seeded, not mistaken for non-empty
+        assert [m["content"] for m in store.load_transcript(e.session_id)] == ["[Al] hi"]
 
     def test_returns_none_without_db(self):
         # A store lacking _db/_execute_write can't do an atomic write.

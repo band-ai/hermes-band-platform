@@ -369,7 +369,10 @@ def _atomic_seed_transcript(
     a concurrent turn-append on another thread — no check-then-act window, no
     clobber. The INSERT mirrors ``SessionDB.replace_messages`` (same columns,
     ``_encode_content``, count upkeep) so FTS triggers and ``message_count`` stay
-    consistent. The COUNT uses the raw connection (not ``store._db.message_count``,
+    consistent. The COUNT is scoped to ``active = 1`` — the same rows the gateway
+    replays via ``load_transcript`` — so a session whose history was soft-deleted
+    by a rewind/undo (rows flipped to ``active = 0``) still counts as empty and
+    gets seeded. It uses the raw connection (not ``store._db.message_count``,
     which would re-enter ``_db``'s non-reentrant lock and deadlock).
     """
     native = getattr(store, "seed_transcript_if_empty", None)
@@ -381,8 +384,14 @@ def _atomic_seed_transcript(
         return None
 
     def _do(conn: Any) -> bool:
+        # Count only ACTIVE rows — the same view the gateway replays via
+        # load_transcript (get_messages_as_conversation filters active=1). A
+        # rewind/undo soft-deletes rows (active=0); counting all rows would treat
+        # such a session as non-empty and skip the seed, yet the caller maps that
+        # False to "handled" and skips the blob too, so the room would answer cold.
         (existing,) = conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1",
+            (session_id,),
         ).fetchone()
         if existing:
             return False

@@ -6,6 +6,7 @@ BEFORE this module imports the adapter — so the adapter's top-level
 """
 
 import asyncio
+import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -1054,18 +1055,23 @@ class TestRoomAddedRejoinFlagsRehydration:
         adapter._link.get_next_message.assert_awaited_with("known-room")
 
     @pytest.mark.asyncio
-    async def test_rejoin_skips_drain_when_full_catchup_running(self, adapter):
-        # An all-rooms drain already covers every room → don't spawn a per-room
-        # one (this also makes connect-time room_added replays cheap).
+    async def test_rejoin_during_running_catchup_still_drains(self, adapter):
+        # The seed↔drain invariant: a re-join always drains, even while an
+        # all-rooms catch-up is in flight. That drain iterates a start-of-run
+        # snapshot of _known_rooms, so a room re-joined mid-drain would never be
+        # reached by it — skipping here would leave the excluded mention backlog
+        # neither seeded nor answered until the next reconnect. Concurrent /
+        # duplicate same-room drains are safe (mark_processing claim + inbound
+        # dedup), so the re-join just drains.
         adapter._link.get_stale_processing_messages = AsyncMock(return_value=[])
         adapter._link.get_next_message = AsyncMock(return_value=None)
         adapter._known_rooms.add("known-room")
-        adapter._catch_up_task = asyncio.create_task(asyncio.sleep(0.05))
+        adapter._catch_up_task = asyncio.create_task(asyncio.sleep(0.05))  # in flight
         await adapter._handle_event(
             SimpleNamespace(type="room_added", room_id="known-room")
         )
-        await asyncio.sleep(0)
-        adapter._link.get_next_message.assert_not_called()
+        await asyncio.sleep(0)  # let the scheduled per-room drain run
+        adapter._link.get_next_message.assert_awaited_with("known-room")
         adapter._catch_up_task.cancel()
 
 
@@ -1445,10 +1451,12 @@ class TestDurableSeedRehydration:
         assert evt.channel_context is None
 
     @pytest.mark.asyncio
-    async def test_seed_write_failure_falls_back_to_blob(self, adapter):
+    async def test_seed_write_failure_falls_back_to_blob(self, adapter, caplog):
         # The seed write itself fails (transient store error) but context fetch
         # works → return False → caller produces the channel_context blob, so
-        # the room is never silently left with no recovered context.
+        # the room is never silently left with no recovered context. The failure
+        # is surfaced at WARNING (not debug): a raised seed is unexpected and
+        # would otherwise silently disable durable rehydration.
         adapter._session_store = _SeedingSessionStore(
             on_seed=lambda: (_ for _ in ()).throw(RuntimeError("db locked"))
         )
@@ -1461,11 +1469,54 @@ class TestDurableSeedRehydration:
             ]
         )
 
-        await adapter._handle_message_created(self._event())
+        with caplog.at_level(logging.WARNING, logger="hermes_band_platform.adapter"):
+            await adapter._handle_message_created(self._event())
 
         evt = adapter.handle_message.call_args[0][0]
         assert evt.channel_context is not None
         assert "earlier note" in evt.channel_context
+        # The seed failure is loud, not swallowed at debug.
+        assert any(
+            r.levelno == logging.WARNING and "seed failed" in r.message.lower()
+            for r in caplog.records
+        )
+
+    def test_build_seed_rows_timestamps_are_monotonic(self, adapter):
+        # The gateway replays a transcript ORDER BY (timestamp, id). A context
+        # item with a missing inserted_at gets _seed_epoch's "now" fallback,
+        # which would sort it AFTER genuine past history and scramble chronology
+        # (an assistant reply landing before the user turn it answered). The
+        # clamp keeps timestamps non-decreasing in list order so replay order ==
+        # the server's oldest-first order regardless of timestamp gaps.
+        import datetime as dt
+
+        adapter._agent_id = "agent-self-id"
+        t1 = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        t2 = dt.datetime(2024, 1, 2, tzinfo=dt.timezone.utc)
+        items = [
+            SimpleNamespace(id="a", message_type="text", content="first",
+                            sender_id="human-1", sender_type="User",
+                            sender_name="Alice", inserted_at=t1),
+            SimpleNamespace(id="b", message_type="text", content="second (no ts)",
+                            sender_id="human-1", sender_type="User",
+                            sender_name="Alice", inserted_at=None),
+            SimpleNamespace(id="c", message_type="text", content="third",
+                            sender_id="human-1", sender_type="User",
+                            sender_name="Alice", inserted_at=t2),
+        ]
+        rows = adapter._build_seed_rows(items, set(), [])
+        # List (chronological) order is preserved...
+        assert [r["content"] for r in rows] == [
+            "[Alice] first",
+            "[Alice] second (no ts)",
+            "[Alice] third",
+        ]
+        # ...and timestamps never decrease, so ORDER BY (timestamp, id) cannot
+        # reorder the now-stamped middle row ahead of the real t2 row that
+        # follows it. (Without the clamp this list would be [t1, now, t2] —
+        # unsorted — and replay would put "third" before "second (no ts)".)
+        ts = [r["timestamp"] for r in rows]
+        assert ts == sorted(ts)
 
     @pytest.mark.asyncio
     async def test_peer_agent_message_seeded_as_user(self, adapter):
@@ -2041,6 +2092,36 @@ class TestCatchUpRehydratesColdRoom:
         # _ack_link defaults: get_next_message -> None, no stale messages.
         await adapter._catch_up_all_rooms()
         assert "room-abc" in adapter._rehydrate_rooms
+
+    @pytest.mark.asyncio
+    async def test_warns_once_when_gateway_isolates_sessions_per_user(
+        self, adapter, caplog
+    ):
+        # Band rooms are shared channels; a gateway with
+        # group_sessions_per_user=True fragments them per user, so per-room
+        # session reset/rehydration target a key the per-user sessions don't
+        # use. We can't change the store config, so surface it loudly — exactly
+        # once, not on every reconnect.
+        adapter._session_store = _FakeSessionStore(group_sessions_per_user=True)
+        with caplog.at_level(logging.WARNING, logger="hermes_band_platform.adapter"):
+            await adapter._catch_up_all_rooms()
+            await adapter._catch_up_all_rooms()  # second connect — must not re-warn
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "group_sessions_per_user" in r.message
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_isolation_warning_in_shared_session_mode(self, adapter, caplog):
+        # The supported config (group_sessions_per_user=False) is silent.
+        adapter._session_store = _FakeSessionStore(group_sessions_per_user=False)
+        with caplog.at_level(logging.WARNING, logger="hermes_band_platform.adapter"):
+            await adapter._catch_up_all_rooms()
+        assert not [
+            r for r in caplog.records if "group_sessions_per_user" in r.message
+        ]
 
 
 class TestReconnectSchedulesCatchUp:

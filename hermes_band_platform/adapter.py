@@ -505,6 +505,8 @@ class BandAdapter(BasePlatformAdapter):
         self._catch_up_task: Optional[asyncio.Task] = None
         # Per-room re-join drains, held so the tasks aren't GC'd mid-flight.
         self._room_catch_up_tasks: set = set()
+        # One-time guard for the session-isolation misconfig warning.
+        self._warned_session_isolation: bool = False
 
         # ── Identity (resolved from get_agent_me on connect) ──
         # _cfg_agent_id opens the link; the resolved _agent_id is authoritative
@@ -1414,11 +1416,15 @@ class BandAdapter(BasePlatformAdapter):
         excluded backlog would be neither seeded nor answered. Mirror the
         (re)connect path here so the invariant holds for both triggers.
 
-        No-op while an all-rooms drain is already in flight (it covers this
-        room), which also makes connect-time ``room_added`` replays cheap.
+        Always drains — we do NOT skip when an all-rooms drain is in flight.
+        That drain iterates a snapshot of the rooms known when it started, so a
+        room re-joined mid-drain would never be reached; skipping here would
+        leave its excluded mention backlog neither seeded nor answered until the
+        next reconnect. A concurrent or duplicate drain of the same room is
+        already safe: each message is ``mark_processing``-claimed before the
+        next ``/next`` fetch, and ``_seen_inbound_ids`` dedups dispatch across
+        tasks — so the simplest correct behavior is to just drain.
         """
-        if self._catch_up_task and not self._catch_up_task.done():
-            return
         task = asyncio.create_task(self._catch_up_room(room_id))
         self._room_catch_up_tasks.add(task)
         task.add_done_callback(self._room_catch_up_tasks.discard)
@@ -1433,6 +1439,10 @@ class BandAdapter(BasePlatformAdapter):
         """
         if not self._link or not getattr(self, "_message_handler", None):
             return
+        self._warn_if_session_isolation_mismatch()
+        # Iterate a snapshot (list()) so a concurrent re-join mutating
+        # _known_rooms can't break iteration; that re-join gets its own drain
+        # via _schedule_room_catch_up (which never skips), so nothing is missed.
         for room_id in list(self._known_rooms):
             if not self._link:
                 return
@@ -1450,6 +1460,32 @@ class BandAdapter(BasePlatformAdapter):
             if not self._has_active_session(room_id):
                 self._rehydrate_rooms.add(room_id)
             await self._catch_up_room(room_id)
+
+    def _warn_if_session_isolation_mismatch(self) -> None:
+        """Warn once if the gateway isolates group sessions per user.
+
+        Every Band room is a single shared channel (locked decision #5): hub
+        bootstrap, the /next drain, per-room session reset, and cold-room
+        rehydration all assume *one* session per room. That holds only when the
+        gateway's ``group_sessions_per_user`` is False. When it is True the
+        store fragments each room into per-user sessions, so per-room probes
+        (``_has_active_session``) and resets target a room-only key that the
+        per-user sessions don't use — leave-reset becomes a no-op and stale
+        history can resume on re-join. We can't change the store's config, so
+        surface the requirement loudly instead of degrading silently.
+        """
+        if self._warned_session_isolation:
+            return
+        self._warned_session_isolation = True
+        store = getattr(self, "_session_store", None)
+        cfg = getattr(store, "config", None)
+        if cfg is not None and getattr(cfg, "group_sessions_per_user", False):
+            logger.warning(
+                "[band] Gateway group_sessions_per_user=True, but Band rooms are "
+                "shared channels — per-room session reset/rehydration assume one "
+                "session per room. Set group_sessions_per_user=False for correct "
+                "behavior (sessions will otherwise fragment per user)."
+            )
 
     async def _catch_up_room(self, room_id: str) -> None:
         """Sweep stuck-'processing' messages, then drain one room's /next backlog.
@@ -1616,9 +1652,15 @@ class BandAdapter(BasePlatformAdapter):
             # Best-effort: a seed failure must never block the triggering
             # message. Fall back to the one-shot blob (return False) — the
             # atomic write is single-transaction, so no partial transcript is
-            # left behind.
-            logger.debug(
-                "[band] Session seed failed for room %s: %s", _short_id(room_id), e
+            # left behind. Logged at WARNING (not debug): a raised seed is not
+            # expected in normal operation — e.g. a schema drift in the atomic
+            # INSERT would otherwise silently disable durable rehydration and
+            # quietly resurrect the re-answer bug with no signal.
+            logger.warning(
+                "[band] Durable session seed failed for room %s (%s) — falling "
+                "back to one-shot context blob",
+                _short_id(room_id),
+                e,
             )
             return False
 
@@ -1637,6 +1679,14 @@ class BandAdapter(BasePlatformAdapter):
         and anything in ``exclude_ids`` are skipped.
         """
         rows: List[_TranscriptRow] = []
+        # ``items`` is oldest-first; the gateway replays a transcript ORDER BY
+        # (timestamp, id). _seed_epoch falls back to "now" for a missing/
+        # unparseable inserted_at, which would sort such a row *after* genuine
+        # past history and scramble chronology. Clamp timestamps to be
+        # non-decreasing in list order so replay order == server order
+        # regardless of timestamp gaps (id breaks ties, preserving insertion
+        # order within an equal-timestamp run).
+        last_ts = 0.0
         for item in items:
             mid = getattr(item, "id", None)
             if mid and mid in exclude_ids:
@@ -1648,13 +1698,11 @@ class BandAdapter(BasePlatformAdapter):
             role = _seed_role_for(sender_type, sender_id, self._agent_id)
             if role == "user":
                 content = f"[{sender_name or 'someone'}] {content}"
-            rows.append(
-                {
-                    "role": role,
-                    "content": content,
-                    "timestamp": _seed_epoch(getattr(item, "inserted_at", None)),
-                }
-            )
+            ts = _seed_epoch(getattr(item, "inserted_at", None))
+            if ts < last_ts:
+                ts = last_ts
+            last_ts = ts
+            rows.append({"role": role, "content": content, "timestamp": ts})
         return rows
 
     async def _actionable_answer_ids(self, room_id: str) -> set:

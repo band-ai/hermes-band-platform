@@ -1370,17 +1370,19 @@ class TestDurableSeedRehydration:
         assert evt.channel_context is None
 
     @pytest.mark.asyncio
-    async def test_warm_session_is_not_reseeded(self, adapter):
-        adapter._session_store = _SeedingSessionStore(
+    async def test_warm_session_is_not_reseeded_and_left_intact(self, adapter):
+        store = _SeedingSessionStore(
             existing_transcript=[{"role": "user", "content": "prior"}]
         )
+        adapter._session_store = store
         adapter._rehydrate_rooms.add("rejoined-room")
         adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx([])
 
         await adapter._handle_message_created(self._event())
 
-        # Transcript already had history → no seed write, no context fetch.
-        assert adapter._session_store.atomic_seeded is None
+        # Warm → no seed write, no clobber, no channel_context.
+        assert store.atomic_seeded is None
+        assert store.load_transcript("sess-1") == [{"role": "user", "content": "prior"}]
         evt = adapter.handle_message.call_args[0][0]
         assert evt.channel_context is None
 
@@ -1481,21 +1483,116 @@ class TestDurableSeedRehydration:
         assert "earlier note" in evt.channel_context
 
     @pytest.mark.asyncio
-    async def test_warm_session_short_circuits_no_clobber(self, adapter):
-        # An already-warm session is left untouched (the atomic primitive isn't
-        # even reached — the load_transcript guard short-circuits first).
-        store = _SeedingSessionStore(
-            existing_transcript=[{"role": "user", "content": "live"}]
-        )
+    async def test_peer_agent_message_seeded_as_user(self, adapter):
+        # A message from a DIFFERENT agent is a peer from our POV → seeded as a
+        # `user` turn with a [name] prefix, NOT `assistant`. (Only our own
+        # replies become assistant; this is the non-obvious INT-509-adjacent case.)
+        store = _SeedingSessionStore()
         adapter._session_store = store
         adapter._rehydrate_rooms.add("rejoined-room")
-        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx([])
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="p1", message_type="text", content="from a peer bot",
+                                sender_id="other-agent", sender_type="Agent",
+                                sender_name="Helper", inserted_at=None),
+                SimpleNamespace(id="o1", message_type="text", content="my reply",
+                                sender_id="agent-self-id", sender_type="Agent",
+                                sender_name="Me", inserted_at=None),
+            ]
+        )
 
         await adapter._handle_message_created(self._event())
 
-        adapter.handle_message.assert_called_once()
-        assert store.atomic_seeded is None
-        assert store.load_transcript("sess-1") == [{"role": "user", "content": "live"}]
+        assert [(r["role"], r["content"]) for r in store.atomic_seeded] == [
+            ("user", "[Helper] from a peer bot"),   # peer agent → user
+            ("assistant", "my reply"),               # our own → assistant
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unaddressed_actionable_message_is_kept_in_seed(self, adapter):
+        # Only *mentions* are excluded from the seed (they get answered). An
+        # unprocessed message that does NOT mention the agent is context, not an
+        # answer — it must stay in the seeded history, not be over-excluded.
+        store = _SeedingSessionStore()
+        adapter._session_store = store
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[
+                    SimpleNamespace(id="mention-1",
+                                    metadata={"mentions": [{"id": "agent-self-id"}]}),
+                    SimpleNamespace(id="chatter-1", metadata={"mentions": []}),
+                ],
+                metadata=SimpleNamespace(next_cursor=None, has_more=False),
+            )
+        )
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="chatter-1", message_type="text",
+                                content="background chatter", sender_id="human-2",
+                                sender_type="User", sender_name="Bob", inserted_at=None),
+                SimpleNamespace(id="mention-1", message_type="text",
+                                content="answer me", sender_id="human-1",
+                                sender_type="User", sender_name="Alice", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        # The mention is excluded (it'll be answered); the un-addressed chatter is kept.
+        assert [r["content"] for r in store.atomic_seeded] == ["[Bob] background chatter"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_room_context_follows_pagination(self, adapter):
+        # The context fetch must follow next_cursor across pages (and terminate).
+        store = _SeedingSessionStore()
+        adapter._session_store = store
+        adapter._rehydrate_rooms.add("rejoined-room")
+
+        page1 = SimpleNamespace(
+            data=[SimpleNamespace(id="h1", message_type="text", content="page one",
+                                  sender_id="human-1", sender_type="User",
+                                  sender_name="Alice", inserted_at=None)],
+            metadata=SimpleNamespace(next_cursor="cursor-2", has_more=True),
+        )
+        page2 = SimpleNamespace(
+            data=[SimpleNamespace(id="h2", message_type="text", content="page two",
+                                  sender_id="human-1", sender_type="User",
+                                  sender_name="Alice", inserted_at=None)],
+            metadata=SimpleNamespace(next_cursor=None, has_more=False),
+        )
+        adapter._link.rest.agent_api_context.get_agent_chat_context = AsyncMock(
+            side_effect=[page1, page2]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        assert [r["content"] for r in store.atomic_seeded] == [
+            "[Alice] page one",
+            "[Alice] page two",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_seed_renders_uuid_mentions_with_participants(self, adapter):
+        # @[[uuid]] mentions are rendered to @handle using the room's participants
+        # cache so the seeded transcript is human-readable.
+        store = _SeedingSessionStore()
+        adapter._session_store = store
+        adapter._participants_cache["rejoined-room"] = [
+            {"id": "human-1", "handle": "alice"}
+        ]
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text",
+                                content="ping @[[human-1]] now", sender_id="human-2",
+                                sender_type="User", sender_name="Bob", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        assert store.atomic_seeded[0]["content"] == "[Bob] ping @alice now"
 
 
 class TestSessionKeyParity:
@@ -1644,40 +1741,39 @@ class TestAtomicSeedTranscript:
 class TestSeedHelpers:
     """Pure helpers behind the durable seed."""
 
-    @pytest.mark.parametrize(
-        "sender_type,sender_id,expected",
-        [
-            ("Agent", "me", "assistant"),  # our own replies
-            ("Agent", "other", "user"),    # a *peer* agent is not us → user
-            ("User", "human-1", "user"),   # humans
-        ],
-    )
-    def test_seed_role_mapping(self, sender_type, sender_id, expected):
-        assert _band_mod._seed_role_for(sender_type, sender_id, "me") == expected
-
-    def test_can_seed_sessions_needs_resolve_and_read(self):
-        # Detecting a cold room needs only resolve + read; the write is separate.
-        assert _band_mod._can_seed_sessions(None) is False
-        assert _band_mod._can_seed_sessions(
-            SimpleNamespace(get_or_create_session=lambda *a: None)
-        ) is False
-        assert _band_mod._can_seed_sessions(
-            SimpleNamespace(
-                get_or_create_session=lambda *a: None,
-                load_transcript=lambda *a: [],
-            )
-        ) is True
-
     def test_seedable_text_skips_non_text_and_empty(self):
         text_item = SimpleNamespace(
             message_type="text", content=" hi ", sender_type="User",
             sender_id="u1", sender_name="Al",
         )
+        # Strips whitespace and returns the (type, id, name, content) tuple.
         assert _band_mod._seedable_text(text_item, []) == ("User", "u1", "Al", "hi")
         tool_item = SimpleNamespace(message_type="tool_call", content="x")
         assert _band_mod._seedable_text(tool_item, []) is None
         empty_item = SimpleNamespace(message_type="text", content="   ")
         assert _band_mod._seedable_text(empty_item, []) is None
+
+    def test_next_page_terminates_on_falsey_or_missing_metadata(self):
+        # Guards the pagination loops against spinning: only a real string cursor
+        # AND has_more is True continues; everything else ends the loop.
+        nxt = _band_mod.BandAdapter._next_page
+        assert nxt(SimpleNamespace(
+            metadata=SimpleNamespace(next_cursor="c", has_more=True))) == ("c", True)
+        assert nxt(SimpleNamespace(
+            metadata=SimpleNamespace(next_cursor="c", has_more=False))) == (None, False)
+        assert nxt(SimpleNamespace(
+            metadata=SimpleNamespace(next_cursor=None, has_more=True))) == (None, False)
+        assert nxt(SimpleNamespace()) == (None, False)              # no metadata
+        assert nxt(SimpleNamespace(metadata=MagicMock())) == (None, False)  # truthy mock
+
+    def test_seed_epoch_coerces_or_falls_back(self):
+        import datetime as _dt
+
+        dt = _dt.datetime(2020, 1, 1, tzinfo=_dt.timezone.utc)
+        assert _band_mod._seed_epoch(dt) == dt.timestamp()
+        # None / unparseable → a real epoch, never raises (keeps ordering sane).
+        assert isinstance(_band_mod._seed_epoch(None), float)
+        assert isinstance(_band_mod._seed_epoch("not-a-time"), float)
 
 
 # ---------------------------------------------------------------------------

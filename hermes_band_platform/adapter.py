@@ -39,7 +39,7 @@ import os
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Callable, Dict, List, Optional, TypedDict
 from urllib.parse import urlsplit
 
 from gateway.config import HomeChannel, Platform, PlatformConfig  # noqa: E402
@@ -1705,6 +1705,34 @@ class BandAdapter(BasePlatformAdapter):
             rows.append({"role": role, "content": content, "timestamp": ts})
         return rows
 
+    async def _paginate(
+        self,
+        endpoint: Callable[..., Any],
+        room_id: str,
+        collect: Callable[[List[Any]], None],
+        what: str,
+    ) -> None:
+        """Drive a cursor-paginated Band REST endpoint, feeding each page to
+        ``collect``. Best-effort: any failure logs at debug and stops, leaving
+        whatever was collected so far — a fetch miss never blocks the turn.
+        """
+        cursor: Optional[str] = None
+        try:
+            while True:
+                kwargs: Dict[str, Any] = {
+                    "chat_id": room_id,
+                    "request_options": DEFAULT_REQUEST_OPTIONS,
+                }
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = await endpoint(**kwargs)
+                collect(getattr(resp, "data", None) or [])
+                cursor, has_more = self._next_page(resp)
+                if not has_more:
+                    break
+        except Exception as e:
+            logger.debug("[band] %s failed for room %s: %s", what, _short_id(room_id), e)
+
     async def _actionable_answer_ids(self, room_id: str) -> set:
         """Ids of messages the answer path will handle as their own turns.
 
@@ -1718,31 +1746,19 @@ class BandAdapter(BasePlatformAdapter):
         ids: set = set()
         if self._link is None:
             return ids
-        cursor: Optional[str] = None
-        try:
-            while True:
-                kwargs: Dict[str, Any] = {
-                    "chat_id": room_id,
-                    "request_options": DEFAULT_REQUEST_OPTIONS,
-                }
-                if cursor:
-                    kwargs["cursor"] = cursor
-                resp = await self._link.rest.agent_api_messages.list_agent_messages(
-                    **kwargs
-                )
-                for msg in getattr(resp, "data", None) or []:
-                    mid = getattr(msg, "id", None)
-                    if mid and self._is_agent_mentioned(msg):
-                        ids.add(mid)
-                cursor, has_more = self._next_page(resp)
-                if not has_more:
-                    break
-        except Exception as e:
-            logger.debug(
-                "[band] Backlog enumeration failed for room %s: %s",
-                _short_id(room_id),
-                e,
-            )
+
+        def collect(page: List[Any]) -> None:
+            for msg in page:
+                mid = getattr(msg, "id", None)
+                if mid and self._is_agent_mentioned(msg):
+                    ids.add(mid)
+
+        await self._paginate(
+            self._link.rest.agent_api_messages.list_agent_messages,
+            room_id,
+            collect,
+            "Backlog enumeration",
+        )
         return ids
 
     async def _fetch_room_context(self, room_id: str) -> List[Any]:
@@ -1755,26 +1771,12 @@ class BandAdapter(BasePlatformAdapter):
         items: List[Any] = []
         if self._link is None:
             return items
-        cursor: Optional[str] = None
-        try:
-            while True:
-                kwargs: Dict[str, Any] = {
-                    "chat_id": room_id,
-                    "request_options": DEFAULT_REQUEST_OPTIONS,
-                }
-                if cursor:
-                    kwargs["cursor"] = cursor
-                resp = await self._link.rest.agent_api_context.get_agent_chat_context(
-                    **kwargs
-                )
-                items.extend(getattr(resp, "data", None) or [])
-                cursor, has_more = self._next_page(resp)
-                if not has_more:
-                    break
-        except Exception as e:
-            logger.debug(
-                "[band] Context fetch failed for room %s: %s", _short_id(room_id), e
-            )
+        await self._paginate(
+            self._link.rest.agent_api_context.get_agent_chat_context,
+            room_id,
+            items.extend,
+            "Context fetch",
+        )
         return items
 
     @staticmethod

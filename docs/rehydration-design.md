@@ -22,12 +22,12 @@ turn — designed for require-mention gap backfill, **not** cold-start recovery.
 never written to the gateway session transcript (`sessions.db`), so it evaporates
 after one turn. Two further defects compound it:
 
-- `_fetch_rehydration_context` (`adapter.py:1356`) flattens history to `who: text`
-  lines with **no role distinction**, so the model cannot tell its own past replies
-  from user turns → it re-answers already-answered questions.
-- The re-join flag path (`adapter.py:905`) sets the rehydrate flag **unconditionally**,
-  without the active-session guard the restart path has (`adapter.py:1269`), so a
-  healthy room can get stale context re-injected on a spurious `room_added`.
+- The old `_fetch_rehydration_context` flattened history to `who: text` lines with
+  **no role distinction**, so the model cannot tell its own past replies from user
+  turns → it re-answers already-answered questions.
+- The re-join flag path set the rehydrate flag **unconditionally**, without the
+  active-session guard the restart path has, so a healthy room can get stale context
+  re-injected on a spurious `room_added`.
 
 ## 2. Goal & non-goals
 
@@ -238,3 +238,27 @@ but **not persisted columns**, so the implementation never depends on them.
   rather than breaking.
 - Land with the bug fixes (P4/P5) even if the full seed is staged, since they are
   self-contained correctness fixes.
+
+## 12. As-shipped deltas (post-review)
+
+A code review hardened the initial implementation; these supersede the sketches above:
+
+- **Atomic write.** The seed does a single `rewrite_transcript(session_id, rows)` into
+  the empty transcript, not a loop of `append_to_transcript`. A failure can't leave a
+  half-seeded transcript that future seeds would short-circuit on. (`_can_seed_sessions`
+  requires `rewrite_transcript`.)
+- **Fail-open.** `_seed_session_from_band` returns `False` on *any* error (not `True`),
+  so a genuine failure falls back to the `channel_context` blob instead of silently
+  leaving the room with no recovered context.
+- **Race-safe.** The two paginated fetches run concurrently (`asyncio.gather`) and
+  *before* the session is touched; an empty-transcript re-check runs immediately before
+  the write with no `await` between, so a concurrent live turn is never clobbered.
+- **Seed↔drain invariant (the missed case).** The seed excludes the unprocessed mention
+  backlog on the assumption a `/next` drain answers it. That holds on (re)connect but
+  not on a *live* re-join (which only set the flag), so the backlog was excluded yet
+  never answered. The re-join path now schedules a per-room drain
+  (`_schedule_room_catch_up`), guarded to no-op while an all-rooms drain is in flight.
+- **One notion of "warm".** `_has_active_session` now means *non-empty transcript*
+  (via `load_transcript`), matching the seed's idempotency guard, so an empty
+  `get_or_create_session` side-effect entry no longer blocks future rehydration.
+- **Shared parsing.** `_build_seed_rows` and the fallback blob share `_seedable_text`.

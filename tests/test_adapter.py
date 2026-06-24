@@ -1058,6 +1058,71 @@ class TestRoomAddedRejoinFlagsRehydration:
         await adapter._handle_event(event)
         assert "warm-room" not in adapter._rehydrate_rooms
 
+    @pytest.mark.asyncio
+    async def test_rejoin_cold_room_schedules_room_drain(self, adapter, monkeypatch):
+        # A live re-join must also drain the room so the backlog the seed
+        # excludes actually gets answered (the seed<->drain invariant).
+        adapter._known_rooms.add("known-room")
+        drained = AsyncMock()
+        monkeypatch.setattr(adapter, "_catch_up_room", drained)
+        await adapter._handle_event(
+            SimpleNamespace(type="room_added", room_id="known-room")
+        )
+        await asyncio.sleep(0)  # let the scheduled task run
+        drained.assert_awaited_once_with("known-room")
+
+    @pytest.mark.asyncio
+    async def test_rejoin_skips_room_drain_when_full_catchup_running(
+        self, adapter, monkeypatch
+    ):
+        # An all-rooms drain already covers every room → don't spawn a per-room
+        # one (this also makes connect-time room_added replays cheap).
+        adapter._known_rooms.add("known-room")
+        adapter._catch_up_task = asyncio.create_task(asyncio.sleep(0.05))
+        drained = AsyncMock()
+        monkeypatch.setattr(adapter, "_catch_up_room", drained)
+        await adapter._handle_event(
+            SimpleNamespace(type="room_added", room_id="known-room")
+        )
+        await asyncio.sleep(0)
+        drained.assert_not_called()
+        adapter._catch_up_task.cancel()
+
+
+class TestHasActiveSession:
+    """'Warm' means a session with real history, not a bare (empty) entry."""
+
+    def _store(self, transcript):
+        key = "agent:main:band:group:room-x"
+        entry = SimpleNamespace(session_id="sid-x")
+
+        class _Store:
+            config = SimpleNamespace(group_sessions_per_user=False)
+            _entries = {key: entry}
+
+            def _ensure_loaded(self):
+                pass
+
+            def load_transcript(self, sid):
+                return list(transcript)
+
+        return _Store()
+
+    def test_empty_transcript_is_not_active(self, monkeypatch):
+        a = _make_adapter(monkeypatch)
+        a._session_store = self._store([])
+        assert a._has_active_session("room-x") is False
+
+    def test_nonempty_transcript_is_active(self, monkeypatch):
+        a = _make_adapter(monkeypatch)
+        a._session_store = self._store([{"role": "user", "content": "hi"}])
+        assert a._has_active_session("room-x") is True
+
+    def test_missing_entry_is_not_active(self, monkeypatch):
+        a = _make_adapter(monkeypatch)
+        a._session_store = self._store([{"role": "user", "content": "hi"}])
+        assert a._has_active_session("other-room") is False
+
 
 class TestRehydrationOnNextMessage:
     """A flagged room's next message pulls Band context into channel_context."""
@@ -1149,26 +1214,40 @@ class TestRehydrationOnNextMessage:
 class _SeedingSessionStore(_FakeSessionStore):
     """Session store stand-in exposing the public durable-seed API.
 
-    Records every row passed to ``append_to_transcript`` so tests can assert
-    what was seeded. ``load_transcript`` starts empty (cold) unless seeded with
-    ``existing_transcript`` (warm).
+    Records the rows passed to ``rewrite_transcript`` (the atomic seed write) in
+    ``seeded`` so tests can assert what was seeded. ``load_transcript`` starts
+    empty (cold) unless constructed with ``existing_transcript`` (warm). An
+    optional ``on_rewrite`` hook lets a test simulate a concurrent write or a
+    store failure.
     """
 
-    def __init__(self, *, existing_transcript=None, session_id="sess-1", **kw):
+    def __init__(
+        self,
+        *,
+        existing_transcript=None,
+        session_id="sess-1",
+        on_rewrite=None,
+        **kw,
+    ):
         super().__init__(**kw)
         self._session_id = session_id
         self._transcripts = {session_id: list(existing_transcript or [])}
-        self.appended = []
+        self.seeded = None
+        self._on_rewrite = on_rewrite
 
     def get_or_create_session(self, source):
+        # Mirror the real store side effect: materialize an (empty) entry.
+        self._entries.setdefault(self._session_id, object())
         return SimpleNamespace(session_id=self._session_id, session_key="k")
 
     def load_transcript(self, session_id):
         return list(self._transcripts.get(session_id, []))
 
-    def append_to_transcript(self, session_id, message, skip_db=False):
-        self._transcripts.setdefault(session_id, []).append(message)
-        self.appended.append(message)
+    def rewrite_transcript(self, session_id, messages):
+        if self._on_rewrite is not None:
+            self._on_rewrite()
+        self._transcripts[session_id] = list(messages)
+        self.seeded = list(messages)
 
 
 class TestDurableSeedRehydration:
@@ -1237,12 +1316,11 @@ class TestDurableSeedRehydration:
         # Durable path used → message carries no one-shot channel_context.
         evt = adapter.handle_message.call_args[0][0]
         assert evt.channel_context is None
-        # Own reply seeded as assistant (prevents re-answering); peer as user.
-        assert store.appended == [
-            {"role": "user", "content": "[Alice] what's the weather?",
-             "timestamp": store.appended[0]["timestamp"]},
-            {"role": "assistant", "content": "It's sunny.",
-             "timestamp": store.appended[1]["timestamp"]},
+        # Single atomic write; own reply as assistant (prevents re-answering),
+        # peer as user with a [name] prefix.
+        assert [(r["role"], r["content"]) for r in store.seeded] == [
+            ("user", "[Alice] what's the weather?"),
+            ("assistant", "It's sunny."),
         ]
         assert "rejoined-room" not in adapter._rehydrate_rooms
 
@@ -1256,8 +1334,8 @@ class TestDurableSeedRehydration:
 
         await adapter._handle_message_created(self._event())
 
-        # Transcript already had history → no new rows, no context fetch needed.
-        assert adapter._session_store.appended == []
+        # Transcript already had history → no seed write, no context fetch.
+        assert adapter._session_store.seeded is None
         evt = adapter.handle_message.call_args[0][0]
         assert evt.channel_context is None
 
@@ -1295,7 +1373,7 @@ class TestDurableSeedRehydration:
 
         await adapter._handle_message_created(self._event())
 
-        seeded = [r["content"] for r in adapter._session_store.appended]
+        seeded = [r["content"] for r in adapter._session_store.seeded]
         assert seeded == ["[Alice] older context"]
 
     @pytest.mark.asyncio
@@ -1318,7 +1396,7 @@ class TestDurableSeedRehydration:
         assert "earlier note" in evt.channel_context
 
     @pytest.mark.asyncio
-    async def test_seed_failure_still_delivers_message(self, adapter):
+    async def test_context_fetch_failure_still_delivers_message(self, adapter):
         adapter._session_store = _SeedingSessionStore()
         adapter._rehydrate_rooms.add("rejoined-room")
         adapter._link.rest.agent_api_context.get_agent_chat_context = AsyncMock(
@@ -1327,11 +1405,65 @@ class TestDurableSeedRehydration:
 
         await adapter._handle_message_created(self._event())
 
-        # Best-effort: message delivered, no rows, no fallback double-up.
+        # Best-effort: message delivered; nothing seeded; the blob fallback also
+        # has no context to offer (same failing endpoint) → channel_context None.
         adapter.handle_message.assert_called_once()
-        assert adapter._session_store.appended == []
+        assert adapter._session_store.seeded is None
         evt = adapter.handle_message.call_args[0][0]
         assert evt.channel_context is None
+
+    @pytest.mark.asyncio
+    async def test_seed_write_failure_falls_back_to_blob(self, adapter):
+        # The seed write itself fails (transient store error) but context fetch
+        # works → return False → caller produces the channel_context blob, so
+        # the room is never silently left with no recovered context.
+        adapter._session_store = _SeedingSessionStore(
+            on_rewrite=lambda: (_ for _ in ()).throw(RuntimeError("db locked"))
+        )
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text", content="earlier note",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is not None
+        assert "earlier note" in evt.channel_context
+
+    @pytest.mark.asyncio
+    async def test_concurrent_fill_during_fetch_skips_write(self, adapter):
+        # Simulate a live turn writing the transcript while the seed's context
+        # fetch is in flight: the pre-write re-check must see it non-empty and
+        # NOT clobber it.
+        store = _SeedingSessionStore()
+        adapter._session_store = store
+        adapter._rehydrate_rooms.add("rejoined-room")
+
+        async def _fill_then_return(*a, **k):
+            store._transcripts["sess-1"] = [{"role": "user", "content": "live turn"}]
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(id="h1", message_type="text", content="old",
+                                    sender_id="human-1", sender_type="User",
+                                    sender_name="Alice", inserted_at=None),
+                ],
+                metadata=SimpleNamespace(next_cursor=None, has_more=False),
+            )
+
+        adapter._link.rest.agent_api_context.get_agent_chat_context = AsyncMock(
+            side_effect=_fill_then_return
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        # rewrite_transcript never ran (re-check found the live turn).
+        assert store.seeded is None
+        assert store.load_transcript("sess-1") == [{"role": "user", "content": "live turn"}]
 
 
 class TestSeedHelpers:
@@ -1348,14 +1480,29 @@ class TestSeedHelpers:
 
     def test_can_seed_sessions_requires_full_api(self):
         assert _band_mod._can_seed_sessions(None) is False
-        partial = SimpleNamespace(get_or_create_session=lambda *a: None)
+        # Missing rewrite_transcript (the atomic seed write) → not seedable.
+        partial = SimpleNamespace(
+            get_or_create_session=lambda *a: None,
+            load_transcript=lambda *a: [],
+        )
         assert _band_mod._can_seed_sessions(partial) is False
         full = SimpleNamespace(
             get_or_create_session=lambda *a: None,
             load_transcript=lambda *a: [],
-            append_to_transcript=lambda *a, **k: None,
+            rewrite_transcript=lambda *a, **k: None,
         )
         assert _band_mod._can_seed_sessions(full) is True
+
+    def test_seedable_text_skips_non_text_and_empty(self):
+        text_item = SimpleNamespace(
+            message_type="text", content=" hi ", sender_type="User",
+            sender_id="u1", sender_name="Al",
+        )
+        assert _band_mod._seedable_text(text_item, []) == ("User", "u1", "Al", "hi")
+        tool_item = SimpleNamespace(message_type="tool_call", content="x")
+        assert _band_mod._seedable_text(tool_item, []) is None
+        empty_item = SimpleNamespace(message_type="text", content="   ")
+        assert _band_mod._seedable_text(empty_item, []) is None
 
 
 # ---------------------------------------------------------------------------

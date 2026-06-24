@@ -289,6 +289,30 @@ def _seed_role_for(sender_type: str, sender_id: Optional[str], agent_id: str) ->
     return "user"
 
 
+def _seedable_text(
+    item: Any, participants: List[Dict[str, Any]]
+) -> Optional[tuple]:
+    """Parse a Band context item into ``(sender_type, sender_id, sender_name,
+    clean_text)``, or None to skip it.
+
+    Single definition of "which context items carry replayable text and how
+    their content is cleaned" (skip non-text and empty; render ``@[[uuid]]``
+    mentions to ``@handle``). Shared by the durable seed (``_build_seed_rows``)
+    and the legacy blob (``_rehydration_context_blob``) so the two never drift.
+    """
+    if (getattr(item, "message_type", "text") or "text") != "text":
+        return None
+    text = (getattr(item, "content", None) or "").strip()
+    if not text:
+        return None
+    return (
+        getattr(item, "sender_type", "") or "",
+        getattr(item, "sender_id", None),
+        getattr(item, "sender_name", None),
+        replace_uuid_mentions(text, participants),
+    )
+
+
 def _seed_epoch(inserted_at: Any) -> float:
     """Best-effort Unix-epoch float for a row's ``timestamp`` column.
 
@@ -314,7 +338,7 @@ def _can_seed_sessions(store: Any) -> bool:
         for method in (
             "get_or_create_session",
             "load_transcript",
-            "append_to_transcript",
+            "rewrite_transcript",
         )
     )
 
@@ -387,6 +411,9 @@ class BandAdapter(BasePlatformAdapter):
         # every link reconnect to pull messages missed while the agent was
         # offline; cancelled on disconnect.
         self._catch_up_task: Optional[asyncio.Task] = None
+        # Per-room catch-up drains spawned on a live re-join (see
+        # _schedule_room_catch_up). Held so the tasks aren't GC'd mid-flight.
+        self._room_catch_up_tasks: set = set()
         # The agent's own UUID + handle, resolved from get_agent_me on connect.
         # ``_cfg_agent_id`` is the configured id used to open the link; the
         # resolved ``_agent_id`` is authoritative for self-filtering.
@@ -972,6 +999,11 @@ class BandAdapter(BasePlatformAdapter):
                     # re-inject stale history over good local state.
                     if not self._has_active_session(room_id):
                         self._rehydrate_rooms.add(room_id)
+                        # Rehydration's two halves must fire together: the seed
+                        # excludes the unprocessed backlog on the assumption a
+                        # drain answers it. (Re)connect runs both; a live re-join
+                        # otherwise sets only the flag, so drain this room too.
+                        self._schedule_room_catch_up(room_id)
                     logger.debug(
                         "[band] Re-joined known room %s", _short_id(room_id)
                     )
@@ -1306,15 +1338,34 @@ class BandAdapter(BasePlatformAdapter):
             return
         self._catch_up_task = asyncio.create_task(self._catch_up_all_rooms())
 
+    def _schedule_room_catch_up(self, room_id: str) -> None:
+        """Drain one room's backlog after a live re-join.
+
+        Rehydration has two halves that MUST fire together: seeding prior
+        history (``_rehydrate_room``) and *answering* the unprocessed mention
+        backlog (this drain). The seed deliberately excludes that backlog so it
+        isn't answered twice — which is only safe if a drain actually answers
+        it. The (re)connect path runs both halves in ``_catch_up_all_rooms``; a
+        live ``room_added`` re-join only sets the flag, so without this the
+        excluded backlog would be neither seeded nor answered. Mirror the
+        (re)connect path here so the invariant holds for both triggers.
+
+        No-op while an all-rooms drain is already in flight (it covers this
+        room), which also makes connect-time ``room_added`` replays cheap.
+        """
+        if self._catch_up_task and not self._catch_up_task.done():
+            return
+        task = asyncio.create_task(self._catch_up_room(room_id))
+        self._room_catch_up_tasks.add(task)
+        task.add_done_callback(self._room_catch_up_tasks.discard)
+
     async def _catch_up_all_rooms(self) -> None:
         """Drain every known room's missed-message backlog (Route A).
 
         On (re)connect: (0) flag rooms whose local history is gone for
-        rehydration, (1) re-pick anything left 'processing' by a prior crash,
-        then (2) drain the unprocessed backlog via /next. Each message flows
-        through the same gate/normalize path as a live one and is acked via the
-        processing-lifecycle hooks. Best-effort and per-room isolated — one
-        room's failure never blocks the others or live consumption.
+        rehydration, then (1) drain each room. Best-effort and per-room
+        isolated — one room's failure never blocks the others or live
+        consumption.
         """
         if not self._link or not getattr(self, "_message_handler", None):
             return
@@ -1334,20 +1385,28 @@ class BandAdapter(BasePlatformAdapter):
             # harmlessly on first use.
             if not self._has_active_session(room_id):
                 self._rehydrate_rooms.add(room_id)
-            # Crash recovery: /next skips messages with an active processing
-            # attempt, so stuck-'processing' ones from a prior incarnation must
-            # be swept explicitly and re-driven.
-            try:
-                stale = await self._link.get_stale_processing_messages(room_id)
-            except Exception as e:
-                stale = []
-                logger.debug(
-                    "[band] stale-processing sweep failed for room %s: %s",
-                    _short_id(room_id), e,
-                )
-            for msg in stale or []:
-                await self._dispatch_caught_up(room_id, msg)
-            await self._drain_room(room_id)
+            await self._catch_up_room(room_id)
+
+    async def _catch_up_room(self, room_id: str) -> None:
+        """Sweep stuck-'processing' messages, then drain one room's /next backlog.
+
+        Crash recovery: /next skips messages with an active processing attempt,
+        so stuck-'processing' ones from a prior incarnation must be swept
+        explicitly and re-driven. Best-effort — never raises to the caller.
+        """
+        if not self._link:
+            return
+        try:
+            stale = await self._link.get_stale_processing_messages(room_id)
+        except Exception as e:
+            stale = []
+            logger.debug(
+                "[band] stale-processing sweep failed for room %s: %s",
+                _short_id(room_id), e,
+            )
+        for msg in stale or []:
+            await self._dispatch_caught_up(room_id, msg)
+        await self._drain_room(room_id)
 
     async def _drain_room(self, room_id: str) -> None:
         """Pull and dispatch a room's unprocessed backlog until /next is empty.
@@ -1441,13 +1500,21 @@ class BandAdapter(BasePlatformAdapter):
     ) -> bool:
         """Seed the room's Hermes session transcript from Band history.
 
-        Returns True when the durable-seed path owns rehydration for this room
+        Returns True when the durable-seed path handled rehydration for this room
         (so the caller skips the ``channel_context`` fallback), False when the
-        session store lacks the public API and the caller should fall back.
+        store lacks the seed API *or* an error prevented seeding — in both of
+        those cases the caller falls back to the one-shot blob.
 
-        Idempotent: seeds only into an *empty* transcript, so a re-join over a
-        live session — or a second message before the flag clears — never
-        duplicates rows (``append_to_transcript`` is append-only, no de-dup).
+        Atomic and race-safe by construction:
+
+          * The two paginated fetches (the only ``await`` points) run *before*
+            we touch the session, concurrently.
+          * The empty-transcript re-check and the ``rewrite_transcript`` write
+            run back-to-back with NO ``await`` between them, so a concurrent live
+            turn for the same room can't interleave and be clobbered, and a room
+            that filled during the fetches is left untouched.
+          * ``rewrite_transcript`` is a single replace, so a failure can't leave
+            a half-seeded transcript that future seeds would short-circuit on.
         """
         store = getattr(self, "_session_store", None)
         if not _can_seed_sessions(store):
@@ -1455,35 +1522,43 @@ class BandAdapter(BasePlatformAdapter):
         try:
             entry = store.get_or_create_session(source)
             if store.load_transcript(entry.session_id):
-                # Warm session — history already present; nothing to rebuild.
+                # Warm session — history already present; nothing to rebuild
+                # (and skip the fetches below).
                 return True
             # Messages the live/catch-up path will answer as their own turns
             # (the trigger + the actionable mention backlog) must not also be
-            # seeded as history, or the agent would see them twice.
-            exclude = await self._actionable_answer_ids(room_id)
+            # seeded as history, or the agent would see them twice. Fetch the
+            # backlog ids and the context concurrently — independent reads.
+            exclude, items = await asyncio.gather(
+                self._actionable_answer_ids(room_id),
+                self._fetch_room_context(room_id),
+            )
             if trigger_msg_id:
                 exclude.add(trigger_msg_id)
             participants = self._participants_cache.get(room_id) or []
-            rows = self._build_seed_rows(
-                await self._fetch_room_context(room_id), exclude, participants
+            rows = self._build_seed_rows(items, exclude, participants)
+            if not rows:
+                return True
+            # Re-check emptiness right before writing: a live turn may have
+            # written during the fetches above. No await between here and the
+            # write, so this is a tight, clobber-free guard.
+            if store.load_transcript(entry.session_id):
+                return True
+            store.rewrite_transcript(entry.session_id, rows)
+            logger.info(
+                "[band] Seeded %d history row(s) into room %s session",
+                len(rows),
+                _short_id(room_id),
             )
-            for row in rows:
-                store.append_to_transcript(entry.session_id, row)
-            if rows:
-                logger.info(
-                    "[band] Seeded %d history row(s) into room %s session",
-                    len(rows),
-                    _short_id(room_id),
-                )
             return True
         except Exception as e:
             # Best-effort: a seed failure must never block the triggering
-            # message. The durable API existed, so don't double up via the
-            # text-blob fallback — just proceed without recovered context.
+            # message. Fall back to the one-shot blob (return False) — the
+            # atomic write above guarantees no partial transcript was left.
             logger.debug(
                 "[band] Session seed failed for room %s: %s", _short_id(room_id), e
             )
-            return True
+            return False
 
     def _build_seed_rows(
         self,
@@ -1504,20 +1579,13 @@ class BandAdapter(BasePlatformAdapter):
             mid = getattr(item, "id", None)
             if mid and mid in exclude_ids:
                 continue
-            if (getattr(item, "message_type", "text") or "text") != "text":
+            parsed = _seedable_text(item, participants)
+            if parsed is None:
                 continue
-            text = (getattr(item, "content", None) or "").strip()
-            if not text:
-                continue
-            role = _seed_role_for(
-                getattr(item, "sender_type", "") or "",
-                getattr(item, "sender_id", None),
-                self._agent_id,
-            )
-            content = replace_uuid_mentions(text, participants)
+            sender_type, sender_id, sender_name, content = parsed
+            role = _seed_role_for(sender_type, sender_id, self._agent_id)
             if role == "user":
-                who = getattr(item, "sender_name", None) or "someone"
-                content = f"[{who}] {content}"
+                content = f"[{sender_name or 'someone'}] {content}"
             rows.append(
                 {
                     "role": role,
@@ -1625,17 +1693,12 @@ class BandAdapter(BasePlatformAdapter):
         cached_participants = self._participants_cache.get(room_id) or []
         lines: List[str] = []
         for item in items:
-            if (getattr(item, "message_type", "text") or "text") != "text":
+            parsed = _seedable_text(item, cached_participants)
+            if parsed is None:
                 continue
-            text = (getattr(item, "content", None) or "").strip()
-            if not text:
-                continue
-            who = (
-                getattr(item, "sender_name", None)
-                or getattr(item, "sender_type", None)
-                or "?"
-            )
-            lines.append(f"{who}: {replace_uuid_mentions(text, cached_participants)}")
+            _stype, _sid, sender_name, content = parsed
+            who = sender_name or _stype or "?"
+            lines.append(f"{who}: {content}")
         if not lines:
             return None
         logger.debug(
@@ -1737,12 +1800,18 @@ class BandAdapter(BasePlatformAdapter):
             logger.debug("[band] Could not send command-gate notice: %s", e)
 
     def _has_active_session(self, room_id: str) -> bool:
-        """Whether the room has an active Hermes session (group gating).
+        """Whether the room has a Hermes session with *real* history.
 
-        Uses the session store wired onto the adapter via ``set_session_store``
-        (the same mechanism Slack uses for un-mentioned thread replies). Band
-        rooms aren't threaded, so the session key is built without a thread_id.
-        Returns False if the store isn't available.
+        "Active" means a session that holds at least one transcript row — the
+        same notion the seed's idempotency guard uses (``load_transcript``
+        non-empty). Anchoring both on history (not mere session-entry presence)
+        keeps the cold-room flagging and the seed agreed: ``get_or_create_session``
+        can leave behind an *empty* entry, which must NOT count as warm or the
+        room would never be re-seeded once real history appears.
+
+        Read-only: looks up an existing entry without creating one. Falls back
+        to entry-presence when the store predates ``load_transcript``. Returns
+        False if the store isn't available.
         """
         session_store = getattr(self, "_session_store", None)
         if not session_store:
@@ -1758,11 +1827,27 @@ class BandAdapter(BasePlatformAdapter):
                 chat_id=room_id,
                 chat_type=_SESSION_CHAT_TYPE,
             )
-            store_cfg = getattr(session_store, "config", None)
-            gspu = getattr(store_cfg, "group_sessions_per_user", False) if store_cfg else False
-            session_key = build_session_key(source, group_sessions_per_user=gspu)
+            # Prefer the store's own key generator so the key matches exactly
+            # what get_or_create_session derives (incl. profile namespace on a
+            # multiplexing gateway); fall back to the shared builder.
+            if hasattr(session_store, "_generate_session_key"):
+                session_key = session_store._generate_session_key(source)
+            else:
+                store_cfg = getattr(session_store, "config", None)
+                gspu = (
+                    getattr(store_cfg, "group_sessions_per_user", False)
+                    if store_cfg
+                    else False
+                )
+                session_key = build_session_key(source, group_sessions_per_user=gspu)
             session_store._ensure_loaded()
-            return session_key in session_store._entries
+            entry = session_store._entries.get(session_key)
+            if entry is None:
+                return False
+            # History-based truth when available; else fall back to presence.
+            if hasattr(session_store, "load_transcript"):
+                return bool(session_store.load_transcript(entry.session_id))
+            return True
         except Exception:
             return False
 

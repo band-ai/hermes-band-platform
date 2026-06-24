@@ -2,6 +2,12 @@
 
 Status: implemented (PR #8, INT-910) · Team: Integration
 
+> **As-shipped note.** §3–§6 below describe the original plan, where the seed wrote
+> via `append_to_transcript`/`rewrite_transcript`. The shipped seed instead uses an
+> atomic single-transaction write (`_atomic_seed_transcript`) to be race-safe — see
+> §12 and `docs/rehydration-seed-race-design.md` §0. The roles, exclusion boundary,
+> and fallback described below are unchanged.
+
 ## 1. Problem
 
 After a gateway restart or a room re-join, the Band–Hermes plugin does not reliably

@@ -471,19 +471,16 @@ class BandAdapter(BasePlatformAdapter):
 
         extra = getattr(config, "extra", {}) or {}
 
-        # Credentials: extra (seeded by _env_enablement) with os.getenv fallback.
-        # Strip whitespace to match _env_enablement (avoids cfg/enablement drift).
+        # ── Credentials & config (env wins over PlatformConfig.extra; stripped
+        #    to match _env_enablement and avoid cfg/enablement drift) ──
         self._cfg_agent_id = (os.getenv("BAND_AGENT_ID") or extra.get("agent_id", "")).strip()
         self._api_key = (os.getenv("BAND_API_KEY") or extra.get("api_key", "")).strip()
         self._base_url = (os.getenv("BAND_BASE_URL") or extra.get("base_url", "")).strip()
-
-        # Owner UUID override — normally resolved from the agent identity on
-        # connect. Anchors the hub (owner control room) and the command gate.
+        # Owner override; else resolved from agent identity on connect. Anchors
+        # the hub (owner control room) and the command gate.
         self._owner_uuid = os.getenv("BAND_OWNER_ID") or extra.get("owner_id", "") or None
-
-        # Hub (owner control room) — pinned id from env/extra, else resolved or
-        # created by _ensure_hub() on connect. The hub is the platform home
-        # channel (cron / notification deliveries land there by default).
+        # Hub room — pinned id from env/extra, else created by _ensure_hub() on
+        # connect; it's the platform home channel (cron/notifications land there).
         self._hub_room_id: Optional[str] = (
             str(os.getenv("BAND_HUB_ROOM") or extra.get("hub_room", "") or "").strip()
             or None
@@ -491,85 +488,55 @@ class BandAdapter(BasePlatformAdapter):
         # Rooms already given the one-time "commands are owner-only" notice.
         self._cmd_notice_rooms: set = set()
 
-        # Effective access policy advertised to the gateway's authorization gate.
-        #
-        # ``enforces_own_access_policy`` (below) is necessary but NOT sufficient on
-        # the released host: ``gateway.authz_mixin._is_user_authorized`` only
-        # trusts an own-policy adapter's intake when its *effective policy* for the
-        # chat type is literally ``"allowlist"`` (the #34515 fail-open fix — a
-        # flag of True with an ``"open"`` policy would admit the whole network).
-        # Band has no DMs, so every source is ``chat_type="group"`` and the host
-        # reads ``_group_policy``; we pin both to ``"allowlist"`` because Band's
-        # own platform ACL *is* the allowlist — a message only reaches us if Band
-        # already admitted the sender. Without this, a fresh install (just
-        # BAND_AGENT_ID + BAND_API_KEY) default-denies every sender, including the
-        # owner, and the agent replies "not an authorized user".
+        # ── Access policy ──
+        # Pinned to "allowlist" so the host's authz gate trusts our own-policy
+        # intake — Band's platform ACL *is* the allowlist. Full rationale in
+        # enforces_own_access_policy.
         self._dm_policy = "allowlist"
         self._group_policy = "allowlist"
 
-        # Runtime state
+        # ── Link & lifecycle ──
         self._link: Optional[Any] = None
-        # The event loop connect() opened the link on. The link's phoenix
-        # websocket primitives (asyncio.Event/Future) bind to it, so a send()
-        # invoked from a *different* loop — e.g. the gateway's startup-restore
-        # replay path — is marshalled back onto it instead of raising
-        # "<Event> is bound to a different event loop" (INT-899).
+        # Loop the link's asyncio primitives bind to; a cross-loop send() is
+        # marshalled back onto it rather than raising (see _send_on_link).
         self._link_loop: Optional[asyncio.AbstractEventLoop] = None
         self._consumer_task: Optional[asyncio.Task] = None
-        # Background /next catch-up drain (Route A). Started on connect and on
-        # every link reconnect to pull messages missed while the agent was
-        # offline; cancelled on disconnect.
+        # Background /next catch-up drain (Route A), (re)started on connect.
         self._catch_up_task: Optional[asyncio.Task] = None
-        # Per-room catch-up drains spawned on a live re-join (see
-        # _schedule_room_catch_up). Held so the tasks aren't GC'd mid-flight.
+        # Per-room re-join drains, held so the tasks aren't GC'd mid-flight.
         self._room_catch_up_tasks: set = set()
-        # The agent's own UUID + handle, resolved from get_agent_me on connect.
-        # ``_cfg_agent_id`` is the configured id used to open the link; the
-        # resolved ``_agent_id`` is authoritative for self-filtering.
+
+        # ── Identity (resolved from get_agent_me on connect) ──
+        # _cfg_agent_id opens the link; the resolved _agent_id is authoritative
+        # for self-filtering.
         self._agent_id: str = self._cfg_agent_id
         self._handle: str = ""
 
-        # Room membership is two disjoint sets — a room is in at most one:
-        #   _known_rooms : rooms the agent currently belongs to (subscribed; the
-        #                  only set the catch-up drain iterates).
-        #   _left_rooms  : rooms it has since left (room_removed/room_deleted),
-        #                  dropped from _known_rooms so a long-lived agent
-        #                  cycling through many rooms can't grow it without
-        #                  bound, and kept here only as capped re-join memory.
-        # Invariant: a ``room_added`` for a room in *either* set is a *re-join*
-        # (its local session was reset on the prior leave), so it is flagged for
-        # context rehydration; a room in neither is brand new.
+        # ── Room tracking ──
+        # Disjoint sets: _known_rooms (currently joined — the only set the drain
+        # iterates) and _left_rooms (capped re-join memory). A room_added for a
+        # room in EITHER is a re-join → flagged in _rehydrate_rooms for a one-time
+        # context rebuild from Band, consumed once.
         self._known_rooms: set = set()
         self._left_rooms: set = set()
-        # Cold rooms whose next inbound message triggers a one-time rebuild of
-        # context from Band history (durably seeded into the session transcript;
-        # see _rehydrate_room). Consumed once, then cleared.
         self._rehydrate_rooms: set = set()
 
-        # Per-room participant cache: room_id -> list[{id, name, handle, type}].
-        self._participants_cache: Dict[str, List[Dict[str, Any]]] = {}
-        # Per-room last human sender: room_id -> {"id", "handle", "name"}.
-        # Used to build mandatory mentions when replying.
-        self._last_human_sender: Dict[str, Dict[str, Any]] = {}
+        # ── Per-room caches ──
+        self._participants_cache: Dict[str, List[Dict[str, Any]]] = {}  # id/name/handle/type
+        self._last_human_sender: Dict[str, Dict[str, Any]] = {}  # for reply @mentions
 
-        # Sent-message id backstop: ids we posted, so the consumer can drop the
-        # platform's echo even if SDK-side self-filtering misses it.
+        # ── Dedup backstops ──
+        # _sent_ids: our own posts, to drop the platform's echo. _seen_inbound_ids:
+        # ids dispatched this lifetime, guarding the live-vs-catch-up race and
+        # server re-offers (NOT persisted — after restart the server cursor wins).
         self._sent_ids: set = set()
-
-        # Inbound-message ids already dispatched THIS process-lifetime. Guards
-        # the narrow live-vs-catch-up race (a message both live-delivered and in
-        # the /next backlog at reconnect) and any server re-offer from
-        # double-processing. Intentionally NOT persisted: after a restart the
-        # server cursor is authoritative and a re-offer SHOULD re-process.
         self._seen_inbound_ids: set = set()
 
-        # Hub failover: when the hub room repeatedly rejects sends (e.g. it hit
-        # its Band message limit, or it's persistently erroring) the adapter
-        # creates a fresh owner room and re-wires it as the main channel.
-        # ``_hub_send_failures`` counts *consecutive* failed hub sends and is
-        # reset by any successful hub send; reaching the threshold triggers a
-        # failover. ``_failover_in_progress`` guards the async failover against
-        # reentrancy, and ``_hub_failovers_done`` caps failovers per connect.
+        # ── Hub failover ──
+        # On repeated hub-send failures (message limit / persistent error) create
+        # a fresh owner room and re-wire it as the main channel. _hub_send_failures
+        # counts CONSECUTIVE failures (reset on success); _failover_in_progress
+        # guards reentrancy; _hub_failovers_done caps failovers per connect.
         self._hub_failover_threshold = _int_env(
             "BAND_HUB_FAILOVER_THRESHOLD", _HUB_FAILOVER_THRESHOLD_DEFAULT
         )

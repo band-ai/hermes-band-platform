@@ -232,20 +232,11 @@ but **not persisted columns**, so the implementation never depends on them.
   this (a wiped DB just re-seeds from Band), but the volume should still be fixed so
   mid-life history isn't needlessly refetched. Track separately.
 
-- **Future work — seed-if-empty TOCTOU (noted, not yet fixed).** The seed only writes
-  when the transcript is empty (`load_transcript` → `rewrite_transcript`). That pair is
-  atomic on the adapter's own event loop (no `await` between the re-check and the
-  write), but it is **two separate `SessionDB` transactions**, so it is not atomic
-  against a gateway turn-append that commits on another thread in the gap. Reachable
-  only when a *different* turn for the *same no-history room* is processed within that
-  sub-millisecond window (e.g. a catch-up-drained message racing the live trigger).
-  Worst cases are low-severity and self-healing — a one-time cold answer, a skipped
-  seed deferred to the next cold boundary, or a single clobbered turn — because Band
-  remains the source of truth and re-seeds on the next cold boundary. A proper fix
-  needs an atomic "seed only if empty" under a single store lock, ideally a
-  gateway-side `seed_if_empty(session_id, rows)` primitive (or routing the seed through
-  the gateway's per-session serialization so it shares the turn lock). Not critical
-  now; revisit if duplicate/lost-on-restart reports recur.
+- **Seed-if-empty TOCTOU — FIXED.** The seed now writes via an atomic
+  single-transaction "seed only if empty" (`_atomic_seed_transcript`), so the
+  cross-thread clobber window is gone. See `docs/rehydration-seed-race-design.md` §0
+  for the as-shipped resolution (and why the interim per-room lock was removed as
+  redundant).
 
 ## 11. Rollout
 
@@ -258,16 +249,16 @@ but **not persisted columns**, so the implementation never depends on them.
 
 A code review hardened the initial implementation; these supersede the sketches above:
 
-- **Atomic write.** The seed does a single `rewrite_transcript(session_id, rows)` into
-  the empty transcript, not a loop of `append_to_transcript`. A failure can't leave a
-  half-seeded transcript that future seeds would short-circuit on. (`_can_seed_sessions`
-  requires `rewrite_transcript`.)
-- **Fail-open.** `_seed_session_from_band` returns `False` on *any* error (not `True`),
-  so a genuine failure falls back to the `channel_context` blob instead of silently
-  leaving the room with no recovered context.
-- **Race-safe.** The two paginated fetches run concurrently (`asyncio.gather`) and
-  *before* the session is touched; an empty-transcript re-check runs immediately before
-  the write with no `await` between, so a concurrent live turn is never clobbered.
+- **Atomic write (race-safe).** The seed writes via `_atomic_seed_transcript`: a
+  single `BEGIN IMMEDIATE` "seed only if empty" (native `seed_transcript_if_empty`
+  when present, else `SessionDB._execute_write` directly). Immune to a concurrent
+  turn-append on another thread — no check-then-act window, no clobber, no partial
+  transcript. The two paginated fetches run concurrently (`asyncio.gather`) *before*
+  the session is touched. (This superseded the earlier per-room lock + re-check,
+  which were removed — see `rehydration-seed-race-design.md` §0.)
+- **Fail-open.** `_seed_session_from_band` returns `False` on a missing atomic-write
+  capability *or* any error, so it falls back to the `channel_context` blob instead of
+  silently leaving the room with no recovered context.
 - **Seed↔drain invariant (the missed case).** The seed excludes the unprocessed mention
   backlog on the assumption a `/next` drain answers it. That holds on (re)connect but
   not on a *live* re-join (which only set the flag), so the backlog was excluded yet

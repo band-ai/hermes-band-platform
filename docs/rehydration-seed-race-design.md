@@ -1,11 +1,40 @@
 # Seed-if-empty race — detailed design + retrospective
 
-Status: proposed · Follows: `docs/rehydration-design.md` §10/§12 · Issue: INT-910 follow-up
+Status: **resolved (shipped)** · Follows: `docs/rehydration-design.md` §10/§12 · Issue: INT-910 follow-up
 
 Every claim below is validated against the shipped Hermes source
 (`hermes-agent 0.17.0`, `hermes_state`) — file/method citations inline. "Hermes
 docs" here means those modules' docstrings + the schema, which are the
 authoritative spec for the gateway's behaviour.
+
+---
+
+## 0. Resolution (as shipped)
+
+The race is closed by an **atomic, single-transaction "seed only if empty"**, and
+the earlier interim mitigation was **removed** as redundant once the atomic write
+landed — a net reduction in concurrency surface:
+
+- **Added** `_atomic_seed_transcript(store, session_id, rows)` (in `adapter.py`):
+  prefers a gateway-native `seed_transcript_if_empty`, else drives
+  `SessionDB._execute_write` directly — one `BEGIN IMMEDIATE` doing
+  `SELECT COUNT` then the inserts (mirroring `replace_messages`' columns,
+  `_encode_content`, and `message_count` upkeep; FTS via triggers; the COUNT uses
+  the raw `conn` to avoid `_db`'s non-reentrant-lock deadlock). `None` ⇒ the store
+  can't write atomically ⇒ caller falls back to the one-shot `channel_context` blob.
+- **Removed** the per-room `asyncio` seed lock (`_seed_locks` / `_seed_lock_for`),
+  the command-vs-non-command gating in `_handle_message_created`, the best-effort
+  `load_transcript`-recheck → `rewrite_transcript` tier, and the W0b telemetry.
+- **Validated** under real thread contention against the real `SessionDB`: a
+  concurrent `append` vs `seed_if_empty` never clobbers the append and never
+  corrupts the transcript (40-session stress test; deterministic empty/no-op
+  cases; special-char round-trip).
+
+The capability ladder is now two tiers: **atomic write** (native or via `_db`) →
+**`channel_context` blob**. The §5 "Phase C lock" / "Phase B upstream" plan below
+is retained as the design rationale; what shipped is the Phase-B write done as an
+in-plugin helper (no monkeypatching — an explicit function using `store._db`),
+which also makes the lock unnecessary.
 
 ---
 

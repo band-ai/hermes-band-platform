@@ -33,6 +33,7 @@ Scope notes:
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -327,20 +328,113 @@ def _seed_epoch(inserted_at: Any) -> float:
 
 
 def _can_seed_sessions(store: Any) -> bool:
-    """Whether the wired session store exposes the public seed API we need.
+    """Whether the store can resolve a room's session and read its transcript.
 
-    Guards the durable-seed path so an older gateway (without these methods)
-    degrades gracefully to the legacy ``channel_context`` blob instead of
-    raising.
+    The minimum needed to detect a cold room and target the durable seed. The
+    *write* is done atomically via ``_atomic_seed_transcript`` (gateway-native
+    primitive or the SessionDB write executor); an older gateway with neither
+    degrades gracefully to the one-shot ``channel_context`` blob.
     """
     return store is not None and all(
         hasattr(store, method)
-        for method in (
-            "get_or_create_session",
-            "load_transcript",
-            "rewrite_transcript",
-        )
+        for method in ("get_or_create_session", "load_transcript")
     )
+
+
+# The ``messages`` columns a transcript row carries, in the order the gateway's
+# own ``SessionDB.replace_messages`` inserts them. Mirrored verbatim so a seeded
+# row is byte-identical to a gateway-written one (and FTS index triggers fire
+# the same way).
+_MESSAGE_COLUMNS = (
+    "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
+    "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
+    "reasoning_details", "codex_reasoning_items", "codex_message_items",
+    "platform_message_id", "observed",
+)
+
+
+def _atomic_seed_transcript(
+    store: Any, session_id: str, rows: List[Dict[str, Any]]
+) -> Optional[bool]:
+    """Atomically seed ``rows`` into a session *iff its transcript is empty*.
+
+    Returns True when rows were written, False when the session was already
+    non-empty (no-op), or ``None`` when the store can't perform an atomic write
+    (the caller then falls back to the ``channel_context`` blob).
+
+    Prefers a gateway-native ``seed_transcript_if_empty`` when present. Otherwise
+    drives ``SessionDB._execute_write`` directly: a single ``BEGIN IMMEDIATE``
+    transaction doing ``SELECT COUNT`` then the inserts, so it is atomic against
+    a concurrent turn-append on another thread — no check-then-act window, no
+    clobber. The INSERT mirrors ``SessionDB.replace_messages`` (same columns,
+    ``_encode_content``, count upkeep) so FTS triggers and ``message_count`` stay
+    consistent. The COUNT uses the raw connection (not ``store._db.message_count``,
+    which would re-enter ``_db``'s non-reentrant lock and deadlock).
+    """
+    native = getattr(store, "seed_transcript_if_empty", None)
+    if native is not None:
+        return bool(native(session_id, rows))
+
+    db = getattr(store, "_db", None)
+    if db is None or not hasattr(db, "_execute_write") or not hasattr(db, "_encode_content"):
+        return None
+
+    def _do(conn: Any) -> bool:
+        (existing,) = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if existing:
+            return False
+        placeholders = ", ".join(["?"] * len(_MESSAGE_COLUMNS))
+        insert = f"INSERT INTO messages ({', '.join(_MESSAGE_COLUMNS)}) VALUES ({placeholders})"
+        now = time.time()
+        total = 0
+        tool_calls_total = 0
+        for msg in rows:
+            role = msg.get("role", "unknown")
+            tool_calls = msg.get("tool_calls")
+            ts = msg.get("timestamp")
+            try:
+                ts = (
+                    float(ts.timestamp())
+                    if hasattr(ts, "timestamp")
+                    else (float(ts) if ts is not None else now)
+                )
+            except (TypeError, ValueError):
+                ts = now
+            conn.execute(
+                insert,
+                (
+                    session_id,
+                    role,
+                    db._encode_content(msg.get("content")),
+                    msg.get("tool_call_id"),
+                    json.dumps(tool_calls) if tool_calls is not None else None,
+                    msg.get("tool_name"),
+                    ts,
+                    msg.get("token_count"),
+                    msg.get("finish_reason"),
+                    msg.get("reasoning") if role == "assistant" else None,
+                    msg.get("reasoning_content") if role == "assistant" else None,
+                    None,
+                    None,
+                    None,
+                    msg.get("platform_message_id") or msg.get("message_id"),
+                    1 if msg.get("observed") else 0,
+                ),
+            )
+            total += 1
+            if tool_calls is not None:
+                tool_calls_total += (
+                    len(tool_calls) if isinstance(tool_calls, list) else 1
+                )
+        conn.execute(
+            "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+            (total, tool_calls_total, session_id),
+        )
+        return True
+
+    return db._execute_write(_do)
 
 
 class BandAdapter(BasePlatformAdapter):
@@ -414,10 +508,6 @@ class BandAdapter(BasePlatformAdapter):
         # Per-room catch-up drains spawned on a live re-join (see
         # _schedule_room_catch_up). Held so the tasks aren't GC'd mid-flight.
         self._room_catch_up_tasks: set = set()
-        # Per-room locks serialising a cold-room seed against same-room
-        # (non-command) dispatch, so no NEW turn starts while we seed (see
-        # _seed_lock_for / _handle_message_created).
-        self._seed_locks: Dict[str, asyncio.Lock] = {}
         # The agent's own UUID + handle, resolved from get_agent_me on connect.
         # ``_cfg_agent_id`` is the configured id used to open the link; the
         # resolved ``_agent_id`` is authoritative for self-filtering.
@@ -1237,33 +1327,26 @@ class BandAdapter(BasePlatformAdapter):
             raw_message=payload,
         )
 
-        # Owner commands dispatch immediately and are NEVER gated by the seed
-        # lock: the gateway dispatches an active-session command INLINE (it
-        # awaits the turn — e.g. /stop, /approve, which would otherwise
-        # deadlock), so holding a lock across it would stall control commands.
-        # A command also never starts a fresh turn, so it can't be the racing
-        # writer; the rehydrate flag is left intact for the next real message.
+        # Owner commands dispatch immediately and skip the seed: they don't need
+        # recovered history, the gateway may dispatch an active-session command
+        # INLINE (e.g. /stop, /approve), so adding the seed's fetch latency would
+        # stall control commands — and a command never starts a fresh turn. The
+        # rehydrate flag is left intact for the next real message.
         if is_command:
             await self.handle_message(out)
             return True
 
-        # Rehydration + dispatch under the per-room seed lock. If this room is
-        # flagged — re-joined or returning with no local session — rebuild
-        # context from Band history (durable transcript seed; falls back to a
-        # one-shot channel_context blob on an older gateway). Holding the lock
-        # across the seed AND the dispatch serialises seeding with any other
-        # non-command dispatch for the room, so no NEW turn can start mid-seed
-        # (closing the reachable cross-thread clobber; a turn already in flight
-        # is the documented residual the upstream atomic primitive closes).
-        # Best-effort — a hydration failure never blocks the message, and the
-        # flag is consumed once so we don't refetch on every message.
-        async with self._seed_lock_for(room_id):
-            if room_id in self._rehydrate_rooms:
-                self._rehydrate_rooms.discard(room_id)
-                out.channel_context = await self._rehydrate_room(
-                    source, room_id, msg_id
-                )
-            await self.handle_message(out)
+        # Rehydration: if this room is flagged — re-joined or returning with no
+        # local session — rebuild context from Band history. The durable path
+        # seeds the gateway transcript atomically (race-free; see
+        # _atomic_seed_transcript) and falls back to a one-shot channel_context
+        # blob on a store that can't be seeded. Best-effort — a hydration failure
+        # never blocks the message, and the flag is consumed once so we don't
+        # refetch on every message.
+        if room_id in self._rehydrate_rooms:
+            self._rehydrate_rooms.discard(room_id)
+            out.channel_context = await self._rehydrate_room(source, room_id, msg_id)
+        await self.handle_message(out)
         return True
 
     # ── Route A: server-cursor ack + missed-message catch-up ──────────────
@@ -1491,26 +1574,6 @@ class BandAdapter(BasePlatformAdapter):
             )
             return False
 
-    def _seed_lock_for(self, room_id: str) -> "asyncio.Lock":
-        """Per-room lock serialising a cold-room seed against same-room dispatch.
-
-        Bounded like the other per-room caches; eviction only drops *unheld*
-        locks so a lock currently in use is never swapped out from under a
-        waiter (which would silently break the serialisation it provides).
-        """
-        lock = self._seed_locks.get(room_id)
-        if lock is not None:
-            return lock
-        lock = asyncio.Lock()
-        self._seed_locks[room_id] = lock
-        if len(self._seed_locks) > _ROOM_CACHE_MAX:
-            for rid in list(self._seed_locks):
-                if rid != room_id and not self._seed_locks[rid].locked():
-                    del self._seed_locks[rid]
-                    if len(self._seed_locks) <= _ROOM_CACHE_MAX // 2:
-                        break
-        return lock
-
     async def _rehydrate_room(
         self, source: Any, room_id: str, trigger_msg_id: Optional[str]
     ) -> Optional[str]:
@@ -1535,24 +1598,14 @@ class BandAdapter(BasePlatformAdapter):
 
         Returns True when the durable-seed path handled rehydration for this room
         (so the caller skips the ``channel_context`` fallback), False when the
-        store lacks the seed API *or* an error prevented seeding — in both of
-        those cases the caller falls back to the one-shot blob.
+        store can't perform an atomic write *or* an error prevented seeding — in
+        both of those cases the caller falls back to the one-shot blob.
 
-        Write path, best → fallback:
-
-          * If the gateway exposes ``seed_transcript_if_empty`` (atomic
-            count-then-insert in one transaction), use it — immune to a
-            cross-thread turn-append.
-          * Otherwise re-check ``load_transcript`` then ``rewrite_transcript``
-            with no ``await`` between (loop-atomic only). The per-room seed lock
-            around dispatch (see ``_handle_message_created``) closes the
-            reachable two-lane path; a turn already in flight from another thread
-            is the documented residual the atomic primitive closes.
-
-        Either write is a single transaction, so a failure can't leave a
-        half-seeded transcript that future seeds would short-circuit on. The two
-        paginated fetches (the only ``await`` points) run concurrently *before*
-        the session is touched.
+        The write goes through ``_atomic_seed_transcript``: a single-transaction
+        "seed only if empty", immune to a concurrent turn-append on a gateway
+        worker thread (no check-then-act window, no clobber, no partial
+        transcript). The two paginated fetches (the only ``await`` points) run
+        concurrently *before* the session is touched.
         """
         store = getattr(self, "_session_store", None)
         if not _can_seed_sessions(store):
@@ -1577,55 +1630,25 @@ class BandAdapter(BasePlatformAdapter):
             rows = self._build_seed_rows(items, exclude, participants)
             if not rows:
                 return True
-            # Preferred write path: an atomic "seed only if empty" exposed by the
-            # gateway (count-then-insert in one BEGIN IMMEDIATE transaction). It
-            # is immune to the cross-thread TOCTOU below because it is atomic
-            # against a concurrent turn-append at the SQLite layer. Used when the
-            # gateway exposes it; older gateways fall through to the best-effort
-            # path. (See docs/rehydration-seed-race-design.md.)
-            seed_if_empty = getattr(store, "seed_transcript_if_empty", None)
-            if seed_if_empty is not None:
-                wrote = seed_if_empty(entry.session_id, rows)
-                if wrote:
-                    logger.info(
-                        "[band] Seeded %d history row(s) into room %s session",
-                        len(rows),
-                        _short_id(room_id),
-                    )
-                else:
-                    logger.info(
-                        "[band] Seed skipped for room %s — session filled "
-                        "concurrently (atomic guard)",
-                        _short_id(room_id),
-                    )
-                return True
-            # Best-effort fallback (older gateway, no atomic primitive). Re-check
-            # emptiness right before writing: a live turn may have written during
-            # the fetches above. No await between here and the write closes the
-            # window on *this* event loop; the per-room seed lock around dispatch
-            # closes the reachable two-lane path. RESIDUAL: the check→write pair
-            # is two SessionDB transactions, so it is NOT atomic against a turn
-            # that commits from another thread in the gap — rare and self-healing
-            # (Band re-seeds on the next cold boundary). The atomic primitive
-            # above is the provable fix. (See the design doc.)
-            if store.load_transcript(entry.session_id):
+            # Atomic write: seed only if the transcript is still empty, in a
+            # single SQLite transaction. Immune to a concurrent turn-append on a
+            # gateway worker thread (no check-then-act window, no clobber). None
+            # means the store can't do an atomic write → fall back to the blob.
+            wrote = _atomic_seed_transcript(store, entry.session_id, rows)
+            if wrote is None:
+                return False
+            if wrote:
                 logger.info(
-                    "[band] Seed skipped for room %s — transcript filled during "
-                    "fetch (best-effort path)",
+                    "[band] Seeded %d history row(s) into room %s session",
+                    len(rows),
                     _short_id(room_id),
                 )
-                return True
-            store.rewrite_transcript(entry.session_id, rows)
-            logger.info(
-                "[band] Seeded %d history row(s) into room %s session",
-                len(rows),
-                _short_id(room_id),
-            )
             return True
         except Exception as e:
             # Best-effort: a seed failure must never block the triggering
-            # message. Fall back to the one-shot blob (return False) — both write
-            # paths above are atomic, so no partial transcript is left behind.
+            # message. Fall back to the one-shot blob (return False) — the
+            # atomic write is single-transaction, so no partial transcript is
+            # left behind.
             logger.debug(
                 "[band] Session seed failed for room %s: %s", _short_id(room_id), e
             )

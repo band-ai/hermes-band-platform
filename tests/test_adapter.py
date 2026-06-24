@@ -1211,13 +1211,12 @@ class TestRehydrationOnNextMessage:
 
 
 class _SeedingSessionStore(_FakeSessionStore):
-    """Session store stand-in exposing the public durable-seed API.
+    """Session store stand-in exposing the gateway-native atomic seed primitive.
 
-    Records the rows passed to ``rewrite_transcript`` (the atomic seed write) in
-    ``seeded`` so tests can assert what was seeded. ``load_transcript`` starts
-    empty (cold) unless constructed with ``existing_transcript`` (warm). An
-    optional ``on_rewrite`` hook lets a test simulate a concurrent write or a
-    store failure.
+    Records the rows passed to ``seed_transcript_if_empty`` in ``atomic_seeded``
+    so tests can assert what was seeded. ``load_transcript`` starts empty (cold)
+    unless constructed with ``existing_transcript`` (warm). An optional
+    ``on_seed`` hook lets a test simulate a store failure during the write.
     """
 
     def __init__(
@@ -1225,21 +1224,14 @@ class _SeedingSessionStore(_FakeSessionStore):
         *,
         existing_transcript=None,
         session_id="sess-1",
-        on_rewrite=None,
-        atomic=False,
+        on_seed=None,
         **kw,
     ):
         super().__init__(**kw)
         self._session_id = session_id
         self._transcripts = {session_id: list(existing_transcript or [])}
-        self.seeded = None
         self.atomic_seeded = None  # rows passed to seed_transcript_if_empty
-        self._on_rewrite = on_rewrite
-        if atomic:
-            # Expose the gateway's atomic primitive (W2). Single-step
-            # count-then-insert, so it never clobbers a concurrently-filled
-            # transcript.
-            self.seed_transcript_if_empty = self._seed_transcript_if_empty
+        self._on_seed = on_seed
 
     def get_or_create_session(self, source):
         # Mirror the real store side effect: materialize an (empty) entry.
@@ -1249,17 +1241,15 @@ class _SeedingSessionStore(_FakeSessionStore):
     def load_transcript(self, session_id):
         return list(self._transcripts.get(session_id, []))
 
-    def rewrite_transcript(self, session_id, messages):
-        if self._on_rewrite is not None:
-            self._on_rewrite()
-        self._transcripts[session_id] = list(messages)
-        self.seeded = list(messages)
-
-    def _seed_transcript_if_empty(self, session_id, messages):
-        self.atomic_seeded = list(messages)
+    def seed_transcript_if_empty(self, session_id, messages):
+        # Single-step count-then-insert: never clobbers a concurrently-filled
+        # transcript (returns False when non-empty).
+        if self._on_seed is not None:
+            self._on_seed()
         if self._transcripts.get(session_id):
             return False
         self._transcripts[session_id] = list(messages)
+        self.atomic_seeded = list(messages)
         return True
 
 
@@ -1331,7 +1321,7 @@ class TestDurableSeedRehydration:
         assert evt.channel_context is None
         # Single atomic write; own reply as assistant (prevents re-answering),
         # peer as user with a [name] prefix.
-        assert [(r["role"], r["content"]) for r in store.seeded] == [
+        assert [(r["role"], r["content"]) for r in store.atomic_seeded] == [
             ("user", "[Alice] what's the weather?"),
             ("assistant", "It's sunny."),
         ]
@@ -1390,7 +1380,7 @@ class TestDurableSeedRehydration:
         await adapter._handle_message_created(self._event())
 
         # Transcript already had history → no seed write, no context fetch.
-        assert adapter._session_store.seeded is None
+        assert adapter._session_store.atomic_seeded is None
         evt = adapter.handle_message.call_args[0][0]
         assert evt.channel_context is None
 
@@ -1428,7 +1418,7 @@ class TestDurableSeedRehydration:
 
         await adapter._handle_message_created(self._event())
 
-        seeded = [r["content"] for r in adapter._session_store.seeded]
+        seeded = [r["content"] for r in adapter._session_store.atomic_seeded]
         assert seeded == ["[Alice] older context"]
 
     @pytest.mark.asyncio
@@ -1463,7 +1453,7 @@ class TestDurableSeedRehydration:
         # Best-effort: message delivered; nothing seeded; the blob fallback also
         # has no context to offer (same failing endpoint) → channel_context None.
         adapter.handle_message.assert_called_once()
-        assert adapter._session_store.seeded is None
+        assert adapter._session_store.atomic_seeded is None
         evt = adapter.handle_message.call_args[0][0]
         assert evt.channel_context is None
 
@@ -1473,7 +1463,7 @@ class TestDurableSeedRehydration:
         # works → return False → caller produces the channel_context blob, so
         # the room is never silently left with no recovered context.
         adapter._session_store = _SeedingSessionStore(
-            on_rewrite=lambda: (_ for _ in ()).throw(RuntimeError("db locked"))
+            on_seed=lambda: (_ for _ in ()).throw(RuntimeError("db locked"))
         )
         adapter._rehydrate_rooms.add("rejoined-room")
         adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
@@ -1491,65 +1481,11 @@ class TestDurableSeedRehydration:
         assert "earlier note" in evt.channel_context
 
     @pytest.mark.asyncio
-    async def test_concurrent_fill_during_fetch_skips_write(self, adapter):
-        # Simulate a live turn writing the transcript while the seed's context
-        # fetch is in flight: the pre-write re-check must see it non-empty and
-        # NOT clobber it.
-        store = _SeedingSessionStore()
-        adapter._session_store = store
-        adapter._rehydrate_rooms.add("rejoined-room")
-
-        async def _fill_then_return(*a, **k):
-            store._transcripts["sess-1"] = [{"role": "user", "content": "live turn"}]
-            return SimpleNamespace(
-                data=[
-                    SimpleNamespace(id="h1", message_type="text", content="old",
-                                    sender_id="human-1", sender_type="User",
-                                    sender_name="Alice", inserted_at=None),
-                ],
-                metadata=SimpleNamespace(next_cursor=None, has_more=False),
-            )
-
-        adapter._link.rest.agent_api_context.get_agent_chat_context = AsyncMock(
-            side_effect=_fill_then_return
-        )
-
-        await adapter._handle_message_created(self._event())
-
-        # rewrite_transcript never ran (re-check found the live turn).
-        assert store.seeded is None
-        assert store.load_transcript("sess-1") == [{"role": "user", "content": "live turn"}]
-
-    @pytest.mark.asyncio
-    async def test_uses_atomic_primitive_when_available(self, adapter):
-        # When the gateway exposes seed_transcript_if_empty, the seed uses it
-        # (the race-immune path) and does NOT fall back to load+rewrite.
-        store = _SeedingSessionStore(atomic=True)
-        adapter._session_store = store
-        adapter._rehydrate_rooms.add("rejoined-room")
-        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
-            [
-                SimpleNamespace(id="h1", message_type="text", content="older context",
-                                sender_id="human-1", sender_type="User",
-                                sender_name="Alice", inserted_at=None),
-            ]
-        )
-
-        await adapter._handle_message_created(self._event())
-
-        assert [(r["role"], r["content"]) for r in store.atomic_seeded] == [
-            ("user", "[Alice] older context"),
-        ]
-        assert store.seeded is None  # the non-atomic rewrite path was not used
-        evt = adapter.handle_message.call_args[0][0]
-        assert evt.channel_context is None
-
-    @pytest.mark.asyncio
-    async def test_atomic_primitive_skip_is_safe(self, adapter):
-        # If the atomic primitive reports the session filled concurrently
-        # (returns False), the message is still delivered and nothing is clobbered.
+    async def test_warm_session_short_circuits_no_clobber(self, adapter):
+        # An already-warm session is left untouched (the atomic primitive isn't
+        # even reached — the load_transcript guard short-circuits first).
         store = _SeedingSessionStore(
-            atomic=True, existing_transcript=[{"role": "user", "content": "live"}]
+            existing_transcript=[{"role": "user", "content": "live"}]
         )
         adapter._session_store = store
         adapter._rehydrate_rooms.add("rejoined-room")
@@ -1557,105 +1493,9 @@ class TestDurableSeedRehydration:
 
         await adapter._handle_message_created(self._event())
 
-        # Warm session short-circuits before the primitive; transcript intact.
         adapter.handle_message.assert_called_once()
+        assert store.atomic_seeded is None
         assert store.load_transcript("sess-1") == [{"role": "user", "content": "live"}]
-
-
-class TestSeedLock:
-    """The per-room seed lock serialises seeding vs same-room non-command dispatch."""
-
-    @pytest.fixture
-    def adapter(self, monkeypatch):
-        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
-        a._agent_id = "agent-self-id"
-        a._owner_uuid = "owner-1"
-        a.handle_message = AsyncMock()
-        a._link = MagicMock()
-        return a
-
-    def _msg(self, msg_id, content="hi there", sender_id="human-1", room="r1"):
-        payload = SimpleNamespace(
-            id=msg_id, content=content, message_type="text",
-            sender_id=sender_id, sender_type="User", sender_name="Alice",
-            chat_room_id=room,
-            metadata=SimpleNamespace(
-                mentions=[SimpleNamespace(id="agent-self-id", handle=None)]
-            ),
-        )
-        return SimpleNamespace(type="message_created", room_id=room, payload=payload)
-
-    @pytest.mark.asyncio
-    async def test_noncommand_dispatch_waits_for_in_progress_seed(self, adapter):
-        # A flagged room's seed holds the room lock; a second non-command
-        # message for the same room must not dispatch until the seed completes.
-        gate = asyncio.Event()
-
-        async def _blocking_rehydrate(source, room_id, trigger_msg_id):
-            await gate.wait()
-            return None
-
-        adapter._rehydrate_room = _blocking_rehydrate
-        adapter._rehydrate_rooms.add("r1")
-
-        a_task = asyncio.create_task(adapter._handle_message_created(self._msg("m1")))
-        await asyncio.sleep(0)  # let A acquire the lock and block in the seed
-        b_task = asyncio.create_task(adapter._handle_message_created(self._msg("m2")))
-        await asyncio.sleep(0)
-
-        # A is blocked seeding; B is blocked on the lock → neither dispatched.
-        adapter.handle_message.assert_not_called()
-
-        gate.set()
-        await asyncio.gather(a_task, b_task)
-        # Both dispatched once the seed released the lock.
-        assert adapter.handle_message.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_owner_command_not_gated_by_seed(self, adapter):
-        # An owner command for the same room dispatches immediately even while a
-        # seed holds the lock (commands inline-await in the gateway; gating them
-        # would stall /stop, /approve).
-        gate = asyncio.Event()
-
-        async def _blocking_rehydrate(source, room_id, trigger_msg_id):
-            await gate.wait()
-            return None
-
-        adapter._rehydrate_room = _blocking_rehydrate
-        adapter._rehydrate_rooms.add("r1")
-
-        a_task = asyncio.create_task(adapter._handle_message_created(self._msg("m1")))
-        await asyncio.sleep(0)  # A holds the lock, blocked seeding
-        # Owner command for the same room — must not wait on the lock.
-        await adapter._handle_message_created(
-            self._msg("c1", content="/help", sender_id="owner-1")
-        )
-        assert adapter.handle_message.call_count == 1  # the command dispatched
-
-        gate.set()
-        await a_task
-
-    @pytest.mark.asyncio
-    async def test_seed_lock_is_per_room(self, adapter):
-        # A seed holding r1's lock must not block dispatch for a different room.
-        gate = asyncio.Event()
-
-        async def _blocking_rehydrate(source, room_id, trigger_msg_id):
-            await gate.wait()
-            return None
-
-        adapter._rehydrate_room = _blocking_rehydrate
-        adapter._rehydrate_rooms.add("r1")
-
-        a_task = asyncio.create_task(adapter._handle_message_created(self._msg("m1", room="r1")))
-        await asyncio.sleep(0)
-        # Different room — proceeds despite r1's seed holding r1's lock.
-        await adapter._handle_message_created(self._msg("m2", room="r2"))
-        assert adapter.handle_message.call_count == 1
-
-        gate.set()
-        await a_task
 
 
 class TestSessionKeyParity:
@@ -1687,6 +1527,120 @@ class TestSessionKeyParity:
         assert a._has_active_session("room-x") is False
 
 
+class TestAtomicSeedTranscript:
+    """_atomic_seed_transcript against the REAL SessionDB (the race-safe write)."""
+
+    def _store(self, tmp_path):
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionSource, SessionStore
+        from hermes_state import SessionDB
+
+        store = SessionStore(tmp_path, GatewayConfig())
+        store._db = SessionDB(db_path=tmp_path / "s.db")
+        return store, SessionSource
+
+    def test_seeds_empty_session_and_counts(self, tmp_path):
+        store, Src = self._store(tmp_path)
+        from gateway.config import Platform
+        e = store.get_or_create_session(
+            Src(platform=Platform("telegram"), chat_id="r1", chat_type="group")
+        )
+        rows = [
+            {"role": "user", "content": "[Al] hi", "timestamp": 1.0},
+            {"role": "assistant", "content": "hello", "timestamp": 2.0},
+        ]
+        wrote = _band_mod._atomic_seed_transcript(store, e.session_id, rows)
+        assert wrote is True
+        got = store.load_transcript(e.session_id)
+        assert [(m["role"], m["content"]) for m in got] == [
+            ("user", "[Al] hi"),
+            ("assistant", "hello"),
+        ]
+        assert store._db.message_count(e.session_id) == 2
+
+    def test_no_op_on_nonempty_session(self, tmp_path):
+        store, Src = self._store(tmp_path)
+        from gateway.config import Platform
+        e = store.get_or_create_session(
+            Src(platform=Platform("telegram"), chat_id="r2", chat_type="group")
+        )
+        store._db.append_message(e.session_id, role="user", content="LIVE", timestamp=1.0)
+        wrote = _band_mod._atomic_seed_transcript(
+            store, e.session_id, [{"role": "assistant", "content": "SEED", "timestamp": 2.0}]
+        )
+        assert wrote is False
+        contents = [m["content"] for m in store.load_transcript(e.session_id)]
+        assert contents == ["LIVE"]  # not clobbered, seed not added
+
+    def test_idempotent(self, tmp_path):
+        store, Src = self._store(tmp_path)
+        from gateway.config import Platform
+        e = store.get_or_create_session(
+            Src(platform=Platform("telegram"), chat_id="r3", chat_type="group")
+        )
+        rows = [{"role": "user", "content": "x", "timestamp": 1.0}]
+        assert _band_mod._atomic_seed_transcript(store, e.session_id, rows) is True
+        assert _band_mod._atomic_seed_transcript(store, e.session_id, rows) is False
+        assert store._db.message_count(e.session_id) == 1
+
+    def test_returns_none_without_db(self):
+        # A store lacking _db/_execute_write can't do an atomic write.
+        assert _band_mod._atomic_seed_transcript(
+            SimpleNamespace(), "sid", [{"role": "user", "content": "x", "timestamp": 1.0}]
+        ) is None
+
+    def test_content_with_special_chars_roundtrips(self, tmp_path):
+        store, Src = self._store(tmp_path)
+        from gateway.config import Platform
+        e = store.get_or_create_session(
+            Src(platform=Platform("telegram"), chat_id="r4", chat_type="group")
+        )
+        weird = 'líne1\n"quoted" & <tag> 表情'
+        _band_mod._atomic_seed_transcript(
+            store, e.session_id, [{"role": "user", "content": weird, "timestamp": 1.0}]
+        )
+        assert store.load_transcript(e.session_id)[0]["content"] == weird
+
+    def test_no_clobber_under_thread_contention(self, tmp_path):
+        # The core safety property: a concurrent append is never lost, and the
+        # seed never corrupts the transcript, across many fresh sessions.
+        import threading
+
+        store, Src = self._store(tmp_path)
+        from gateway.config import Platform
+
+        for i in range(40):
+            e = store.get_or_create_session(
+                Src(platform=Platform("telegram"), chat_id=f"c{i}", chat_type="group")
+            )
+            sid = e.session_id
+            errs = []
+
+            def _append():
+                try:
+                    store._db.append_message(sid, role="user", content="LIVE", timestamp=1.0)
+                except Exception as ex:  # noqa: BLE001
+                    errs.append(ex)
+
+            def _seed():
+                try:
+                    _band_mod._atomic_seed_transcript(
+                        store, sid, [{"role": "assistant", "content": "SEED", "timestamp": 2.0}]
+                    )
+                except Exception as ex:  # noqa: BLE001
+                    errs.append(ex)
+
+            ta = threading.Thread(target=_append)
+            tb = threading.Thread(target=_seed)
+            tb.start()
+            ta.start()
+            tb.join()
+            ta.join()
+            assert not errs, errs
+            contents = [m["content"] for m in store.load_transcript(sid)]
+            assert "LIVE" in contents  # the append is never clobbered
+
+
 class TestSeedHelpers:
     """Pure helpers behind the durable seed."""
 
@@ -1701,20 +1655,18 @@ class TestSeedHelpers:
     def test_seed_role_mapping(self, sender_type, sender_id, expected):
         assert _band_mod._seed_role_for(sender_type, sender_id, "me") == expected
 
-    def test_can_seed_sessions_requires_full_api(self):
+    def test_can_seed_sessions_needs_resolve_and_read(self):
+        # Detecting a cold room needs only resolve + read; the write is separate.
         assert _band_mod._can_seed_sessions(None) is False
-        # Missing rewrite_transcript (the atomic seed write) → not seedable.
-        partial = SimpleNamespace(
-            get_or_create_session=lambda *a: None,
-            load_transcript=lambda *a: [],
-        )
-        assert _band_mod._can_seed_sessions(partial) is False
-        full = SimpleNamespace(
-            get_or_create_session=lambda *a: None,
-            load_transcript=lambda *a: [],
-            rewrite_transcript=lambda *a, **k: None,
-        )
-        assert _band_mod._can_seed_sessions(full) is True
+        assert _band_mod._can_seed_sessions(
+            SimpleNamespace(get_or_create_session=lambda *a: None)
+        ) is False
+        assert _band_mod._can_seed_sessions(
+            SimpleNamespace(
+                get_or_create_session=lambda *a: None,
+                load_transcript=lambda *a: [],
+            )
+        ) is True
 
     def test_seedable_text_skips_non_text_and_empty(self):
         text_item = SimpleNamespace(

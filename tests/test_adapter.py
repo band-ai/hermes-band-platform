@@ -1059,33 +1059,32 @@ class TestRoomAddedRejoinFlagsRehydration:
         assert "warm-room" not in adapter._rehydrate_rooms
 
     @pytest.mark.asyncio
-    async def test_rejoin_cold_room_schedules_room_drain(self, adapter, monkeypatch):
-        # A live re-join must also drain the room so the backlog the seed
-        # excludes actually gets answered (the seed<->drain invariant).
+    async def test_rejoin_cold_room_actually_drains_backlog(self, adapter):
+        # A live re-join must drain the room so the backlog the seed excludes
+        # actually gets answered. Drive the real _catch_up_room -> _drain_room
+        # against a mocked link and assert a /next pull really happened.
+        adapter._link.get_stale_processing_messages = AsyncMock(return_value=[])
+        adapter._link.get_next_message = AsyncMock(return_value=None)  # empty backlog
         adapter._known_rooms.add("known-room")
-        drained = AsyncMock()
-        monkeypatch.setattr(adapter, "_catch_up_room", drained)
         await adapter._handle_event(
             SimpleNamespace(type="room_added", room_id="known-room")
         )
-        await asyncio.sleep(0)  # let the scheduled task run
-        drained.assert_awaited_once_with("known-room")
+        await asyncio.sleep(0)  # let the scheduled drain task run
+        adapter._link.get_next_message.assert_awaited_with("known-room")
 
     @pytest.mark.asyncio
-    async def test_rejoin_skips_room_drain_when_full_catchup_running(
-        self, adapter, monkeypatch
-    ):
+    async def test_rejoin_skips_drain_when_full_catchup_running(self, adapter):
         # An all-rooms drain already covers every room → don't spawn a per-room
         # one (this also makes connect-time room_added replays cheap).
+        adapter._link.get_stale_processing_messages = AsyncMock(return_value=[])
+        adapter._link.get_next_message = AsyncMock(return_value=None)
         adapter._known_rooms.add("known-room")
         adapter._catch_up_task = asyncio.create_task(asyncio.sleep(0.05))
-        drained = AsyncMock()
-        monkeypatch.setattr(adapter, "_catch_up_room", drained)
         await adapter._handle_event(
             SimpleNamespace(type="room_added", room_id="known-room")
         )
         await asyncio.sleep(0)
-        drained.assert_not_called()
+        adapter._link.get_next_message.assert_not_called()
         adapter._catch_up_task.cancel()
 
 
@@ -1325,6 +1324,48 @@ class TestDurableSeedRehydration:
         assert "rejoined-room" not in adapter._rehydrate_rooms
 
     @pytest.mark.asyncio
+    async def test_cold_room_seeds_real_session_store_roundtrip(self, adapter, tmp_path):
+        # Wire the REAL gateway SessionStore (temp SQLite) and mock ONLY the
+        # Band REST endpoints (the genuine external service). This validates the
+        # actual persistence contract — row-dict keys accepted, roles round-trip
+        # through load_transcript — instead of a hand-rolled fake.
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionStore
+        from hermes_state import SessionDB
+
+        store = SessionStore(tmp_path, GatewayConfig())
+        store._db = SessionDB(db_path=tmp_path / "state.db")  # isolate from ~/.hermes
+        adapter._session_store = store
+
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text", content="what's the weather?",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+                SimpleNamespace(id="h2", message_type="text", content="It's sunny.",
+                                sender_id="agent-self-id", sender_type="Agent",
+                                sender_name="Bot", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        # Exactly one session exists — the seeded room — and the REAL
+        # load_transcript reads back the user/assistant rows the seed wrote.
+        assert len(store._entries) == 1
+        entry = next(iter(store._entries.values()))
+        assert "band:group:rejoined-room" in entry.session_key
+        rows = store.load_transcript(entry.session_id)
+        assert [(r["role"], r["content"]) for r in rows] == [
+            ("user", "[Alice] what's the weather?"),
+            ("assistant", "It's sunny."),
+        ]
+        # Durable path → no one-shot channel_context on the delivered message.
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is None
+
+    @pytest.mark.asyncio
     async def test_warm_session_is_not_reseeded(self, adapter):
         adapter._session_store = _SeedingSessionStore(
             existing_transcript=[{"role": "user", "content": "prior"}]
@@ -1469,14 +1510,16 @@ class TestDurableSeedRehydration:
 class TestSeedHelpers:
     """Pure helpers behind the durable seed."""
 
-    def test_role_own_agent_is_assistant(self):
-        assert _band_mod._seed_role_for("Agent", "me", "me") == "assistant"
-
-    def test_role_peer_agent_is_user(self):
-        assert _band_mod._seed_role_for("Agent", "other", "me") == "user"
-
-    def test_role_human_is_user(self):
-        assert _band_mod._seed_role_for("User", "human-1", "me") == "user"
+    @pytest.mark.parametrize(
+        "sender_type,sender_id,expected",
+        [
+            ("Agent", "me", "assistant"),  # our own replies
+            ("Agent", "other", "user"),    # a *peer* agent is not us → user
+            ("User", "human-1", "user"),   # humans
+        ],
+    )
+    def test_seed_role_mapping(self, sender_type, sender_id, expected):
+        assert _band_mod._seed_role_for(sender_type, sender_id, "me") == expected
 
     def test_can_seed_sessions_requires_full_api(self):
         assert _band_mod._can_seed_sessions(None) is False

@@ -405,8 +405,9 @@ class BandAdapter(BasePlatformAdapter):
         # context rehydration; a room in neither is brand new.
         self._known_rooms: set = set()
         self._left_rooms: set = set()
-        # Re-joined rooms whose next inbound message should pull recent Band
-        # context into MessageEvent.channel_context (consumed once, then cleared).
+        # Cold rooms whose next inbound message triggers a one-time rebuild of
+        # context from Band history (durably seeded into the session transcript;
+        # see _rehydrate_room). Consumed once, then cleared.
         self._rehydrate_rooms: set = set()
 
         # Per-room participant cache: room_id -> list[{id, name, handle, type}].
@@ -1326,11 +1327,11 @@ class BandAdapter(BasePlatformAdapter):
             # If the room has no local session (fresh deploy, lost/migrated DB,
             # or first run after the agent was down), flag it so the next message
             # we process — stale sweep, /next drain, or a later live event —
-            # rebuilds from the room's server-side history via
-            # _fetch_rehydration_context rather than answering the backlog cold.
-            # A room with an intact local session is skipped (its history is in
-            # the store); a room that genuinely has no history yields None and
-            # the flag clears harmlessly on first use.
+            # rebuilds from the room's server-side history via _rehydrate_room
+            # rather than answering the backlog cold. A room with an intact local
+            # session is skipped (its history is in the store); a room that
+            # genuinely has no history seeds nothing and the flag clears
+            # harmlessly on first use.
             if not self._has_active_session(room_id):
                 self._rehydrate_rooms.add(room_id)
             # Crash recovery: /next skips messages with an active processing

@@ -1,6 +1,6 @@
 # Band-managed history rehydration — design & implementation plan
 
-Status: proposed · Branch: `claude/band-hermes-rehydration-6tkrad` · Team: Integration
+Status: implemented (PR #8, INT-910) · Team: Integration
 
 ## 1. Problem
 
@@ -139,10 +139,12 @@ message is both seeded and answered.
 - `_catch_up_all_rooms` (`~:1269`): keep cold flagging but route through the public
   emptiness check.
 
-**Remove / retire**
-- `_fetch_rehydration_context` (`:1356`) and the `channel_context` injection on the
-  primary path. Keep a thin text-blob fallback only under the P9 capability guard.
-- `_has_active_session`'s private-state peeking (`:1499`) → public `load_transcript`.
+**Retire / repurpose** *(as implemented)*
+- `_fetch_rehydration_context` → renamed `_rehydration_context_blob` and demoted to the
+  P9 capability-guard fallback; the primary path no longer sets `channel_context`.
+- `_has_active_session` is kept as the cold-room *hint*; the authoritative idempotency
+  guard is the public `load_transcript` empty-check inside the seed (so correctness no
+  longer depends on the private-state peek).
 
 **Cold-detection helper sketch** (illustrative):
 

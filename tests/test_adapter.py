@@ -2391,6 +2391,28 @@ class TestConnectDisconnect:
         await adapter.disconnect()
         fake_link.disconnect.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_room_catch_up_tasks(self, monkeypatch):
+        # Per-room re-join drains must not outlive the link — otherwise a stale
+        # drain can resume against a freshly reconnected link.
+        adapter = _make_adapter(monkeypatch)
+
+        async def _forever():
+            await asyncio.sleep(999)
+
+        task = asyncio.create_task(_forever())
+        adapter._room_catch_up_tasks.add(task)
+        task.add_done_callback(adapter._room_catch_up_tasks.discard)
+
+        fake_link = MagicMock()
+        fake_link.disconnect = AsyncMock()
+        adapter._link = fake_link
+
+        await adapter.disconnect()
+
+        assert task.cancelled() or task.done()
+        assert adapter._room_catch_up_tasks == set()
+
 
 # ---------------------------------------------------------------------------
 # 16. _record_sent_id eviction

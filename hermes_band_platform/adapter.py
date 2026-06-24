@@ -766,6 +766,17 @@ class BandAdapter(BasePlatformAdapter):
                 logger.debug("[band] Catch-up task raised on shutdown: %s", e)
         self._catch_up_task = None
 
+        # Cancel any per-room re-join drains (scheduled by _schedule_room_catch_up)
+        # so a stale drain can't outlive the link and resume against a freshly
+        # reconnected one. The done-callback discards each from the set as it
+        # settles; snapshot first, then await the cancellations.
+        room_tasks = [t for t in self._room_catch_up_tasks if not t.done()]
+        for task in room_tasks:
+            task.cancel()
+        if room_tasks:
+            await asyncio.gather(*room_tasks, return_exceptions=True)
+        self._room_catch_up_tasks.clear()
+
         if self._consumer_task and not self._consumer_task.done():
             self._consumer_task.cancel()
             try:

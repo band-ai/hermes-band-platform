@@ -610,6 +610,58 @@ class TestBandAdapterSend:
         assert len(mentions) >= 1
         assert any(getattr(m, "id", None) == "human-id" for m in mentions)
 
+    @pytest.mark.asyncio
+    async def test_send_marshals_to_link_loop_when_called_from_another_loop(self, adapter):
+        """Cross-loop send is routed back onto the link's loop (INT-899).
+
+        The Band link's phoenix primitives bind to the loop ``connect()`` ran
+        on; a send() from a *different* running loop (the gateway startup-restore
+        replay path) must not raise "<Event> is bound to a different event loop".
+        """
+        import threading
+
+        mock_link = MagicMock()
+        resp = SimpleNamespace(data=SimpleNamespace(id="cross-loop-id"))
+        send_loops: list = []
+
+        async def _create(*args, **kwargs):
+            send_loops.append(asyncio.get_running_loop())
+            return resp
+
+        mock_link.rest.agent_api_messages.create_agent_chat_message = _create
+        adapter._link = mock_link
+        adapter._last_human_sender["room-x"] = {
+            "id": "user-x", "handle": "ux", "name": "User X",
+        }
+
+        # Run a dedicated "link" loop in its own thread and pin it on the adapter,
+        # exactly as connect() would.
+        link_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run_loop():
+            asyncio.set_event_loop(link_loop)
+            link_loop.call_soon(ready.set)
+            link_loop.run_forever()
+
+        t = threading.Thread(target=_run_loop, daemon=True)
+        t.start()
+        ready.wait(5)
+        adapter._link_loop = link_loop
+        try:
+            # We're on the default test loop, which is NOT link_loop.
+            assert asyncio.get_running_loop() is not link_loop
+            result = await adapter.send("room-x", "hello from restore")
+        finally:
+            link_loop.call_soon_threadsafe(link_loop.stop)
+            t.join(5)
+            link_loop.close()
+
+        assert result.success is True
+        assert result.message_id == "cross-loop-id"
+        # The REST call actually executed on the link's loop, not the caller's.
+        assert send_loops == [link_loop]
+
 
 # ---------------------------------------------------------------------------
 # 10. Inbound self-filter — _handle_message_created

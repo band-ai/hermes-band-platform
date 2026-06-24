@@ -1541,7 +1541,18 @@ class BandAdapter(BasePlatformAdapter):
                 return True
             # Re-check emptiness right before writing: a live turn may have
             # written during the fetches above. No await between here and the
-            # write, so this is a tight, clobber-free guard.
+            # write closes the window on *this* event loop.
+            #
+            # KNOWN RESIDUAL RACE (accepted; low severity — see the design doc's
+            # "future work"): this check→write pair is two separate SessionDB
+            # transactions, so it is NOT atomic against a gateway turn-append
+            # that commits on *another thread* in the gap. Worst case is rare
+            # and self-healing: a concurrent turn for this same no-history room
+            # could be answered cold, the seed could be skipped (deferred to the
+            # next cold boundary), or this rewrite could clobber one turn's rows
+            # once. Band stays the source of truth, so the next cold boundary
+            # re-seeds. A real fix needs an atomic "seed only if empty" under a
+            # single store lock (ideally a gateway-side primitive).
             if store.load_transcript(entry.session_id):
                 return True
             store.rewrite_transcript(entry.session_id, rows)

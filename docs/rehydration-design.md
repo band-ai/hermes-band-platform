@@ -232,6 +232,21 @@ but **not persisted columns**, so the implementation never depends on them.
   this (a wiped DB just re-seeds from Band), but the volume should still be fixed so
   mid-life history isn't needlessly refetched. Track separately.
 
+- **Future work — seed-if-empty TOCTOU (noted, not yet fixed).** The seed only writes
+  when the transcript is empty (`load_transcript` → `rewrite_transcript`). That pair is
+  atomic on the adapter's own event loop (no `await` between the re-check and the
+  write), but it is **two separate `SessionDB` transactions**, so it is not atomic
+  against a gateway turn-append that commits on another thread in the gap. Reachable
+  only when a *different* turn for the *same no-history room* is processed within that
+  sub-millisecond window (e.g. a catch-up-drained message racing the live trigger).
+  Worst cases are low-severity and self-healing — a one-time cold answer, a skipped
+  seed deferred to the next cold boundary, or a single clobbered turn — because Band
+  remains the source of truth and re-seeds on the next cold boundary. A proper fix
+  needs an atomic "seed only if empty" under a single store lock, ideally a
+  gateway-side `seed_if_empty(session_id, rows)` primitive (or routing the seed through
+  the gateway's per-session serialization so it shares the turn lock). Not critical
+  now; revisit if duplicate/lost-on-restart reports recur.
+
 ## 11. Rollout
 
 - Behind the P9 capability guard, so an older gateway degrades to today's behaviour

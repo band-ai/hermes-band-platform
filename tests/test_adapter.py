@@ -6,6 +6,7 @@ BEFORE this module imports the adapter — so the adapter's top-level
 """
 
 import asyncio
+import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -55,11 +56,7 @@ def _make_adapter(monkeypatch, agent_id="agent-uuid-1234", api_key="secret-key",
 class TestBandAdapterInit:
 
     def test_init_reads_agent_id_from_env(self, monkeypatch):
-        monkeypatch.setenv("BAND_AGENT_ID", "env-agent-id")
-        monkeypatch.setenv("BAND_API_KEY", "env-api-key")
-        monkeypatch.delenv("BAND_BASE_URL", raising=False)
-        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
-        adapter = BandAdapter(_make_config())
+        adapter = _make_adapter(monkeypatch, agent_id="env-agent-id", api_key="env-api-key")
         assert adapter._cfg_agent_id == "env-agent-id"
         assert adapter._api_key == "env-api-key"
 
@@ -81,20 +78,12 @@ class TestBandAdapterInit:
         assert adapter._cfg_agent_id == "env-wins"
 
     def test_init_sets_band_platform_identity(self, monkeypatch):
-        monkeypatch.setenv("BAND_AGENT_ID", "x")
-        monkeypatch.setenv("BAND_API_KEY", "y")
-        monkeypatch.delenv("BAND_BASE_URL", raising=False)
-        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
-        adapter = BandAdapter(_make_config())
+        adapter = _make_adapter(monkeypatch)
         # platform is a Platform enum with value "band"
         assert adapter.platform.value == "band"
 
     def test_init_base_url_from_env(self, monkeypatch):
-        monkeypatch.setenv("BAND_AGENT_ID", "a")
-        monkeypatch.setenv("BAND_API_KEY", "b")
-        monkeypatch.setenv("BAND_BASE_URL", "https://custom.host")
-        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
-        adapter = BandAdapter(_make_config())
+        adapter = _make_adapter(monkeypatch, base_url="https://custom.host")
         assert adapter._base_url == "https://custom.host"
 
     def test_init_base_url_from_extra(self, monkeypatch):
@@ -109,11 +98,7 @@ class TestBandAdapterInit:
         assert adapter._base_url == "https://extra.host"
 
     def test_init_runtime_state_is_empty(self, monkeypatch):
-        monkeypatch.setenv("BAND_AGENT_ID", "a")
-        monkeypatch.setenv("BAND_API_KEY", "b")
-        monkeypatch.delenv("BAND_BASE_URL", raising=False)
-        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
-        adapter = BandAdapter(_make_config())
+        adapter = _make_adapter(monkeypatch)
         assert adapter._link is None
         assert adapter._consumer_task is None
         assert adapter._sent_ids == set()
@@ -121,12 +106,7 @@ class TestBandAdapterInit:
         assert adapter._last_human_sender == {}
 
     def test_name_property(self, monkeypatch):
-        monkeypatch.setenv("BAND_AGENT_ID", "a")
-        monkeypatch.setenv("BAND_API_KEY", "b")
-        monkeypatch.delenv("BAND_BASE_URL", raising=False)
-        monkeypatch.delenv("BAND_OWNER_ID", raising=False)
-        adapter = BandAdapter(_make_config())
-        assert adapter.name == "Band"
+        assert _make_adapter(monkeypatch).name == "Band"
 
 
 class TestBandAccessPolicy:
@@ -877,15 +857,17 @@ class TestHandleEvent:
         adapter._link.unsubscribe_room.assert_called_once_with("del-room")
 
     @pytest.mark.asyncio
-    async def test_unknown_event_type_is_ignored(self, adapter):
-        # Should not raise
-        event = SimpleNamespace(type="participant_added", room_id="some-room")
+    async def test_unhandled_event_type_is_ignored(self, adapter):
+        # An event the router has no branch for (e.g. a future contact_* event)
+        # falls through silently: no raise, no room subscribe/unsubscribe.
+        event = SimpleNamespace(type="contact_request_received", room_id="some-room")
         await adapter._handle_event(event)
         adapter._link.subscribe_room.assert_not_called()
+        adapter._link.unsubscribe_room.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# 15. Tools-pass event handling — participant changes, session close, rehydrate
+# 12. Room & participant lifecycle events — participant changes, leave-reset, re-join
 # ---------------------------------------------------------------------------
 
 class _FakeSessionStore:
@@ -911,6 +893,33 @@ class _FakeSessionStore:
         self.reset_calls.append(session_key)
         self._entries.pop(session_key, None)
         return None
+
+
+def _history_store(transcripts):
+    """Session-store stand-in whose 'warm' verdict is history-based.
+
+    ``transcripts`` maps session_key -> transcript list. Unlike ``_FakeSessionStore``
+    (which has no ``load_transcript`` so ``_has_active_session`` falls back to the
+    legacy entry-presence branch), this exposes ``load_transcript`` and entries
+    carrying ``session_id`` — so a test exercises the real history-based rule
+    (empty transcript == cold), the behavior this change introduced.
+    """
+    entries = {key: SimpleNamespace(session_id=f"sid::{key}") for key in transcripts}
+    by_sid = {f"sid::{key}": list(t) for key, t in transcripts.items()}
+
+    class _Store:
+        config = SimpleNamespace(group_sessions_per_user=False)
+
+        def __init__(self):
+            self._entries = entries
+
+        def _ensure_loaded(self):
+            pass
+
+        def load_transcript(self, session_id):
+            return list(by_sid.get(session_id, []))
+
+    return _Store()
 
 
 class TestParticipantChangeEvents:
@@ -1043,8 +1052,109 @@ class TestRoomAddedRejoinFlagsRehydration:
         event = SimpleNamespace(type="room_added", room_id="known-room")
         await adapter._handle_event(event)
         adapter._link.subscribe_room.assert_called_once_with("known-room")
-        # Re-join: flagged for rehydration, no synthetic wake.
+        # Re-join of a cold room: flagged for rehydration, no synthetic wake.
         assert "known-room" in adapter._rehydrate_rooms
+
+    @pytest.mark.asyncio
+    async def test_rejoin_room_with_live_session_not_flagged(self, adapter):
+        # A room_added for a room that already has a live session (e.g. a
+        # server-side re-subscribe replay) must NOT re-inject stale history.
+        # Uses a load_transcript-bearing store so this exercises the real
+        # history-based _has_active_session, not the entry-presence fallback.
+        adapter._known_rooms.add("warm-room")
+        adapter._session_store = _history_store(
+            {"agent:main:band:group:warm-room": [{"role": "user", "content": "prior"}]}
+        )
+        event = SimpleNamespace(type="room_added", room_id="warm-room")
+        await adapter._handle_event(event)
+        assert "warm-room" not in adapter._rehydrate_rooms
+
+    @pytest.mark.asyncio
+    async def test_rejoin_room_with_empty_session_is_flagged(self, adapter):
+        # The new history-based rule: a bare session entry with an EMPTY
+        # transcript counts as cold, so a re-join still flags it for rehydration.
+        # (Under the old entry-presence logic this room would be seen as warm and
+        # NOT flagged — so this test fails if the history-based change is reverted.)
+        adapter._known_rooms.add("empty-room")
+        adapter._session_store = _history_store(
+            {"agent:main:band:group:empty-room": []}
+        )
+        event = SimpleNamespace(type="room_added", room_id="empty-room")
+        await adapter._handle_event(event)
+        assert "empty-room" in adapter._rehydrate_rooms
+
+    @pytest.mark.asyncio
+    async def test_rejoin_cold_room_actually_drains_backlog(self, adapter):
+        # A live re-join must drain the room so the backlog the seed excludes
+        # actually gets answered. Drive the real _catch_up_room -> _drain_room
+        # against a mocked link and assert a /next pull really happened.
+        adapter._link.get_stale_processing_messages = AsyncMock(return_value=[])
+        adapter._link.get_next_message = AsyncMock(return_value=None)  # empty backlog
+        adapter._known_rooms.add("known-room")
+        await adapter._handle_event(
+            SimpleNamespace(type="room_added", room_id="known-room")
+        )
+        await asyncio.sleep(0)  # let the scheduled drain task run
+        adapter._link.get_next_message.assert_awaited_with("known-room")
+
+    @pytest.mark.asyncio
+    async def test_rejoin_during_running_catchup_still_drains(self, adapter):
+        # The seed↔drain invariant: a re-join always drains, even while an
+        # all-rooms catch-up is in flight. That drain iterates a start-of-run
+        # snapshot of _known_rooms, so a room re-joined mid-drain would never be
+        # reached by it — skipping here would leave the excluded mention backlog
+        # neither seeded nor answered until the next reconnect. Concurrent /
+        # duplicate same-room drains are safe (mark_processing claim + inbound
+        # dedup), so the re-join just drains.
+        adapter._link.get_stale_processing_messages = AsyncMock(return_value=[])
+        adapter._link.get_next_message = AsyncMock(return_value=None)
+        adapter._known_rooms.add("known-room")
+        adapter._catch_up_task = asyncio.create_task(asyncio.sleep(0.05))  # in flight
+        await adapter._handle_event(
+            SimpleNamespace(type="room_added", room_id="known-room")
+        )
+        await asyncio.sleep(0)  # let the scheduled per-room drain run
+        adapter._link.get_next_message.assert_awaited_with("known-room")
+        adapter._catch_up_task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# 13. Cold-room rehydration & durable transcript seeding (Band as source of truth)
+# ---------------------------------------------------------------------------
+
+class TestHasActiveSession:
+    """'Warm' means a session with real history, not a bare (empty) entry."""
+
+    def _store(self, transcript):
+        key = "agent:main:band:group:room-x"
+        entry = SimpleNamespace(session_id="sid-x")
+
+        class _Store:
+            config = SimpleNamespace(group_sessions_per_user=False)
+            _entries = {key: entry}
+
+            def _ensure_loaded(self):
+                pass
+
+            def load_transcript(self, sid):
+                return list(transcript)
+
+        return _Store()
+
+    def test_empty_transcript_is_not_active(self, monkeypatch):
+        a = _make_adapter(monkeypatch)
+        a._session_store = self._store([])
+        assert a._has_active_session("room-x") is False
+
+    def test_nonempty_transcript_is_active(self, monkeypatch):
+        a = _make_adapter(monkeypatch)
+        a._session_store = self._store([{"role": "user", "content": "hi"}])
+        assert a._has_active_session("room-x") is True
+
+    def test_missing_entry_is_not_active(self, monkeypatch):
+        a = _make_adapter(monkeypatch)
+        a._session_store = self._store([{"role": "user", "content": "hi"}])
+        assert a._has_active_session("other-room") is False
 
 
 class TestRehydrationOnNextMessage:
@@ -1134,8 +1244,645 @@ class TestRehydrationOnNextMessage:
         assert "rejoined-room" not in adapter._rehydrate_rooms
 
 
+class _SeedingSessionStore(_FakeSessionStore):
+    """Session store stand-in exposing the gateway-native atomic seed primitive.
+
+    Records the rows passed to ``seed_transcript_if_empty`` in ``atomic_seeded``
+    so tests can assert what was seeded. ``load_transcript`` starts empty (cold)
+    unless constructed with ``existing_transcript`` (warm). An optional
+    ``on_seed`` hook lets a test simulate a store failure during the write.
+    """
+
+    def __init__(
+        self,
+        *,
+        existing_transcript=None,
+        session_id="sess-1",
+        on_seed=None,
+        **kw,
+    ):
+        super().__init__(**kw)
+        self._session_id = session_id
+        self._transcripts = {session_id: list(existing_transcript or [])}
+        self.atomic_seeded = None  # rows passed to seed_transcript_if_empty
+        self._on_seed = on_seed
+
+    def get_or_create_session(self, source):
+        # Mirror the real store side effect: materialize an (empty) entry.
+        self._entries.setdefault(self._session_id, object())
+        return SimpleNamespace(session_id=self._session_id, session_key="k")
+
+    def load_transcript(self, session_id):
+        return list(self._transcripts.get(session_id, []))
+
+    def seed_transcript_if_empty(self, session_id, messages):
+        # Single-step count-then-insert: never clobbers a concurrently-filled
+        # transcript (returns False when non-empty).
+        if self._on_seed is not None:
+            self._on_seed()
+        if self._transcripts.get(session_id):
+            return False
+        self._transcripts[session_id] = list(messages)
+        self.atomic_seeded = list(messages)
+        return True
+
+
+class TestDurableSeedRehydration:
+    """Cold rooms seed the gateway transcript from Band (Band as source of truth)."""
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
+        a._agent_id = "agent-self-id"
+        a.handle_message = AsyncMock()
+        a._link = MagicMock()
+        # No actionable backlog by default.
+        a._link.rest.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[], metadata=SimpleNamespace(next_cursor=None, has_more=False)
+            )
+        )
+        return a
+
+    def _event(self, room_id="rejoined-room", msg_id="msg-r1"):
+        payload = SimpleNamespace(
+            id=msg_id,
+            content="hey, you back?",
+            message_type="text",
+            sender_id="human-1",
+            sender_type="User",
+            sender_name="Alice",
+            chat_room_id=room_id,
+            metadata=SimpleNamespace(
+                mentions=[SimpleNamespace(id="agent-self-id", handle=None)]
+            ),
+        )
+        return SimpleNamespace(type="message_created", room_id=room_id, payload=payload)
+
+    def _ctx(self, items):
+        return AsyncMock(
+            return_value=SimpleNamespace(
+                data=items, metadata=SimpleNamespace(next_cursor=None, has_more=False)
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_cold_room_seeds_transcript_with_roles_and_no_channel_context(
+        self, adapter
+    ):
+        adapter._session_store = _SeedingSessionStore()  # cold (empty transcript)
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(
+                    id="h1", message_type="text", content="what's the weather?",
+                    sender_id="human-1", sender_type="User", sender_name="Alice",
+                    inserted_at=None,
+                ),
+                SimpleNamespace(
+                    id="h2", message_type="text", content="It's sunny.",
+                    sender_id="agent-self-id", sender_type="Agent", sender_name="Bot",
+                    inserted_at=None,
+                ),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        store = adapter._session_store
+        # Durable path used → message carries no one-shot channel_context.
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is None
+        # Single atomic write; own reply as assistant (prevents re-answering),
+        # peer as user with a [name] prefix.
+        assert [(r["role"], r["content"]) for r in store.atomic_seeded] == [
+            ("user", "[Alice] what's the weather?"),
+            ("assistant", "It's sunny."),
+        ]
+        assert "rejoined-room" not in adapter._rehydrate_rooms
+
+    @pytest.mark.asyncio
+    async def test_cold_room_seeds_real_session_store_roundtrip(self, adapter, tmp_path):
+        # Wire the REAL gateway SessionStore (temp SQLite) and mock ONLY the
+        # Band REST endpoints (the genuine external service). This validates the
+        # actual persistence contract — row-dict keys accepted, roles round-trip
+        # through load_transcript — instead of a hand-rolled fake.
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionStore
+        from hermes_state import SessionDB
+
+        store = SessionStore(tmp_path, GatewayConfig())
+        store._db = SessionDB(db_path=tmp_path / "state.db")  # isolate from ~/.hermes
+        adapter._session_store = store
+
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text", content="what's the weather?",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+                SimpleNamespace(id="h2", message_type="text", content="It's sunny.",
+                                sender_id="agent-self-id", sender_type="Agent",
+                                sender_name="Bot", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        # Exactly one session exists — the seeded room — and the REAL
+        # load_transcript reads back the user/assistant rows the seed wrote.
+        assert len(store._entries) == 1
+        entry = next(iter(store._entries.values()))
+        assert "band:group:rejoined-room" in entry.session_key
+        rows = store.load_transcript(entry.session_id)
+        assert [(r["role"], r["content"]) for r in rows] == [
+            ("user", "[Alice] what's the weather?"),
+            ("assistant", "It's sunny."),
+        ]
+        # Durable path → no one-shot channel_context on the delivered message.
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is None
+
+    @pytest.mark.asyncio
+    async def test_warm_session_is_not_reseeded_and_left_intact(self, adapter):
+        store = _SeedingSessionStore(
+            existing_transcript=[{"role": "user", "content": "prior"}]
+        )
+        adapter._session_store = store
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx([])
+
+        await adapter._handle_message_created(self._event())
+
+        # Warm → no seed write, no clobber, no channel_context.
+        assert store.atomic_seeded is None
+        assert store.load_transcript("sess-1") == [{"role": "user", "content": "prior"}]
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is None
+
+    @pytest.mark.asyncio
+    async def test_trigger_and_backlog_excluded_from_seed(self, adapter):
+        adapter._session_store = _SeedingSessionStore()
+        adapter._rehydrate_rooms.add("rejoined-room")
+        # Actionable backlog: an unprocessed message that @mentions the agent.
+        adapter._link.rest.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[
+                    SimpleNamespace(
+                        id="backlog-1",
+                        metadata={"mentions": [{"id": "agent-self-id"}]},
+                    )
+                ],
+                metadata=SimpleNamespace(next_cursor=None, has_more=False),
+            )
+        )
+        # Context includes the trigger (msg-r1), the backlog (backlog-1), and
+        # one genuine history item (h1). Only h1 should be seeded.
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text", content="older context",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+                SimpleNamespace(id="backlog-1", message_type="text", content="unanswered Q",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+                SimpleNamespace(id="msg-r1", message_type="text", content="hey, you back?",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        seeded = [r["content"] for r in adapter._session_store.atomic_seeded]
+        assert seeded == ["[Alice] older context"]
+
+    @pytest.mark.asyncio
+    async def test_no_seed_api_falls_back_to_channel_context(self, adapter):
+        # Store lacks the seed API → legacy one-shot channel_context blob.
+        adapter._session_store = _FakeSessionStore()
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text", content="earlier note",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is not None
+        assert "earlier note" in evt.channel_context
+
+    @pytest.mark.asyncio
+    async def test_context_fetch_failure_still_delivers_message(self, adapter):
+        adapter._session_store = _SeedingSessionStore()
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = AsyncMock(
+            side_effect=RuntimeError("context boom")
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        # Best-effort: message delivered; nothing seeded; the blob fallback also
+        # has no context to offer (same failing endpoint) → channel_context None.
+        adapter.handle_message.assert_called_once()
+        assert adapter._session_store.atomic_seeded is None
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is None
+
+    @pytest.mark.asyncio
+    async def test_seed_write_failure_falls_back_to_blob(self, adapter, caplog):
+        # The seed write itself fails (transient store error) but context fetch
+        # works → return False → caller produces the channel_context blob, so
+        # the room is never silently left with no recovered context. The failure
+        # is surfaced at WARNING (not debug): a raised seed is unexpected and
+        # would otherwise silently disable durable rehydration.
+        adapter._session_store = _SeedingSessionStore(
+            on_seed=lambda: (_ for _ in ()).throw(RuntimeError("db locked"))
+        )
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text", content="earlier note",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+            ]
+        )
+
+        with caplog.at_level(logging.WARNING, logger="hermes_band_platform.adapter"):
+            await adapter._handle_message_created(self._event())
+
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is not None
+        assert "earlier note" in evt.channel_context
+        # The seed failure is loud, not swallowed at debug.
+        assert any(
+            r.levelno == logging.WARNING and "seed failed" in r.message.lower()
+            for r in caplog.records
+        )
+
+    def test_build_seed_rows_timestamps_are_monotonic(self, adapter):
+        # The gateway replays a transcript ORDER BY (timestamp, id). A context
+        # item with a missing inserted_at gets _seed_epoch's "now" fallback,
+        # which would sort it AFTER genuine past history and scramble chronology
+        # (an assistant reply landing before the user turn it answered). The
+        # clamp keeps timestamps non-decreasing in list order so replay order ==
+        # the server's oldest-first order regardless of timestamp gaps.
+        import datetime as dt
+
+        adapter._agent_id = "agent-self-id"
+        t1 = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        t2 = dt.datetime(2024, 1, 2, tzinfo=dt.timezone.utc)
+        items = [
+            SimpleNamespace(id="a", message_type="text", content="first",
+                            sender_id="human-1", sender_type="User",
+                            sender_name="Alice", inserted_at=t1),
+            SimpleNamespace(id="b", message_type="text", content="second (no ts)",
+                            sender_id="human-1", sender_type="User",
+                            sender_name="Alice", inserted_at=None),
+            SimpleNamespace(id="c", message_type="text", content="third",
+                            sender_id="human-1", sender_type="User",
+                            sender_name="Alice", inserted_at=t2),
+        ]
+        rows = adapter._build_seed_rows(items, set(), [])
+        # List (chronological) order is preserved...
+        assert [r["content"] for r in rows] == [
+            "[Alice] first",
+            "[Alice] second (no ts)",
+            "[Alice] third",
+        ]
+        # ...and timestamps never decrease, so ORDER BY (timestamp, id) cannot
+        # reorder the now-stamped middle row ahead of the real t2 row that
+        # follows it. (Without the clamp this list would be [t1, now, t2] —
+        # unsorted — and replay would put "third" before "second (no ts)".)
+        ts = [r["timestamp"] for r in rows]
+        assert ts == sorted(ts)
+
+    @pytest.mark.asyncio
+    async def test_peer_agent_message_seeded_as_user(self, adapter):
+        # A message from a DIFFERENT agent is a peer from our POV → seeded as a
+        # `user` turn with a [name] prefix, NOT `assistant`. (Only our own
+        # replies become assistant; this is the non-obvious INT-509-adjacent case.)
+        store = _SeedingSessionStore()
+        adapter._session_store = store
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="p1", message_type="text", content="from a peer bot",
+                                sender_id="other-agent", sender_type="Agent",
+                                sender_name="Helper", inserted_at=None),
+                SimpleNamespace(id="o1", message_type="text", content="my reply",
+                                sender_id="agent-self-id", sender_type="Agent",
+                                sender_name="Me", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        assert [(r["role"], r["content"]) for r in store.atomic_seeded] == [
+            ("user", "[Helper] from a peer bot"),   # peer agent → user
+            ("assistant", "my reply"),               # our own → assistant
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unaddressed_actionable_message_is_kept_in_seed(self, adapter):
+        # Only *mentions* are excluded from the seed (they get answered). An
+        # unprocessed message that does NOT mention the agent is context, not an
+        # answer — it must stay in the seeded history, not be over-excluded.
+        store = _SeedingSessionStore()
+        adapter._session_store = store
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[
+                    SimpleNamespace(id="mention-1",
+                                    metadata={"mentions": [{"id": "agent-self-id"}]}),
+                    SimpleNamespace(id="chatter-1", metadata={"mentions": []}),
+                ],
+                metadata=SimpleNamespace(next_cursor=None, has_more=False),
+            )
+        )
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="chatter-1", message_type="text",
+                                content="background chatter", sender_id="human-2",
+                                sender_type="User", sender_name="Bob", inserted_at=None),
+                SimpleNamespace(id="mention-1", message_type="text",
+                                content="answer me", sender_id="human-1",
+                                sender_type="User", sender_name="Alice", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        # The mention is excluded (it'll be answered); the un-addressed chatter is kept.
+        assert [r["content"] for r in store.atomic_seeded] == ["[Bob] background chatter"]
+
+    @pytest.mark.asyncio
+    async def test_fetch_room_context_follows_pagination(self, adapter):
+        # The context fetch must follow next_cursor across pages (and terminate).
+        store = _SeedingSessionStore()
+        adapter._session_store = store
+        adapter._rehydrate_rooms.add("rejoined-room")
+
+        page1 = SimpleNamespace(
+            data=[SimpleNamespace(id="h1", message_type="text", content="page one",
+                                  sender_id="human-1", sender_type="User",
+                                  sender_name="Alice", inserted_at=None)],
+            metadata=SimpleNamespace(next_cursor="cursor-2", has_more=True),
+        )
+        page2 = SimpleNamespace(
+            data=[SimpleNamespace(id="h2", message_type="text", content="page two",
+                                  sender_id="human-1", sender_type="User",
+                                  sender_name="Alice", inserted_at=None)],
+            metadata=SimpleNamespace(next_cursor=None, has_more=False),
+        )
+        adapter._link.rest.agent_api_context.get_agent_chat_context = AsyncMock(
+            side_effect=[page1, page2]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        assert [r["content"] for r in store.atomic_seeded] == [
+            "[Alice] page one",
+            "[Alice] page two",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_seed_renders_uuid_mentions_with_participants(self, adapter):
+        # @[[uuid]] mentions are rendered to @handle using the room's participants
+        # cache so the seeded transcript is human-readable.
+        store = _SeedingSessionStore()
+        adapter._session_store = store
+        adapter._participants_cache["rejoined-room"] = [
+            {"id": "human-1", "handle": "alice"}
+        ]
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text",
+                                content="ping @[[human-1]] now", sender_id="human-2",
+                                sender_type="User", sender_name="Bob", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        assert store.atomic_seeded[0]["content"] == "[Bob] ping @alice now"
+
+
+class TestSessionKeyParity:
+    """_reset_room_session and _has_active_session derive the SAME key as the store."""
+
+    @pytest.mark.asyncio
+    async def test_reset_targets_the_real_session_key(self, monkeypatch, tmp_path):
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionSource, SessionStore
+        from hermes_state import SessionDB
+
+        a = _make_adapter(monkeypatch)
+        store = SessionStore(tmp_path, GatewayConfig())
+        store._db = SessionDB(db_path=tmp_path / "s.db")
+        a._session_store = store
+
+        # _session_key_for must match the store's own derivation (single source).
+        src = SessionSource(platform=a.platform, chat_id="room-x", chat_type="group")
+        assert a._session_key_for("room-x") == store._generate_session_key(src)
+
+        # Create + warm the room's session, then reset via the adapter (leave
+        # path) and confirm it actually targeted that session (now cold).
+        entry = store.get_or_create_session(src)
+        store.rewrite_transcript(
+            entry.session_id, [{"role": "user", "content": "hi", "timestamp": 1.0}]
+        )
+        assert a._has_active_session("room-x") is True
+        a._reset_room_session("room-x")
+        assert a._has_active_session("room-x") is False
+
+
+class TestAtomicSeedTranscript:
+    """_atomic_seed_transcript against the REAL SessionDB (the race-safe write)."""
+
+    def _store(self, tmp_path):
+        from gateway.config import GatewayConfig
+        from gateway.session import SessionSource, SessionStore
+        from hermes_state import SessionDB
+
+        store = SessionStore(tmp_path, GatewayConfig())
+        store._db = SessionDB(db_path=tmp_path / "s.db")
+        return store, SessionSource
+
+    def test_seeds_empty_session_and_counts(self, tmp_path):
+        store, Src = self._store(tmp_path)
+        from gateway.config import Platform
+        e = store.get_or_create_session(
+            Src(platform=Platform("telegram"), chat_id="r1", chat_type="group")
+        )
+        rows = [
+            {"role": "user", "content": "[Al] hi", "timestamp": 1.0},
+            {"role": "assistant", "content": "hello", "timestamp": 2.0},
+        ]
+        wrote = _band_mod._atomic_seed_transcript(store, e.session_id, rows)
+        assert wrote is True
+        got = store.load_transcript(e.session_id)
+        assert [(m["role"], m["content"]) for m in got] == [
+            ("user", "[Al] hi"),
+            ("assistant", "hello"),
+        ]
+        assert store._db.message_count(e.session_id) == 2
+
+    def test_no_op_on_nonempty_session(self, tmp_path):
+        store, Src = self._store(tmp_path)
+        from gateway.config import Platform
+        e = store.get_or_create_session(
+            Src(platform=Platform("telegram"), chat_id="r2", chat_type="group")
+        )
+        store._db.append_message(e.session_id, role="user", content="LIVE", timestamp=1.0)
+        wrote = _band_mod._atomic_seed_transcript(
+            store, e.session_id, [{"role": "assistant", "content": "SEED", "timestamp": 2.0}]
+        )
+        assert wrote is False
+        contents = [m["content"] for m in store.load_transcript(e.session_id)]
+        assert contents == ["LIVE"]  # not clobbered, seed not added
+
+    def test_idempotent(self, tmp_path):
+        store, Src = self._store(tmp_path)
+        from gateway.config import Platform
+        e = store.get_or_create_session(
+            Src(platform=Platform("telegram"), chat_id="r3", chat_type="group")
+        )
+        rows = [{"role": "user", "content": "x", "timestamp": 1.0}]
+        assert _band_mod._atomic_seed_transcript(store, e.session_id, rows) is True
+        assert _band_mod._atomic_seed_transcript(store, e.session_id, rows) is False
+        assert store._db.message_count(e.session_id) == 1
+
+    def test_seeds_session_with_only_soft_deleted_rows(self, tmp_path):
+        # A rewind/undo soft-deletes rows (active=0). load_transcript filters
+        # active=1, so the gateway replays the session as empty/cold and the room
+        # is flagged for rehydration. The atomic guard must agree — count only
+        # ACTIVE rows — or it sees the inactive rows, no-ops (returns False), the
+        # caller treats that as "handled" and skips the blob, and the room answers
+        # cold with nothing seeded.
+        store, Src = self._store(tmp_path)
+        from gateway.config import Platform
+        e = store.get_or_create_session(
+            Src(platform=Platform("telegram"), chat_id="r6", chat_type="group")
+        )
+        store._db.append_message(e.session_id, role="user", content="OLD", timestamp=1.0)
+        # Soft-delete every row, as a full rewind would.
+        store._db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE messages SET active = 0 WHERE session_id = ?", (e.session_id,)
+            )
+        )
+        assert store.load_transcript(e.session_id) == []  # cold to the gateway
+        wrote = _band_mod._atomic_seed_transcript(
+            store, e.session_id, [{"role": "user", "content": "[Al] hi", "timestamp": 2.0}]
+        )
+        assert wrote is True  # seeded, not mistaken for non-empty
+        assert [m["content"] for m in store.load_transcript(e.session_id)] == ["[Al] hi"]
+
+    def test_returns_none_without_db(self):
+        # A store lacking _db/_execute_write can't do an atomic write.
+        assert _band_mod._atomic_seed_transcript(
+            SimpleNamespace(), "sid", [{"role": "user", "content": "x", "timestamp": 1.0}]
+        ) is None
+
+    def test_content_with_special_chars_roundtrips(self, tmp_path):
+        store, Src = self._store(tmp_path)
+        from gateway.config import Platform
+        e = store.get_or_create_session(
+            Src(platform=Platform("telegram"), chat_id="r4", chat_type="group")
+        )
+        weird = 'líne1\n"quoted" & <tag> 表情'
+        _band_mod._atomic_seed_transcript(
+            store, e.session_id, [{"role": "user", "content": weird, "timestamp": 1.0}]
+        )
+        assert store.load_transcript(e.session_id)[0]["content"] == weird
+
+    def test_no_clobber_under_thread_contention(self, tmp_path):
+        # The core safety property: a concurrent append is never lost, and the
+        # seed never corrupts the transcript, across many fresh sessions.
+        import threading
+
+        store, Src = self._store(tmp_path)
+        from gateway.config import Platform
+
+        for i in range(40):
+            e = store.get_or_create_session(
+                Src(platform=Platform("telegram"), chat_id=f"c{i}", chat_type="group")
+            )
+            sid = e.session_id
+            errs = []
+
+            def _append():
+                try:
+                    store._db.append_message(sid, role="user", content="LIVE", timestamp=1.0)
+                except Exception as ex:  # noqa: BLE001
+                    errs.append(ex)
+
+            def _seed():
+                try:
+                    _band_mod._atomic_seed_transcript(
+                        store, sid, [{"role": "assistant", "content": "SEED", "timestamp": 2.0}]
+                    )
+                except Exception as ex:  # noqa: BLE001
+                    errs.append(ex)
+
+            ta = threading.Thread(target=_append)
+            tb = threading.Thread(target=_seed)
+            tb.start()
+            ta.start()
+            tb.join()
+            ta.join()
+            assert not errs, errs
+            contents = [m["content"] for m in store.load_transcript(sid)]
+            assert "LIVE" in contents  # the append is never clobbered
+
+
+class TestSeedHelpers:
+    """Pure helpers behind the durable seed."""
+
+    def test_seedable_text_skips_non_text_and_empty(self):
+        text_item = SimpleNamespace(
+            message_type="text", content=" hi ", sender_type="User",
+            sender_id="u1", sender_name="Al",
+        )
+        # Strips whitespace and returns the (type, id, name, content) tuple.
+        assert _band_mod._seedable_text(text_item, []) == ("User", "u1", "Al", "hi")
+        tool_item = SimpleNamespace(message_type="tool_call", content="x")
+        assert _band_mod._seedable_text(tool_item, []) is None
+        empty_item = SimpleNamespace(message_type="text", content="   ")
+        assert _band_mod._seedable_text(empty_item, []) is None
+
+    def test_next_page_terminates_on_falsey_or_missing_metadata(self):
+        # Guards the pagination loops against spinning: only a real string cursor
+        # AND has_more is True continues; everything else ends the loop.
+        nxt = _band_mod.BandAdapter._next_page
+        assert nxt(SimpleNamespace(
+            metadata=SimpleNamespace(next_cursor="c", has_more=True))) == ("c", True)
+        assert nxt(SimpleNamespace(
+            metadata=SimpleNamespace(next_cursor="c", has_more=False))) == (None, False)
+        assert nxt(SimpleNamespace(
+            metadata=SimpleNamespace(next_cursor=None, has_more=True))) == (None, False)
+        assert nxt(SimpleNamespace()) == (None, False)              # no metadata
+        assert nxt(SimpleNamespace(metadata=MagicMock())) == (None, False)  # truthy mock
+
+    def test_seed_epoch_coerces_or_falls_back(self):
+        import datetime as _dt
+
+        dt = _dt.datetime(2020, 1, 1, tzinfo=_dt.timezone.utc)
+        assert _band_mod._seed_epoch(dt) == dt.timestamp()
+        # None / unparseable → a real epoch, never raises (keeps ordering sane).
+        assert isinstance(_band_mod._seed_epoch(None), float)
+        assert isinstance(_band_mod._seed_epoch("not-a-time"), float)
+
+
 # ---------------------------------------------------------------------------
-# 15b. Route A — server-cursor ack lifecycle + /next missed-message catch-up
+# 14. Route A — server-cursor ack lifecycle + /next missed-message catch-up
 # ---------------------------------------------------------------------------
 
 def _ack_link():
@@ -1415,6 +2162,36 @@ class TestCatchUpRehydratesColdRoom:
         await adapter._catch_up_all_rooms()
         assert "room-abc" in adapter._rehydrate_rooms
 
+    @pytest.mark.asyncio
+    async def test_warns_once_when_gateway_isolates_sessions_per_user(
+        self, adapter, caplog
+    ):
+        # Band rooms are shared channels; a gateway with
+        # group_sessions_per_user=True fragments them per user, so per-room
+        # session reset/rehydration target a key the per-user sessions don't
+        # use. We can't change the store config, so surface it loudly — exactly
+        # once, not on every reconnect.
+        adapter._session_store = _FakeSessionStore(group_sessions_per_user=True)
+        with caplog.at_level(logging.WARNING, logger="hermes_band_platform.adapter"):
+            await adapter._catch_up_all_rooms()
+            await adapter._catch_up_all_rooms()  # second connect — must not re-warn
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "group_sessions_per_user" in r.message
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_isolation_warning_in_shared_session_mode(self, adapter, caplog):
+        # The supported config (group_sessions_per_user=False) is silent.
+        adapter._session_store = _FakeSessionStore(group_sessions_per_user=False)
+        with caplog.at_level(logging.WARNING, logger="hermes_band_platform.adapter"):
+            await adapter._catch_up_all_rooms()
+        assert not [
+            r for r in caplog.records if "group_sessions_per_user" in r.message
+        ]
+
 
 class TestReconnectSchedulesCatchUp:
 
@@ -1489,7 +2266,7 @@ class TestMentionParsingDictMetadata:
 
 
 # ---------------------------------------------------------------------------
-# 12. connect/disconnect lifecycle
+# 15. connect/disconnect lifecycle
 # ---------------------------------------------------------------------------
 
 class TestConnectDisconnect:
@@ -1614,9 +2391,31 @@ class TestConnectDisconnect:
         await adapter.disconnect()
         fake_link.disconnect.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_room_catch_up_tasks(self, monkeypatch):
+        # Per-room re-join drains must not outlive the link — otherwise a stale
+        # drain can resume against a freshly reconnected link.
+        adapter = _make_adapter(monkeypatch)
+
+        async def _forever():
+            await asyncio.sleep(999)
+
+        task = asyncio.create_task(_forever())
+        adapter._room_catch_up_tasks.add(task)
+        task.add_done_callback(adapter._room_catch_up_tasks.discard)
+
+        fake_link = MagicMock()
+        fake_link.disconnect = AsyncMock()
+        adapter._link = fake_link
+
+        await adapter.disconnect()
+
+        assert task.cancelled() or task.done()
+        assert adapter._room_catch_up_tasks == set()
+
 
 # ---------------------------------------------------------------------------
-# 13. _record_sent_id eviction
+# 16. _record_sent_id eviction
 # ---------------------------------------------------------------------------
 
 class TestRecordSentId:
@@ -1634,7 +2433,7 @@ class TestRecordSentId:
 
 
 # ---------------------------------------------------------------------------
-# 14. get_chat_info
+# 17. get_chat_info
 # ---------------------------------------------------------------------------
 
 class TestGetChatInfo:
@@ -1687,7 +2486,7 @@ class TestGetChatInfo:
 
 
 # ---------------------------------------------------------------------------
-# 15. Hub bootstrap (_ensure_hub) + main-channel wiring
+# 18. Hub bootstrap (_ensure_hub) + main-channel wiring
 # ---------------------------------------------------------------------------
 
 def _make_hub_link(rooms=None, created_room_id="hub-new-1"):
@@ -1916,7 +2715,7 @@ class TestWireHomeChannel:
 
 
 # ---------------------------------------------------------------------------
-# 16. Owner slash-command gate
+# 19. Owner slash-command gate
 # ---------------------------------------------------------------------------
 
 class TestIsCommandText:
@@ -2129,7 +2928,7 @@ class TestOwnerCommandGate:
 
 
 # ---------------------------------------------------------------------------
-# 17. _env_enablement — hub / home-channel seeding
+# 20. _env_enablement — hub / home-channel seeding
 # ---------------------------------------------------------------------------
 
 class TestEnvEnablementHubSeeds:
@@ -2170,7 +2969,7 @@ class TestEnvEnablementHubSeeds:
 
 
 # ---------------------------------------------------------------------------
-# 18. Hub installation announcement (first designation must be owner-visible)
+# 21. Hub installation announcement (first designation must be owner-visible)
 # ---------------------------------------------------------------------------
 
 class TestHubAnnouncement:
@@ -2228,7 +3027,7 @@ class TestHubAnnouncement:
 
 
 # ---------------------------------------------------------------------------
-# 19. Hub greeting builder (clean title + owner-facing body)
+# 22. Hub greeting builder (clean title + owner-facing body)
 # ---------------------------------------------------------------------------
 
 class TestHubGreeting:
@@ -2271,7 +3070,7 @@ class TestHubGreeting:
 
 
 # ---------------------------------------------------------------------------
-# 20. Hub failover — repeated hub send failures create + re-wire a fresh hub
+# 23. Hub failover — repeated hub send failures create + re-wire a fresh hub
 # ---------------------------------------------------------------------------
 
 class TestHubFailover:

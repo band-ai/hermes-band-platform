@@ -33,10 +33,13 @@ Scope notes:
 """
 
 import asyncio
+import json
 import logging
 import os
+import time
+from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypedDict
 from urllib.parse import urlsplit
 
 from gateway.config import HomeChannel, Platform, PlatformConfig  # noqa: E402
@@ -260,6 +263,204 @@ def _mention_items(
     return items
 
 
+class _TranscriptRow(TypedDict):
+    """The stable, documented subset of a Hermes session-transcript row.
+
+    We deliberately restrict seeded rows to the columns the gateway's
+    ``messages`` table actually persists (``role``/``content``/``timestamp``).
+    The gateway's ``append_to_transcript`` accepts extra keys
+    (``platform_message_id``, ``observed``, …), but those are NOT in the
+    persisted schema across versions, so depending on them would be fragile.
+    """
+
+    role: str
+    content: str
+    timestamp: float
+
+
+def _seed_role_for(sender_type: str, sender_id: Optional[str], agent_id: str) -> str:
+    """Map a Band message's sender to a transcript role.
+
+    Our own past replies must be replayed as ``assistant`` turns — otherwise the
+    rehydrated transcript reads as a run of unanswered user messages and the
+    model re-answers questions it already handled. Everyone else (humans and
+    peer agents) is a ``user`` turn from this agent's point of view.
+    """
+    if sender_type == "Agent" and sender_id and sender_id == agent_id:
+        return "assistant"
+    return "user"
+
+
+def _seedable_text(
+    item: Any, participants: List[Dict[str, Any]]
+) -> Optional[tuple]:
+    """Parse a Band context item into ``(sender_type, sender_id, sender_name,
+    clean_text)``, or None to skip it.
+
+    Single definition of "which context items carry replayable text and how
+    their content is cleaned" (skip non-text and empty; render ``@[[uuid]]``
+    mentions to ``@handle``). Shared by the durable seed (``_build_seed_rows``)
+    and the legacy blob (``_rehydration_context_blob``) so the two never drift.
+    """
+    if (getattr(item, "message_type", "text") or "text") != "text":
+        return None
+    text = (getattr(item, "content", None) or "").strip()
+    if not text:
+        return None
+    return (
+        getattr(item, "sender_type", "") or "",
+        getattr(item, "sender_id", None),
+        getattr(item, "sender_name", None),
+        replace_uuid_mentions(text, participants),
+    )
+
+
+def _seed_epoch(inserted_at: Any) -> float:
+    """Best-effort Unix-epoch float for a row's ``timestamp`` column.
+
+    Band timestamps are datetimes; the gateway stores ``timestamp REAL`` as a
+    Unix epoch. Fall back to "now" when the value is missing or unparseable so a
+    seeded row is never dropped over a timestamp quirk.
+    """
+    try:
+        return float(inserted_at.timestamp())
+    except (AttributeError, TypeError, ValueError, OSError):
+        return time.time()
+
+
+def _can_seed_sessions(store: Any) -> bool:
+    """Whether the store can resolve a room's session and read its transcript.
+
+    The minimum needed to detect a cold room and target the durable seed. The
+    *write* is done atomically via ``_atomic_seed_transcript`` (gateway-native
+    primitive or the SessionDB write executor); an older gateway with neither
+    degrades gracefully to the one-shot ``channel_context`` blob.
+    """
+    return store is not None and all(
+        hasattr(store, method)
+        for method in ("get_or_create_session", "load_transcript")
+    )
+
+
+# The ``messages`` columns a transcript row carries, in the order the gateway's
+# own ``SessionDB.replace_messages`` inserts them. Mirrored verbatim so a seeded
+# row is byte-identical to a gateway-written one (and FTS index triggers fire
+# the same way).
+_MESSAGE_COLUMNS = (
+    "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
+    "timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
+    "reasoning_details", "codex_reasoning_items", "codex_message_items",
+    "platform_message_id", "observed",
+)
+
+
+def _atomic_seed_transcript(
+    store: Any, session_id: str, rows: List[Dict[str, Any]]
+) -> Optional[bool]:
+    """Atomically seed ``rows`` into a session *iff its transcript is empty*.
+
+    Returns True when rows were written, False when the session was already
+    non-empty (no-op), or ``None`` when the store can't perform an atomic write
+    (the caller then falls back to the ``channel_context`` blob).
+
+    Prefers a gateway-native ``seed_transcript_if_empty`` when present. Otherwise
+    drives ``SessionDB._execute_write`` directly: a single ``BEGIN IMMEDIATE``
+    transaction doing ``SELECT COUNT`` then the inserts, so it is atomic against
+    a concurrent turn-append on another thread — no check-then-act window, no
+    clobber. The INSERT mirrors ``SessionDB.replace_messages`` (same columns,
+    ``_encode_content``, count upkeep) so FTS triggers and ``message_count`` stay
+    consistent. The COUNT is scoped to ``active = 1`` — the same rows the gateway
+    replays via ``load_transcript`` — so a session whose history was soft-deleted
+    by a rewind/undo (rows flipped to ``active = 0``) still counts as empty and
+    gets seeded. It uses the raw connection (not ``store._db.message_count``,
+    which would re-enter ``_db``'s non-reentrant lock and deadlock).
+    """
+    native = getattr(store, "seed_transcript_if_empty", None)
+    if native is not None:
+        return bool(native(session_id, rows))
+
+    db = getattr(store, "_db", None)
+    if db is None or not hasattr(db, "_execute_write") or not hasattr(db, "_encode_content"):
+        return None
+
+    def _do(conn: Any) -> bool:
+        # Count only ACTIVE rows — the same view the gateway replays via
+        # load_transcript (get_messages_as_conversation filters active=1). A
+        # rewind/undo soft-deletes rows (active=0); counting all rows would treat
+        # such a session as non-empty and skip the seed, yet the caller maps that
+        # False to "handled" and skips the blob too, so the room would answer cold.
+        (existing,) = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1",
+            (session_id,),
+        ).fetchone()
+        if existing:
+            return False
+        placeholders = ", ".join(["?"] * len(_MESSAGE_COLUMNS))
+        insert = f"INSERT INTO messages ({', '.join(_MESSAGE_COLUMNS)}) VALUES ({placeholders})"
+        now = time.time()
+        total = 0
+        tool_calls_total = 0
+        for msg in rows:
+            role = msg.get("role", "unknown")
+            tool_calls = msg.get("tool_calls")
+            ts = msg.get("timestamp")
+            try:
+                ts = (
+                    float(ts.timestamp())
+                    if hasattr(ts, "timestamp")
+                    else (float(ts) if ts is not None else now)
+                )
+            except (TypeError, ValueError):
+                ts = now
+            conn.execute(
+                insert,
+                (
+                    session_id,
+                    role,
+                    db._encode_content(msg.get("content")),
+                    msg.get("tool_call_id"),
+                    json.dumps(tool_calls) if tool_calls is not None else None,
+                    msg.get("tool_name"),
+                    ts,
+                    msg.get("token_count"),
+                    msg.get("finish_reason"),
+                    msg.get("reasoning") if role == "assistant" else None,
+                    msg.get("reasoning_content") if role == "assistant" else None,
+                    None,
+                    None,
+                    None,
+                    msg.get("platform_message_id") or msg.get("message_id"),
+                    1 if msg.get("observed") else 0,
+                ),
+            )
+            total += 1
+            if tool_calls is not None:
+                tool_calls_total += (
+                    len(tool_calls) if isinstance(tool_calls, list) else 1
+                )
+        conn.execute(
+            "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+            (total, tool_calls_total, session_id),
+        )
+        return True
+
+    return db._execute_write(_do)
+
+
+@dataclass
+class _Inbound:
+    """A normalized inbound Band message (after the leading self-mention strip)."""
+
+    payload: Any
+    room_id: str
+    msg_id: Optional[str]
+    content: str
+    message_type: str
+    sender_id: Optional[str]
+    sender_type: str
+    sender_name: Optional[str]
+
+
 class BandAdapter(BasePlatformAdapter):
     """Async Band adapter implementing the BasePlatformAdapter interface.
 
@@ -279,19 +480,16 @@ class BandAdapter(BasePlatformAdapter):
 
         extra = getattr(config, "extra", {}) or {}
 
-        # Credentials: extra (seeded by _env_enablement) with os.getenv fallback.
-        # Strip whitespace to match _env_enablement (avoids cfg/enablement drift).
+        # ── Credentials & config (env wins over PlatformConfig.extra; stripped
+        #    to match _env_enablement and avoid cfg/enablement drift) ──
         self._cfg_agent_id = (os.getenv("BAND_AGENT_ID") or extra.get("agent_id", "")).strip()
         self._api_key = (os.getenv("BAND_API_KEY") or extra.get("api_key", "")).strip()
         self._base_url = (os.getenv("BAND_BASE_URL") or extra.get("base_url", "")).strip()
-
-        # Owner UUID override — normally resolved from the agent identity on
-        # connect. Anchors the hub (owner control room) and the command gate.
+        # Owner override; else resolved from agent identity on connect. Anchors
+        # the hub (owner control room) and the command gate.
         self._owner_uuid = os.getenv("BAND_OWNER_ID") or extra.get("owner_id", "") or None
-
-        # Hub (owner control room) — pinned id from env/extra, else resolved or
-        # created by _ensure_hub() on connect. The hub is the platform home
-        # channel (cron / notification deliveries land there by default).
+        # Hub room — pinned id from env/extra, else created by _ensure_hub() on
+        # connect; it's the platform home channel (cron/notifications land there).
         self._hub_room_id: Optional[str] = (
             str(os.getenv("BAND_HUB_ROOM") or extra.get("hub_room", "") or "").strip()
             or None
@@ -299,81 +497,57 @@ class BandAdapter(BasePlatformAdapter):
         # Rooms already given the one-time "commands are owner-only" notice.
         self._cmd_notice_rooms: set = set()
 
-        # Effective access policy advertised to the gateway's authorization gate.
-        #
-        # ``enforces_own_access_policy`` (below) is necessary but NOT sufficient on
-        # the released host: ``gateway.authz_mixin._is_user_authorized`` only
-        # trusts an own-policy adapter's intake when its *effective policy* for the
-        # chat type is literally ``"allowlist"`` (the #34515 fail-open fix — a
-        # flag of True with an ``"open"`` policy would admit the whole network).
-        # Band has no DMs, so every source is ``chat_type="group"`` and the host
-        # reads ``_group_policy``; we pin both to ``"allowlist"`` because Band's
-        # own platform ACL *is* the allowlist — a message only reaches us if Band
-        # already admitted the sender. Without this, a fresh install (just
-        # BAND_AGENT_ID + BAND_API_KEY) default-denies every sender, including the
-        # owner, and the agent replies "not an authorized user".
+        # ── Access policy ──
+        # Pinned to "allowlist" so the host's authz gate trusts our own-policy
+        # intake — Band's platform ACL *is* the allowlist. Full rationale in
+        # enforces_own_access_policy.
         self._dm_policy = "allowlist"
         self._group_policy = "allowlist"
 
-        # Runtime state
+        # ── Link & lifecycle ──
         self._link: Optional[Any] = None
-        # The event loop connect() opened the link on. The link's phoenix
-        # websocket primitives (asyncio.Event/Future) bind to it, so a send()
-        # invoked from a *different* loop — e.g. the gateway's startup-restore
-        # replay path — is marshalled back onto it instead of raising
-        # "<Event> is bound to a different event loop" (INT-899).
+        # Loop the link's asyncio primitives bind to; a cross-loop send() is
+        # marshalled back onto it rather than raising (see _send_on_link).
         self._link_loop: Optional[asyncio.AbstractEventLoop] = None
         self._consumer_task: Optional[asyncio.Task] = None
-        # Background /next catch-up drain (Route A). Started on connect and on
-        # every link reconnect to pull messages missed while the agent was
-        # offline; cancelled on disconnect.
+        # Background /next catch-up drain (Route A), (re)started on connect.
         self._catch_up_task: Optional[asyncio.Task] = None
-        # The agent's own UUID + handle, resolved from get_agent_me on connect.
-        # ``_cfg_agent_id`` is the configured id used to open the link; the
-        # resolved ``_agent_id`` is authoritative for self-filtering.
+        # Per-room re-join drains, held so the tasks aren't GC'd mid-flight.
+        self._room_catch_up_tasks: set = set()
+        # One-time guard for the session-isolation misconfig warning.
+        self._warned_session_isolation: bool = False
+
+        # ── Identity (resolved from get_agent_me on connect) ──
+        # _cfg_agent_id opens the link; the resolved _agent_id is authoritative
+        # for self-filtering.
         self._agent_id: str = self._cfg_agent_id
         self._handle: str = ""
 
-        # Room membership is two disjoint sets — a room is in at most one:
-        #   _known_rooms : rooms the agent currently belongs to (subscribed; the
-        #                  only set the catch-up drain iterates).
-        #   _left_rooms  : rooms it has since left (room_removed/room_deleted),
-        #                  dropped from _known_rooms so a long-lived agent
-        #                  cycling through many rooms can't grow it without
-        #                  bound, and kept here only as capped re-join memory.
-        # Invariant: a ``room_added`` for a room in *either* set is a *re-join*
-        # (its local session was reset on the prior leave), so it is flagged for
-        # context rehydration; a room in neither is brand new.
+        # ── Room tracking ──
+        # Disjoint sets: _known_rooms (currently joined — the only set the drain
+        # iterates) and _left_rooms (capped re-join memory). A room_added for a
+        # room in EITHER is a re-join → flagged in _rehydrate_rooms for a one-time
+        # context rebuild from Band, consumed once.
         self._known_rooms: set = set()
         self._left_rooms: set = set()
-        # Re-joined rooms whose next inbound message should pull recent Band
-        # context into MessageEvent.channel_context (consumed once, then cleared).
         self._rehydrate_rooms: set = set()
 
-        # Per-room participant cache: room_id -> list[{id, name, handle, type}].
-        self._participants_cache: Dict[str, List[Dict[str, Any]]] = {}
-        # Per-room last human sender: room_id -> {"id", "handle", "name"}.
-        # Used to build mandatory mentions when replying.
-        self._last_human_sender: Dict[str, Dict[str, Any]] = {}
+        # ── Per-room caches ──
+        self._participants_cache: Dict[str, List[Dict[str, Any]]] = {}  # id/name/handle/type
+        self._last_human_sender: Dict[str, Dict[str, Any]] = {}  # for reply @mentions
 
-        # Sent-message id backstop: ids we posted, so the consumer can drop the
-        # platform's echo even if SDK-side self-filtering misses it.
+        # ── Dedup backstops ──
+        # _sent_ids: our own posts, to drop the platform's echo. _seen_inbound_ids:
+        # ids dispatched this lifetime, guarding the live-vs-catch-up race and
+        # server re-offers (NOT persisted — after restart the server cursor wins).
         self._sent_ids: set = set()
-
-        # Inbound-message ids already dispatched THIS process-lifetime. Guards
-        # the narrow live-vs-catch-up race (a message both live-delivered and in
-        # the /next backlog at reconnect) and any server re-offer from
-        # double-processing. Intentionally NOT persisted: after a restart the
-        # server cursor is authoritative and a re-offer SHOULD re-process.
         self._seen_inbound_ids: set = set()
 
-        # Hub failover: when the hub room repeatedly rejects sends (e.g. it hit
-        # its Band message limit, or it's persistently erroring) the adapter
-        # creates a fresh owner room and re-wires it as the main channel.
-        # ``_hub_send_failures`` counts *consecutive* failed hub sends and is
-        # reset by any successful hub send; reaching the threshold triggers a
-        # failover. ``_failover_in_progress`` guards the async failover against
-        # reentrancy, and ``_hub_failovers_done`` caps failovers per connect.
+        # ── Hub failover ──
+        # On repeated hub-send failures (message limit / persistent error) create
+        # a fresh owner room and re-wire it as the main channel. _hub_send_failures
+        # counts CONSECUTIVE failures (reset on success); _failover_in_progress
+        # guards reentrancy; _hub_failovers_done caps failovers per connect.
         self._hub_failover_threshold = _int_env(
             "BAND_HUB_FAILOVER_THRESHOLD", _HUB_FAILOVER_THRESHOLD_DEFAULT
         )
@@ -426,101 +600,24 @@ class BandAdapter(BasePlatformAdapter):
 
     async def connect(self) -> bool:
         """Open the Band link, resolve identity, subscribe, start consuming."""
-        # Reset per-connect hub failover state so a reconnect starts clean.
-        self._hub_send_failures = 0
-        self._failover_in_progress = False
-        self._hub_failovers_done = 0
-
-        if not BAND_AVAILABLE:
-            missing_sdk_msg = (
-                "band-sdk not installed. Directory plugin installs do not install "
-                "Python dependencies; install into the gateway Python with: "
-                "uv pip install --python <gateway-python> 'band-sdk>=1.0.0,<2.0.0'"
-            )
-            logger.error(
-                "[band] %s",
-                missing_sdk_msg,
-            )
-            self._set_fatal_error(
-                "dependency_missing",
-                missing_sdk_msg,
-                retryable=False,
-            )
+        self._reset_failover_state()
+        if not self._preflight_ok():
             return False
-
-        if not self._cfg_agent_id or not self._api_key:
-            logger.error("[band] BAND_AGENT_ID and BAND_API_KEY must be set")
-            self._set_fatal_error(
-                "config_missing",
-                "BAND_AGENT_ID and BAND_API_KEY must be set",
-                retryable=False,
-            )
+        if not self._acquire_agent_lock():
             return False
-
-        # Prevent two profiles from driving the same Band agent identity.
-        # Best-effort: skip gracefully if the scoped-lock helper isn't present
-        # (e.g. in some test harnesses).
-        try:
-            from gateway.status import acquire_scoped_lock
-
-            acquired, existing = acquire_scoped_lock(
-                "band", self._cfg_agent_id, metadata={"platform": "band"}
-            )
-            if not acquired:
-                owner_pid = existing.get("pid") if isinstance(existing, dict) else None
-                msg = (
-                    f"Band agent {_short_id(self._cfg_agent_id)} already in use"
-                    + (f" (PID {owner_pid})" if owner_pid else "")
-                    + ". Stop the other gateway first."
-                )
-                logger.error("[band] %s", msg)
-                self._set_fatal_error("band_lock", msg, retryable=False)
-                return False
-            self._lock_identity = self._cfg_agent_id
-        except ImportError:
-            self._lock_identity = None
 
         ws_url, rest_url = _derive_urls(self._base_url)
-
         try:
             self._link = BandLink(self._cfg_agent_id, self._api_key, ws_url, rest_url)
             await self._link.connect()
-            # Pin the loop the link (and its asyncio primitives) live on, so a
-            # cross-loop send() can be marshalled back here rather than failing.
+            # Pin the loop the link's asyncio primitives bind to, so a cross-loop
+            # send() (e.g. the gateway's startup-restore replay) is marshalled
+            # back here rather than raising — see _send_on_link.
             self._link_loop = asyncio.get_running_loop()
-
-            # Resolve identity — the authoritative agent UUID + handle + owner.
-            me = await self._link.rest.agent_api_identity.get_agent_me(
-                request_options=DEFAULT_REQUEST_OPTIONS,
-            )
-            agent = getattr(me, "data", None)
-            if agent is not None:
-                self._agent_id = getattr(agent, "id", None) or self._cfg_agent_id
-                self._handle = getattr(agent, "handle", "") or ""
-                # Owner used later for guardrails — store it now (env override wins).
-                self._owner_uuid = self._owner_uuid or getattr(agent, "owner_uuid", None)
-                # Persist so the owner is durable and visible to OUT-OF-PROCESS
-                # callers (standalone cron senders have no gateway runner ref, so
-                # _owner_identity() falls back to BAND_OWNER_ID) and to fresh
-                # config loads. Mirrors _persist_hub_room / BAND_HOME_ROOM.
-                if self._owner_uuid:
-                    self._persist_owner(self._owner_uuid)
-
-            # Subscribe to agent-level room events (room_added / room_removed).
+            await self._resolve_identity()
             await self._link.subscribe_agent_rooms(self._cfg_agent_id)
-
-            # Subscribe to rooms already known to the server so we relay messages
-            # in existing rooms without waiting for a room_added event.
             await self._subscribe_known_rooms()
-
-            # Ensure the owner hub exists and is wired as the main channel.
-            # Best-effort: a hub failure must never block messaging (the
-            # command gate then stays fail-closed instead).
-            try:
-                await self._ensure_hub()
-            except Exception as e:
-                logger.warning("[band] Hub bootstrap failed — continuing without hub: %s", e)
-
+            await self._bootstrap_hub_safe()
             self._consumer_task = asyncio.create_task(self._consume())
             self._mark_connected()
             logger.info(
@@ -529,17 +626,101 @@ class BandAdapter(BasePlatformAdapter):
                 self._handle or "<unknown>",
                 _short_id(self._owner_uuid),
             )
-            # Route A catch-up: drain each known room's server-side backlog of
-            # messages missed while offline. Runs in the background so a large
-            # backlog never delays connect() or blocks the live consumer.
+            # Background drain of each known room's offline backlog (Route A);
+            # never delays connect() or blocks the live consumer.
             self._schedule_catch_up()
             return True
         except Exception as e:
             logger.error("[band] Failed to connect: %s", e)
             self._set_fatal_error("connect_failed", str(e), retryable=True)
-            # Release the lock we may have taken so a retry isn't blocked.
-            self._release_lock()
+            self._release_lock()  # so a retry isn't blocked by our own lock
             return False
+
+    def _reset_failover_state(self) -> None:
+        """Clear per-connect hub-failover counters so a reconnect starts clean."""
+        self._hub_send_failures = 0
+        self._failover_in_progress = False
+        self._hub_failovers_done = 0
+
+    def _preflight_ok(self) -> bool:
+        """Require the SDK to be installed and credentials present (fail-closed)."""
+        if not BAND_AVAILABLE:
+            msg = (
+                "band-sdk not installed. Directory plugin installs do not install "
+                "Python dependencies; install into the gateway Python with: "
+                "uv pip install --python <gateway-python> 'band-sdk>=1.0.0,<2.0.0'"
+            )
+            logger.error("[band] %s", msg)
+            self._set_fatal_error("dependency_missing", msg, retryable=False)
+            return False
+        if not self._cfg_agent_id or not self._api_key:
+            logger.error("[band] BAND_AGENT_ID and BAND_API_KEY must be set")
+            self._set_fatal_error(
+                "config_missing",
+                "BAND_AGENT_ID and BAND_API_KEY must be set",
+                retryable=False,
+            )
+            return False
+        return True
+
+    def _acquire_agent_lock(self) -> bool:
+        """Take the scoped lock so two profiles can't drive the same Band agent.
+
+        Best-effort: if the gateway lock helper isn't importable (some test
+        harnesses), proceed unlocked. Returns False (fatal) only on a real
+        conflict with another live holder.
+        """
+        try:
+            from gateway.status import acquire_scoped_lock
+        except ImportError:
+            self._lock_identity = None
+            return True
+        acquired, existing = acquire_scoped_lock(
+            "band", self._cfg_agent_id, metadata={"platform": "band"}
+        )
+        if not acquired:
+            owner_pid = existing.get("pid") if isinstance(existing, dict) else None
+            msg = (
+                f"Band agent {_short_id(self._cfg_agent_id)} already in use"
+                + (f" (PID {owner_pid})" if owner_pid else "")
+                + ". Stop the other gateway first."
+            )
+            logger.error("[band] %s", msg)
+            self._set_fatal_error("band_lock", msg, retryable=False)
+            return False
+        self._lock_identity = self._cfg_agent_id
+        return True
+
+    async def _resolve_identity(self) -> None:
+        """Resolve the authoritative agent UUID + handle + owner via get_agent_me.
+
+        Persists the owner so it's durable for out-of-process callers (cron
+        senders fall back to BAND_OWNER_ID) and fresh config loads.
+        """
+        me = await self._link.rest.agent_api_identity.get_agent_me(
+            request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+        agent = getattr(me, "data", None)
+        if agent is None:
+            return
+        self._agent_id = getattr(agent, "id", None) or self._cfg_agent_id
+        self._handle = getattr(agent, "handle", "") or ""
+        self._owner_uuid = self._owner_uuid or getattr(agent, "owner_uuid", None)
+        if self._owner_uuid:
+            self._persist_owner(self._owner_uuid)
+
+    async def _bootstrap_hub_safe(self) -> None:
+        """Ensure the owner hub exists and is the main channel — never fatal.
+
+        A hub failure must not block messaging; the command gate then stays
+        fail-closed instead.
+        """
+        try:
+            await self._ensure_hub()
+        except Exception as e:
+            logger.warning(
+                "[band] Hub bootstrap failed — continuing without hub: %s", e
+            )
 
     async def _subscribe_known_rooms(self) -> None:
         """Subscribe to rooms the agent is already a participant of.
@@ -584,6 +765,17 @@ class BandAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("[band] Catch-up task raised on shutdown: %s", e)
         self._catch_up_task = None
+
+        # Cancel any per-room re-join drains (scheduled by _schedule_room_catch_up)
+        # so a stale drain can't outlive the link and resume against a freshly
+        # reconnected one. The done-callback discards each from the set as it
+        # settles; snapshot first, then await the cancellations.
+        room_tasks = [t for t in self._room_catch_up_tasks if not t.done()]
+        for task in room_tasks:
+            task.cancel()
+        if room_tasks:
+            await asyncio.gather(*room_tasks, return_exceptions=True)
+        self._room_catch_up_tasks.clear()
 
         if self._consumer_task and not self._consumer_task.done():
             self._consumer_task.cancel()
@@ -905,10 +1097,20 @@ class BandAdapter(BasePlatformAdapter):
                 if room_id in self._known_rooms or room_id in self._left_rooms:
                     self._left_rooms.discard(room_id)
                     self._known_rooms.add(room_id)
-                    self._rehydrate_rooms.add(room_id)
+                    # Only a genuinely cold room needs rehydration. A spurious
+                    # room_added for a room with a live session (e.g. a
+                    # server-side re-subscribe replay, which arrives after the
+                    # connect-time pre-subscribe populated _known_rooms) must not
+                    # re-inject stale history over good local state.
+                    if not self._has_active_session(room_id):
+                        self._rehydrate_rooms.add(room_id)
+                        # Rehydration's two halves must fire together: the seed
+                        # excludes the unprocessed backlog on the assumption a
+                        # drain answers it. (Re)connect runs both; a live re-join
+                        # otherwise sets only the flag, so drain this room too.
+                        self._schedule_room_catch_up(room_id)
                     logger.debug(
-                        "[band] Re-joined known room %s — flagged for rehydration",
-                        _short_id(room_id),
+                        "[band] Re-joined known room %s", _short_id(room_id)
                     )
                 else:
                     self._known_rooms.add(room_id)
@@ -948,22 +1150,19 @@ class BandAdapter(BasePlatformAdapter):
         rebuilds context from the room's own server-side state (rehydration)
         rather than silently resuming stale history. Every Band room keys to a
         single ``_SESSION_CHAT_TYPE`` session (see the constant), so there is
-        exactly one key to reset — no per-room chat-type bookkeeping, and
-        ``group_sessions_per_user=False`` matches Band's locked one-channel model.
+        exactly one key to reset. The key is derived via the shared
+        ``_session_key_for`` so it matches exactly what the gateway/seed use —
+        otherwise, on a gateway whose ``group_sessions_per_user``/profile differs
+        from the old hard-coded assumption, the reset would target the wrong key
+        and silently fail, letting stale history resume on re-join.
         """
         store = getattr(self, "_session_store", None)
         if not store:
             return
         try:
-            key = build_session_key(
-                SessionSource(
-                    platform=self.platform,
-                    chat_id=room_id,
-                    chat_type=_SESSION_CHAT_TYPE,
-                ),
-                group_sessions_per_user=False,
-            )
-            store.reset_session(key)
+            key = self._session_key_for(room_id)
+            if key is not None:
+                store.reset_session(key)
         except Exception:
             pass
 
@@ -1005,154 +1204,139 @@ class BandAdapter(BasePlatformAdapter):
         )
 
     async def _handle_message_created(self, event: Any) -> bool:
-        """Normalize an inbound Band message into a Hermes MessageEvent.
+        """Normalize an inbound Band message and forward it to the gateway.
 
-        Returns ``True`` when the message was forwarded to the gateway (its ack
-        is then driven by the processing-lifecycle hooks), ``False`` when it was
-        filtered/dropped. The caught-up drain uses this to decide whether to
-        make a drained message terminal itself (see ``_drain_room``); the live
-        consumer ignores the return value.
+        Returns ``True`` when forwarded (the ack is then driven by the
+        processing-lifecycle hooks), ``False`` when filtered/dropped — the
+        caught-up drain uses this to decide whether to terminally-ack a dropped
+        message (see ``_drain_room``); the live consumer ignores the return.
         """
-        payload = getattr(event, "payload", None)
-        if payload is None:
+        inb = self._normalize_inbound(event)
+        if inb is None:
             return False
 
-        room_id = getattr(event, "room_id", None) or getattr(payload, "chat_room_id", None)
-        if not room_id:
+        # Self-filter: our own posts (and any platform echo of them) are never
+        # offered by /next, so just drop — nothing to ack.
+        if inb.sender_type == "Agent" and inb.sender_id == self._agent_id:
             return False
-
-        msg_id = getattr(payload, "id", None)
-        content = getattr(payload, "content", None) or ""
-        # Band embeds the addressed mention inline at the FRONT of the content
-        # (``@[[<agent-id>]] /help``). The gateway detects slash commands with
-        # ``text.startswith("/")``, so strip our own leading self-mention here —
-        # otherwise an addressed command never dispatches (the mention precedes
-        # the slash). Also de-noises ordinary prose.
-        content = self._strip_self_mention(content)
-        message_type = getattr(payload, "message_type", "") or ""
-        sender_id = getattr(payload, "sender_id", None)
-        sender_type = getattr(payload, "sender_type", "") or ""
-        sender_name = getattr(payload, "sender_name", None)
-
-        # Self-filter: skip our own agent messages (primary), and use the
-        # sent-id set as a backstop in case the platform echoes a post we made.
-        # Neither is offered by /next (the agent's own posts don't @mention it),
-        # so there is nothing to ack — just drop.
-        if sender_type == "Agent" and sender_id == self._agent_id:
+        if inb.msg_id and inb.msg_id in self._sent_ids:
             return False
-        if msg_id and msg_id in self._sent_ids:
-            return False
-
-        # Inbound dedup: if we already forwarded this id this process-lifetime
-        # (live-vs-catch-up race, or a server re-offer), its first turn owns the
-        # ack — don't double-process. Report it as forwarded so the drain leaves
-        # settling to that first turn.
-        if msg_id and msg_id in self._seen_inbound_ids:
+        # Inbound dedup: already forwarded this id this lifetime (live-vs-catch-up
+        # race / server re-offer) → its first turn owns the ack. Report forwarded
+        # so the drain leaves settling to that turn.
+        if inb.msg_id and inb.msg_id in self._seen_inbound_ids:
             return True
-
-        # Only relay user/text content. tool_call / thought / tool_result /
-        # error / task etc. are event-type messages, not conversational text.
-        # /next returns text only, so these never appear in a drain.
-        if message_type and message_type != "text":
+        # Only conversational text reaches the agent — tool/thought/task etc. are
+        # event rows, and /next returns text only, so these never appear in a drain.
+        if inb.message_type and inb.message_type != "text":
             logger.debug(
                 "[band] Skipping non-text message_type=%s in room %s",
-                message_type,
-                _short_id(room_id),
+                inb.message_type,
+                _short_id(inb.room_id),
             )
             return False
 
-        # Participants drive @mention-handle resolution and last-human-sender
-        # tracking (fetched on first sight). chat_type is NOT derived from them:
-        # every Band room is one shared, mention-gated session keyed on room_id
-        # (see _SESSION_CHAT_TYPE) so the conversation can't re-key when the
-        # roster changes.
-        participants = await self._get_participants(room_id)
-        chat_type = _SESSION_CHAT_TYPE
-
-        # Track the last human sender so replies can @mention them (mentions are
-        # mandatory on send).
-        if sender_id and sender_type != "Agent":
-            handle = self._handle_for_participant(participants, sender_id)
-            self._last_human_sender[room_id] = {
-                "id": sender_id,
-                "handle": handle,
-                "name": sender_name,
+        # Participants drive @mention resolution + last-human-sender. chat_type is
+        # the constant _SESSION_CHAT_TYPE, so a roster change can never re-key the
+        # room's single shared session.
+        participants = await self._get_participants(inb.room_id)
+        if inb.sender_id and inb.sender_type != "Agent":
+            self._last_human_sender[inb.room_id] = {
+                "id": inb.sender_id,
+                "handle": self._handle_for_participant(participants, inb.sender_id),
+                "name": inb.sender_name,
             }
             self._cap_cache(self._last_human_sender, _ROOM_CACHE_MAX)
 
-        # Owner command gate: slash commands are accepted ONLY from the owner,
-        # in any Band room. Command-shaped text from anyone else is dropped
-        # here — before the gateway ever sees it — silently for other agents
-        # (a notice would invite bot↔bot ping-pong), with a one-time per-room
-        # notice for humans. Fail-closed: no resolved owner means no Band
-        # slash commands at all. Plain chat is unaffected (runs after the
-        # last-human-sender update so the notice can @mention the sender).
-        is_command = self._is_command_text(content)
-        if is_command and not self._is_owner_command(sender_id):
-            if sender_type != "Agent":
-                await self._notify_command_blocked(room_id)
-            # A blocked command is command-shaped @mention text, so /next WOULD
-            # re-offer it. We've adjudicated it (dropped) — mark it processed so
-            # the server cursor advances and it isn't redelivered on reconnect.
-            await self._ack_consumed(room_id, msg_id)
+        # Owner-command gate: slash commands are owner-only, in any room. Others'
+        # command-shaped text is dropped here (one-time notice for humans, silent
+        # for agents to avoid bot↔bot ping-pong); fail-closed when no owner is
+        # resolved. Runs after the last-sender update so a notice can @mention them.
+        is_command = self._is_command_text(inb.content)
+        if is_command and not self._is_owner_command(inb.sender_id):
+            if inb.sender_type != "Agent":
+                await self._notify_command_blocked(inb.room_id)
+            # /next would re-offer this @mention text — ack so it isn't redelivered.
+            await self._ack_consumed(inb.room_id, inb.msg_id)
             return False
 
-        # Gating: Band has no DMs — every room is a mention-gated group room, so
-        # the agent wakes ONLY when it's @mentioned. The platform already routes
-        # by mention (/next offers only mentioned messages); we mirror that on the
-        # live path rather than inventing our own routing — no hub bypass, no
-        # active-session stickiness, so live and catch-up behave identically. The
-        # one always-pass case is a validated owner slash command (any
-        # command-shaped text still here has cleared the owner gate above), so the
-        # owner never has to @mention the agent to run a command.
-        if not (is_command or self._is_agent_mentioned(payload)):
+        # Mention gate: every Band room is mention-gated (no DMs), so wake only on
+        # an @mention — mirroring /next, which offers mentioned messages only. A
+        # validated owner command always passes (no @mention required).
+        if not (is_command or self._is_agent_mentioned(inb.payload)):
             logger.debug(
-                "[band] Ignoring un-addressed message in room %s",
-                _short_id(room_id),
+                "[band] Ignoring un-addressed message in room %s", _short_id(inb.room_id)
             )
-            # Not an @mention, so /next never offers it (its filter is
-            # mention-only) — nothing to ack, just drop.
             return False
-
-        room_name = self._room_name_for(room_id) or room_id
 
         source = self.build_source(
-            chat_id=room_id,
-            chat_name=room_name,
-            chat_type=chat_type,
-            user_id=sender_id,
-            user_name=sender_name,
-            thread_id=None,  # Band uses rooms, not threads — always None.
+            chat_id=inb.room_id,
+            chat_name=self._room_name_for(inb.room_id) or inb.room_id,
+            chat_type=_SESSION_CHAT_TYPE,
+            user_id=inb.sender_id,
+            user_name=inb.sender_name,
+            thread_id=None,  # Band uses rooms, not threads.
+        )
+        return await self._forward_inbound(inb, source, is_command)
+
+    def _normalize_inbound(self, event: Any) -> Optional[_Inbound]:
+        """Extract a normalized inbound message, or None if it lacks payload/room.
+
+        Band prepends the addressed self-mention inline (``@[[agent]] /help``);
+        strip it so a leading slash-command is detected and prose is de-noised.
+        """
+        payload = getattr(event, "payload", None)
+        if payload is None:
+            return None
+        room_id = getattr(event, "room_id", None) or getattr(
+            payload, "chat_room_id", None
+        )
+        if not room_id:
+            return None
+        return _Inbound(
+            payload=payload,
+            room_id=room_id,
+            msg_id=getattr(payload, "id", None),
+            content=self._strip_self_mention(getattr(payload, "content", None) or ""),
+            message_type=getattr(payload, "message_type", "") or "",
+            sender_id=getattr(payload, "sender_id", None),
+            sender_type=getattr(payload, "sender_type", "") or "",
+            sender_name=getattr(payload, "sender_name", None),
         )
 
-        # Rehydration: if this room is flagged — re-joined (room_removed reset
-        # its session) or returning with no local session (agent restart / lost
-        # DB, flagged by _catch_up_all_rooms) — pull recent agent-relevant Band
-        # context into channel_context so the session rebuilds from the room's
-        # server-side state rather than empty history. Best-effort — never block
-        # the message on a hydration failure; the flag is consumed once
-        # regardless so we don't refetch on every subsequent message.
-        channel_context: Optional[str] = None
-        if room_id in self._rehydrate_rooms:
-            self._rehydrate_rooms.discard(room_id)
-            channel_context = await self._fetch_rehydration_context(room_id)
+    async def _forward_inbound(
+        self, inb: _Inbound, source: Any, is_command: bool
+    ) -> bool:
+        """Build the ``MessageEvent`` and hand it to the gateway.
 
-        if msg_id:
-            self._seen_inbound_ids.add(msg_id)
+        Commands dispatch immediately and skip the seed (they may inline-await in
+        the gateway — e.g. /stop, /approve — and never start a fresh turn; the
+        rehydrate flag is left for the next real message). A flagged cold room
+        otherwise rebuilds context from Band first (atomic durable seed, blob
+        fallback; best-effort, flag consumed once — see _rehydrate_room).
+        """
+        if inb.msg_id:
+            self._seen_inbound_ids.add(inb.msg_id)
             if len(self._seen_inbound_ids) > _SENT_IDS_MAX:
                 for _ in range(_SENT_IDS_MAX // 2):
                     self._seen_inbound_ids.pop()
 
-        await self.handle_message(
-            MessageEvent(
-                text=content,
-                message_type=MessageType.TEXT,
-                source=source,
-                message_id=msg_id,
-                raw_message=payload,
-                channel_context=channel_context,
-            )
+        out = MessageEvent(
+            text=inb.content,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=inb.msg_id,
+            raw_message=inb.payload,
         )
+        if is_command:
+            await self.handle_message(out)
+            return True
+        if inb.room_id in self._rehydrate_rooms:
+            self._rehydrate_rooms.discard(inb.room_id)
+            out.channel_context = await self._rehydrate_room(
+                source, inb.room_id, inb.msg_id
+            )
+        await self.handle_message(out)
         return True
 
     # ── Route A: server-cursor ack + missed-message catch-up ──────────────
@@ -1240,18 +1424,45 @@ class BandAdapter(BasePlatformAdapter):
             return
         self._catch_up_task = asyncio.create_task(self._catch_up_all_rooms())
 
+    def _schedule_room_catch_up(self, room_id: str) -> None:
+        """Drain one room's backlog after a live re-join.
+
+        Rehydration has two halves that MUST fire together: seeding prior
+        history (``_rehydrate_room``) and *answering* the unprocessed mention
+        backlog (this drain). The seed deliberately excludes that backlog so it
+        isn't answered twice — which is only safe if a drain actually answers
+        it. The (re)connect path runs both halves in ``_catch_up_all_rooms``; a
+        live ``room_added`` re-join only sets the flag, so without this the
+        excluded backlog would be neither seeded nor answered. Mirror the
+        (re)connect path here so the invariant holds for both triggers.
+
+        Always drains — we do NOT skip when an all-rooms drain is in flight.
+        That drain iterates a snapshot of the rooms known when it started, so a
+        room re-joined mid-drain would never be reached; skipping here would
+        leave its excluded mention backlog neither seeded nor answered until the
+        next reconnect. A concurrent or duplicate drain of the same room is
+        already safe: each message is ``mark_processing``-claimed before the
+        next ``/next`` fetch, and ``_seen_inbound_ids`` dedups dispatch across
+        tasks — so the simplest correct behavior is to just drain.
+        """
+        task = asyncio.create_task(self._catch_up_room(room_id))
+        self._room_catch_up_tasks.add(task)
+        task.add_done_callback(self._room_catch_up_tasks.discard)
+
     async def _catch_up_all_rooms(self) -> None:
         """Drain every known room's missed-message backlog (Route A).
 
         On (re)connect: (0) flag rooms whose local history is gone for
-        rehydration, (1) re-pick anything left 'processing' by a prior crash,
-        then (2) drain the unprocessed backlog via /next. Each message flows
-        through the same gate/normalize path as a live one and is acked via the
-        processing-lifecycle hooks. Best-effort and per-room isolated — one
-        room's failure never blocks the others or live consumption.
+        rehydration, then (1) drain each room. Best-effort and per-room
+        isolated — one room's failure never blocks the others or live
+        consumption.
         """
         if not self._link or not getattr(self, "_message_handler", None):
             return
+        self._warn_if_session_isolation_mismatch()
+        # Iterate a snapshot (list()) so a concurrent re-join mutating
+        # _known_rooms can't break iteration; that re-join gets its own drain
+        # via _schedule_room_catch_up (which never skips), so nothing is missed.
         for room_id in list(self._known_rooms):
             if not self._link:
                 return
@@ -1261,27 +1472,61 @@ class BandAdapter(BasePlatformAdapter):
             # If the room has no local session (fresh deploy, lost/migrated DB,
             # or first run after the agent was down), flag it so the next message
             # we process — stale sweep, /next drain, or a later live event —
-            # rebuilds from the room's server-side history via
-            # _fetch_rehydration_context rather than answering the backlog cold.
-            # A room with an intact local session is skipped (its history is in
-            # the store); a room that genuinely has no history yields None and
-            # the flag clears harmlessly on first use.
+            # rebuilds from the room's server-side history via _rehydrate_room
+            # rather than answering the backlog cold. A room with an intact local
+            # session is skipped (its history is in the store); a room that
+            # genuinely has no history seeds nothing and the flag clears
+            # harmlessly on first use.
             if not self._has_active_session(room_id):
                 self._rehydrate_rooms.add(room_id)
-            # Crash recovery: /next skips messages with an active processing
-            # attempt, so stuck-'processing' ones from a prior incarnation must
-            # be swept explicitly and re-driven.
-            try:
-                stale = await self._link.get_stale_processing_messages(room_id)
-            except Exception as e:
-                stale = []
-                logger.debug(
-                    "[band] stale-processing sweep failed for room %s: %s",
-                    _short_id(room_id), e,
-                )
-            for msg in stale or []:
-                await self._dispatch_caught_up(room_id, msg)
-            await self._drain_room(room_id)
+            await self._catch_up_room(room_id)
+
+    def _warn_if_session_isolation_mismatch(self) -> None:
+        """Warn once if the gateway isolates group sessions per user.
+
+        Every Band room is a single shared channel (locked decision #5): hub
+        bootstrap, the /next drain, per-room session reset, and cold-room
+        rehydration all assume *one* session per room. That holds only when the
+        gateway's ``group_sessions_per_user`` is False. When it is True the
+        store fragments each room into per-user sessions, so per-room probes
+        (``_has_active_session``) and resets target a room-only key that the
+        per-user sessions don't use — leave-reset becomes a no-op and stale
+        history can resume on re-join. We can't change the store's config, so
+        surface the requirement loudly instead of degrading silently.
+        """
+        if self._warned_session_isolation:
+            return
+        self._warned_session_isolation = True
+        store = getattr(self, "_session_store", None)
+        cfg = getattr(store, "config", None)
+        if cfg is not None and getattr(cfg, "group_sessions_per_user", False):
+            logger.warning(
+                "[band] Gateway group_sessions_per_user=True, but Band rooms are "
+                "shared channels — per-room session reset/rehydration assume one "
+                "session per room. Set group_sessions_per_user=False for correct "
+                "behavior (sessions will otherwise fragment per user)."
+            )
+
+    async def _catch_up_room(self, room_id: str) -> None:
+        """Sweep stuck-'processing' messages, then drain one room's /next backlog.
+
+        Crash recovery: /next skips messages with an active processing attempt,
+        so stuck-'processing' ones from a prior incarnation must be swept
+        explicitly and re-driven. Best-effort — never raises to the caller.
+        """
+        if not self._link:
+            return
+        try:
+            stale = await self._link.get_stale_processing_messages(room_id)
+        except Exception as e:
+            stale = []
+            logger.debug(
+                "[band] stale-processing sweep failed for room %s: %s",
+                _short_id(room_id), e,
+            )
+        for msg in stale or []:
+            await self._dispatch_caught_up(room_id, msg)
+        await self._drain_room(room_id)
 
     async def _drain_room(self, room_id: str) -> None:
         """Pull and dispatch a room's unprocessed backlog until /next is empty.
@@ -1353,53 +1598,243 @@ class BandAdapter(BasePlatformAdapter):
             )
             return False
 
-    async def _fetch_rehydration_context(self, room_id: str) -> Optional[str]:
-        """Pull recent agent-relevant Band messages to rebuild a room's context.
+    async def _rehydrate_room(
+        self, source: Any, room_id: str, trigger_msg_id: Optional[str]
+    ) -> Optional[str]:
+        """Rebuild a cold room's context from Band's server-side history.
 
-        Used when local history is missing — a room re-join or an agent that
-        came back online with no stored session. Returns a plain-text blob
-        suitable for ``MessageEvent.channel_context``, or None when nothing
-        useful was retrieved. Best-effort: any failure is swallowed (logged at
-        debug) so a hydration miss never blocks the triggering message.
+        Preferred path: durably **seed the gateway session transcript** so the
+        recovered history persists across this turn and future restarts — Band
+        is the source of truth. Falls back to a one-shot ``channel_context``
+        text blob only when the session store can't be seeded (older gateway).
+
+        Returns the ``channel_context`` to attach to the triggering message, or
+        ``None`` when the durable seed handled it (nothing to attach).
         """
+        if await self._seed_session_from_band(source, room_id, trigger_msg_id):
+            return None
+        return await self._rehydration_context_blob(room_id)
+
+    async def _seed_session_from_band(
+        self, source: Any, room_id: str, trigger_msg_id: Optional[str]
+    ) -> bool:
+        """Seed the room's Hermes session transcript from Band history.
+
+        Returns True when the durable-seed path handled rehydration for this room
+        (so the caller skips the ``channel_context`` fallback), False when the
+        store can't perform an atomic write *or* an error prevented seeding — in
+        both of those cases the caller falls back to the one-shot blob.
+
+        The write goes through ``_atomic_seed_transcript``: a single-transaction
+        "seed only if empty", immune to a concurrent turn-append on a gateway
+        worker thread (no check-then-act window, no clobber, no partial
+        transcript). The two paginated fetches (the only ``await`` points) run
+        concurrently *before* the session is touched.
+        """
+        store = getattr(self, "_session_store", None)
+        if not _can_seed_sessions(store):
+            return False
         try:
-            ctx = await self._link.rest.agent_api_context.get_agent_chat_context(
-                chat_id=room_id,
-                request_options=DEFAULT_REQUEST_OPTIONS,
+            entry = store.get_or_create_session(source)
+            if store.load_transcript(entry.session_id):
+                # Warm session — history already present; nothing to rebuild
+                # (and skip the fetches below).
+                return True
+            # Messages the live/catch-up path will answer as their own turns
+            # (the trigger + the actionable mention backlog) must not also be
+            # seeded as history, or the agent would see them twice. Fetch the
+            # backlog ids and the context concurrently — independent reads.
+            exclude, items = await asyncio.gather(
+                self._actionable_answer_ids(room_id),
+                self._fetch_room_context(room_id),
             )
+            if trigger_msg_id:
+                exclude.add(trigger_msg_id)
+            participants = self._participants_cache.get(room_id) or []
+            rows = self._build_seed_rows(items, exclude, participants)
+            if not rows:
+                return True
+            # Atomic write: seed only if the transcript is still empty, in a
+            # single SQLite transaction. Immune to a concurrent turn-append on a
+            # gateway worker thread (no check-then-act window, no clobber). None
+            # means the store can't do an atomic write → fall back to the blob.
+            wrote = _atomic_seed_transcript(store, entry.session_id, rows)
+            if wrote is None:
+                return False
+            if wrote:
+                logger.info(
+                    "[band] Seeded %d history row(s) into room %s session",
+                    len(rows),
+                    _short_id(room_id),
+                )
+            return True
         except Exception as e:
-            logger.debug(
-                "[band] Rehydration context fetch failed for room %s: %s",
+            # Best-effort: a seed failure must never block the triggering
+            # message. Fall back to the one-shot blob (return False) — the
+            # atomic write is single-transaction, so no partial transcript is
+            # left behind. Logged at WARNING (not debug): a raised seed is not
+            # expected in normal operation — e.g. a schema drift in the atomic
+            # INSERT would otherwise silently disable durable rehydration and
+            # quietly resurrect the re-answer bug with no signal.
+            logger.warning(
+                "[band] Durable session seed failed for room %s (%s) — falling "
+                "back to one-shot context blob",
                 _short_id(room_id),
                 e,
             )
-            return None
+            return False
 
-        items = getattr(ctx, "data", None) or []
-        # Render ``@[[uuid]]`` mentions as ``@handle`` for readability when we
-        # already hold this room's participants (warm cache only — never force a
-        # fetch on this best-effort path).
+    def _build_seed_rows(
+        self,
+        items: List[Any],
+        exclude_ids: set,
+        participants: List[Dict[str, Any]],
+    ) -> List[_TranscriptRow]:
+        """Convert Band context items into transcript rows (chronological order).
+
+        Own replies become ``assistant`` turns; everyone else becomes a ``user``
+        turn prefixed ``[name]`` — mirroring how the gateway renders a live
+        shared-room message — so the model can attribute speakers and never
+        re-answers a question it already handled. Non-text items, empty content,
+        and anything in ``exclude_ids`` are skipped.
+        """
+        rows: List[_TranscriptRow] = []
+        # ``items`` is oldest-first; the gateway replays a transcript ORDER BY
+        # (timestamp, id). _seed_epoch falls back to "now" for a missing/
+        # unparseable inserted_at, which would sort such a row *after* genuine
+        # past history and scramble chronology. Clamp timestamps to be
+        # non-decreasing in list order so replay order == server order
+        # regardless of timestamp gaps (id breaks ties, preserving insertion
+        # order within an equal-timestamp run).
+        last_ts = 0.0
+        for item in items:
+            mid = getattr(item, "id", None)
+            if mid and mid in exclude_ids:
+                continue
+            parsed = _seedable_text(item, participants)
+            if parsed is None:
+                continue
+            sender_type, sender_id, sender_name, content = parsed
+            role = _seed_role_for(sender_type, sender_id, self._agent_id)
+            if role == "user":
+                content = f"[{sender_name or 'someone'}] {content}"
+            ts = _seed_epoch(getattr(item, "inserted_at", None))
+            if ts < last_ts:
+                ts = last_ts
+            last_ts = ts
+            rows.append({"role": role, "content": content, "timestamp": ts})
+        return rows
+
+    async def _paginate(
+        self,
+        endpoint: Callable[..., Any],
+        room_id: str,
+        collect: Callable[[List[Any]], None],
+        what: str,
+    ) -> None:
+        """Drive a cursor-paginated Band REST endpoint, feeding each page to
+        ``collect``. Best-effort: any failure logs at debug and stops, leaving
+        whatever was collected so far — a fetch miss never blocks the turn.
+        """
+        cursor: Optional[str] = None
+        try:
+            while True:
+                kwargs: Dict[str, Any] = {
+                    "chat_id": room_id,
+                    "request_options": DEFAULT_REQUEST_OPTIONS,
+                }
+                if cursor:
+                    kwargs["cursor"] = cursor
+                resp = await endpoint(**kwargs)
+                collect(getattr(resp, "data", None) or [])
+                cursor, has_more = self._next_page(resp)
+                if not has_more:
+                    break
+        except Exception as e:
+            logger.debug("[band] %s failed for room %s: %s", what, _short_id(room_id), e)
+
+    async def _actionable_answer_ids(self, room_id: str) -> set:
+        """Ids of messages the answer path will handle as their own turns.
+
+        These are the not-yet-``processed`` messages that @mention the agent —
+        the trigger and the offline backlog the ``/next`` drain re-answers.
+        Excluding them from the seed keeps history and answered turns disjoint
+        (no double-answer). ``list_agent_messages`` with no status filter returns
+        everything not processed (chronological, paginated); we keep the
+        mentions, since only those are ever answered.
+        """
+        ids: set = set()
+        if self._link is None:
+            return ids
+
+        def collect(page: List[Any]) -> None:
+            for msg in page:
+                mid = getattr(msg, "id", None)
+                if mid and self._is_agent_mentioned(msg):
+                    ids.add(mid)
+
+        await self._paginate(
+            self._link.rest.agent_api_messages.list_agent_messages,
+            room_id,
+            collect,
+            "Backlog enumeration",
+        )
+        return ids
+
+    async def _fetch_room_context(self, room_id: str) -> List[Any]:
+        """Page through Band's chat-context endpoint (oldest first).
+
+        This is the rehydration view — every message relevant to the agent for
+        execution context. Best-effort: any failure yields what we have so far
+        so a hydration miss never blocks the triggering message.
+        """
+        items: List[Any] = []
+        if self._link is None:
+            return items
+        await self._paginate(
+            self._link.rest.agent_api_context.get_agent_chat_context,
+            room_id,
+            items.extend,
+            "Context fetch",
+        )
+        return items
+
+    @staticmethod
+    def _next_page(resp: Any) -> tuple:
+        """Extract ``(next_cursor, has_more)`` from a paginated REST response.
+
+        Returns ``has_more=True`` only when the cursor is a real non-empty
+        string *and* the response flags more pages — so a response whose
+        ``metadata`` is absent or a test double never spins the paging loop.
+        """
+        meta = getattr(resp, "metadata", None)
+        cursor = getattr(meta, "next_cursor", None)
+        has_more = getattr(meta, "has_more", False)
+        if isinstance(cursor, str) and cursor and has_more is True:
+            return cursor, True
+        return None, False
+
+    async def _rehydration_context_blob(self, room_id: str) -> Optional[str]:
+        """Fallback: a one-shot ``channel_context`` text blob (legacy path).
+
+        Used only when the session store can't be durably seeded (older
+        gateway). Returns a plain-text transcript suitable for
+        ``MessageEvent.channel_context``, or None when nothing useful was found.
+        """
+        items = await self._fetch_room_context(room_id)
         cached_participants = self._participants_cache.get(room_id) or []
         lines: List[str] = []
         for item in items:
-            message_type = getattr(item, "message_type", "text") or "text"
-            if message_type != "text":
+            parsed = _seedable_text(item, cached_participants)
+            if parsed is None:
                 continue
-            text = getattr(item, "content", None) or ""
-            if not text.strip():
-                continue
-            who = (
-                getattr(item, "sender_name", None)
-                or getattr(item, "name", None)
-                or getattr(item, "sender_type", None)
-                or "?"
-            )
-            lines.append(f"{who}: {replace_uuid_mentions(text.strip(), cached_participants)}")
-
+            _stype, _sid, sender_name, content = parsed
+            who = sender_name or _stype or "?"
+            lines.append(f"{who}: {content}")
         if not lines:
             return None
         logger.debug(
-            "[band] Rehydrated %d context message(s) for room %s",
+            "[band] Rehydrated %d context message(s) for room %s (fallback blob)",
             len(lines),
             _short_id(room_id),
         )
@@ -1496,33 +1931,64 @@ class BandAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[band] Could not send command-gate notice: %s", e)
 
-    def _has_active_session(self, room_id: str) -> bool:
-        """Whether the room has an active Hermes session (group gating).
+    def _session_key_for(self, room_id: str) -> Optional[str]:
+        """The Hermes session key for a Band room, derived the way the store does.
 
-        Uses the session store wired onto the adapter via ``set_session_store``
-        (the same mechanism Slack uses for un-mentioned thread replies). Band
-        rooms aren't threaded, so the session key is built without a thread_id.
-        Returns False if the store isn't available.
+        Single source of key derivation for the cold-room hint
+        (``_has_active_session``) and close-on-leave reset (``_reset_room_session``)
+        so they can never diverge. Prefers the store's own
+        ``_generate_session_key`` — which matches exactly what
+        ``get_or_create_session`` (and therefore the gateway) compute, including
+        the profile namespace and the store's ``group_sessions_per_user`` setting
+        on a multiplexing gateway — and falls back to the public
+        ``build_session_key``. Returns None when no store is wired.
+        """
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return None
+        source = SessionSource(
+            platform=self.platform,
+            chat_id=room_id,
+            chat_type=_SESSION_CHAT_TYPE,
+        )
+        gen = getattr(store, "_generate_session_key", None)
+        if gen is not None:
+            return gen(source)
+        store_cfg = getattr(store, "config", None)
+        gspu = (
+            getattr(store_cfg, "group_sessions_per_user", False) if store_cfg else False
+        )
+        return build_session_key(source, group_sessions_per_user=gspu)
+
+    def _has_active_session(self, room_id: str) -> bool:
+        """Whether the room has a Hermes session with *real* history.
+
+        "Active" means a session that holds at least one transcript row — the
+        same notion the seed's idempotency guard uses (``load_transcript``
+        non-empty). Anchoring both on history (not mere session-entry presence)
+        keeps the cold-room flagging and the seed agreed: ``get_or_create_session``
+        can leave behind an *empty* entry, which must NOT count as warm or the
+        room would never be re-seeded once real history appears.
+
+        Read-only: looks up an existing entry without creating one. Falls back
+        to entry-presence when the store predates ``load_transcript``. Returns
+        False if the store isn't available.
         """
         session_store = getattr(self, "_session_store", None)
         if not session_store:
             return False
         try:
-            from gateway.session import SessionSource, build_session_key
-
-            # Use the same constant chat_type every other call site uses so this
-            # key matches how the room's session was stored. Band has one shared
-            # session per room regardless of participant count.
-            source = SessionSource(
-                platform=self.platform,
-                chat_id=room_id,
-                chat_type=_SESSION_CHAT_TYPE,
-            )
-            store_cfg = getattr(session_store, "config", None)
-            gspu = getattr(store_cfg, "group_sessions_per_user", False) if store_cfg else False
-            session_key = build_session_key(source, group_sessions_per_user=gspu)
+            session_key = self._session_key_for(room_id)
+            if session_key is None:
+                return False
             session_store._ensure_loaded()
-            return session_key in session_store._entries
+            entry = session_store._entries.get(session_key)
+            if entry is None:
+                return False
+            # History-based truth when available; else fall back to presence.
+            if hasattr(session_store, "load_transcript"):
+                return bool(session_store.load_transcript(entry.session_id))
+            return True
         except Exception:
             return False
 

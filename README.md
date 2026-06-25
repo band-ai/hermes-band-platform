@@ -423,16 +423,19 @@ whatever the agent didn't mark `processed` is still owed to it, across any outag
   conversation to a fresh session. Sender attribution is preserved in the transcript.
 - **Close on leave.** When the agent is removed from a room (`room_removed` / `room_deleted`), its
   Hermes session for that room is reset so the stale local transcript will not silently resume.
-- **Rehydrate when local history is gone.** A flagged room rebuilds context from the room's own
-  server-side state on its next turn — recent agent-relevant messages pulled via the Band
-  chat-context API and surfaced as `channel_context` — rather than from empty/stale local history.
-  Two triggers:
-    - **Room re-join** (`room_added` for a known room): close-on-leave reset the local transcript,
-      so the room is flagged to reconstruct the *already-seen* history.
+- **Rehydrate when local history is gone — Band is the source of truth.** A flagged room
+  **durably seeds** its Hermes session transcript from the Band chat-context API (own replies as
+  `assistant` turns, peers as `user`), so recovered history persists across turns and restarts
+  rather than evaporating after one. The trigger and the unprocessed mention backlog (answered by
+  the `/next` drain) are excluded from the seed, so nothing is answered twice, and the agent never
+  re-answers a question already in its history. Seeding is idempotent (only into an empty
+  transcript) and capability-guarded — an older gateway falls back to a one-shot `channel_context`
+  blob. Two triggers:
+    - **Room re-join** (`room_added` for a known *cold* room): close-on-leave reset the local
+      transcript, so the room is flagged to reconstruct the *already-seen* history.
     - **Agent return** (every (re)connect): the catch-up drain flags any room with **no local
       session** — a fresh deploy, a lost/migrated DB, or the first run after the agent was down.
-      The first message processed carries the recovered history, so a returning agent never answers
-      a backlog cold. A room whose local session is intact is skipped.
+      A room whose local session is intact is skipped.
 </details>
 
 ### Limitations

@@ -158,7 +158,7 @@ Pin `BAND_HERMES_REF` to a tag or commit for a reproducible install.
 
 Once the plugin is installed, the bundled skill walks the full setup — identifies the gateway's
 Python, enables the plugin (with the `plugins.enabled` fallback), registers a Band agent from
-`BAND_USER_API_KEY` via `scripts/register_agent.py`, saves the agent-scoped credentials, restarts,
+`BAND_USER_API_KEY` via `scripts/register-agent.sh`, saves the agent-scoped credentials, restarts,
 and verifies the hub round-trip. The user key is read from the environment and never printed or
 stored. It is **resumable** — re-running acts only on what's still missing.
 
@@ -204,14 +204,17 @@ mints an agent and saves only the agent-scoped pair; the user key never reaches 
 ```bash
 export BAND_USER_API_KEY=...
 HERMES_PY="$(hermes --version 2>&1 | sed -n 's/^Project: //p')/venv/bin/python"
-"$HERMES_PY" hermes_band_platform/skills/add-band/scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY
-unset BAND_USER_API_KEY
+# Mint the agent (prints only the agent-scoped pair), then persist it via Hermes's env writer.
+eval "$(bash hermes_band_platform/skills/add-band/scripts/register-agent.sh)"
+BAND_AGENT_ID="$BAND_AGENT_ID" BAND_AGENT_API_KEY="$BAND_AGENT_API_KEY" \
+  "$HERMES_PY" -c 'import os; from hermes_cli.config import save_env_value as s; s("BAND_AGENT_ID", os.environ["BAND_AGENT_ID"]); s("BAND_API_KEY", os.environ["BAND_AGENT_API_KEY"])'
+unset BAND_USER_API_KEY BAND_AGENT_API_KEY
 ```
 
-> The bundled `register_agent.py` is a temporary helper that sends browser-like registration
-> headers to avoid Cloudflare 1010. Replace it with the `band-sdk` CLI once
-> `band.cli.register_agent` is published — keeping the same `User-Agent`/`Accept`/`Accept-Language`
-> headers.
+> The bundled `register-agent.sh` is a temporary helper that sends browser-like registration
+> headers to avoid Cloudflare 1010; it prints the agent-scoped pair for you to persist with
+> Hermes's env writer. Replace it with the `band-sdk` CLI once `band.cli.register_agent` is
+> published — keeping the same `User-Agent`/`Accept`/`Accept-Language` headers.
 
 **Pre-created agent (manual)** — make one at `app.band.ai/agents/new`, then set:
 

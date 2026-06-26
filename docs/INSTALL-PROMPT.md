@@ -28,7 +28,7 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
    Run the skill's helper scripts (gateway_python.py, verify_install.py, verify_gateway.py,
    verify_roundtrip.py) from /tmp/hbp/hermes_band_platform/skills/add-band with the gateway's
    own Python (the skill shows how to derive it as HERMES_PY). Registration temporarily
-   uses the bundled `scripts/register_agent.py` helper; switch to the SDK
+   uses the bundled `scripts/register-agent.sh` helper; switch to the SDK
    `band-register-agent` / `band.cli.register_agent` command after it is published,
    but only after verifying the SDK CLI preserves the helper's browser-like
    registration headers (`User-Agent`, `Accept`, `Accept-Language`) to avoid
@@ -50,7 +50,7 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
 3. Stop and ask me at the two human gates:
    • Credentials — I either create the Band agent at app.band.ai/agents/new and give you
      BAND_AGENT_ID + BAND_API_KEY, or I set BAND_USER_API_KEY for the bundled
-     `scripts/register_agent.py` helper.
+     `scripts/register-agent.sh` helper.
    • The live test — I @mention the agent in the "Hermes Agent Hub" room and confirm a reply.
 
 4. When done, report: plugin version, how you enabled it (CLI vs config), the BAND_HUB_ROOM id,

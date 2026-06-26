@@ -33,7 +33,7 @@ Do not use this skill for ordinary Band chat troubleshooting after setup; inspec
 
 This skill installs the plugin and the Band SDK as part of the procedure — they need not be present beforehand.
 
-Never ask the user to paste a Band user API key into a command line, and never read it yourself. Until the SDK registration CLI is published, the key is consumed by the bundled `scripts/register_agent.py` helper (a small Python helper that reads it from the environment) — ideally by the bootstrapper *before* this skill runs, so it never enters the agent's environment. Only the resulting agent-scoped `BAND_AGENT_ID` + `BAND_API_KEY` are stored; the user key is never printed or persisted. Once `band.cli.register_agent` ships in `band-sdk`, replace this temporary helper with the SDK CLI, but preserve the helper's browser-like registration headers (`User-Agent`, `Accept`, `Accept-Language`) because sparse script fingerprints can trigger Cloudflare 1010 on the registration endpoint. Have the user remove `BAND_USER_API_KEY` after the one registration step.
+Never ask the user to paste a Band user API key into a command line, and never read it yourself. Until the SDK registration CLI is published, the key is consumed by the bundled `scripts/register-agent.sh` helper (a dependency-light bash helper, shared with the nanoclaw/openclaw bootstraps, that reads it from the environment) — ideally by the bootstrapper *before* this skill runs, so it never enters the agent's environment. The helper prints only the resulting agent-scoped `BAND_AGENT_ID` + `BAND_API_KEY`, which the caller persists through Hermes's env writer; the user key is never printed or persisted. Once `band.cli.register_agent` ships in `band-sdk`, replace this temporary helper with the SDK CLI, but preserve the helper's browser-like registration headers (`User-Agent`, `Accept`, `Accept-Language`) because sparse script fingerprints can trigger Cloudflare 1010 on the registration endpoint. Have the user remove `BAND_USER_API_KEY` after the one registration step.
 
 ## How to Run
 
@@ -42,14 +42,14 @@ Use the `terminal` tool for commands and the helper scripts shipped with this sk
 Skill helper paths are relative to this skill directory:
 
 - `scripts/gateway_python.py` — resolve + validate the gateway interpreter
-- `scripts/register_agent.py` — temporary registration helper; replace with `band.cli.register_agent` after the SDK CLI is published
+- `scripts/register-agent.sh` — canonical, dependency-light registration helper (shared with the nanoclaw/openclaw bootstraps); prints the agent-scoped pair for the caller to persist. Replace with `band.cli.register_agent` after the SDK CLI is published
 - `scripts/ensure_access_policy.py` — set Band's access policy to `allowlist` so the gateway trusts Band's ACL (idempotent; safe to run anytime)
 - `scripts/ensure_home_channel.py` — set the hub as the home (main) channel by persisting `BAND_HOME_ROOM` (idempotent; safe to run anytime after the hub exists)
 - `scripts/verify_install.py`
 - `scripts/verify_gateway.py`
 - `scripts/verify_roundtrip.py` — prove the agent can post to its owner
 
-Registration temporarily ships as `scripts/register_agent.py` because the SDK CLI is not published yet. The helper saves `BAND_AGENT_ID` + `BAND_API_KEY` through Hermes's env writer and never prints the user key. It also sends a browser-like request fingerprint to avoid Cloudflare 1010 blocks on `app.band.ai`; the future `band-register-agent` / `band.cli.register_agent` path must keep equivalent headers before the bundled helper is removed. The setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
+Registration temporarily ships as `scripts/register-agent.sh` because the SDK CLI is not published yet. The helper mints the agent and prints the agent-scoped `BAND_AGENT_ID` + `BAND_AGENT_API_KEY` on stdout (never the user key); the caller persists them through Hermes's env writer (as `BAND_AGENT_ID` + `BAND_API_KEY`). It sends a browser-like request fingerprint to avoid Cloudflare 1010 blocks on `app.band.ai`; the future `band-register-agent` / `band.cli.register_agent` path must keep equivalent headers before the bundled helper is removed. The other setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
 
 This skill is **resumable**: run `verify_install.py` first and act *only* on what's missing, so re-running after a partial failure never double-installs or re-registers.
 
@@ -83,7 +83,10 @@ uv pip install --python "$HERMES_PY" 'band-sdk>=1.0.0,<2.0.0'
 Register (temporary bundled helper — needs `BAND_USER_API_KEY`), ensure the access policy, then verify install / gateway / prove a round-trip (always with the gateway interpreter):
 
 ```bash
-"$HERMES_PY" scripts/register_agent.py        # mints the agent and saves BAND_AGENT_ID + BAND_API_KEY
+# Register: mint the agent (prints only the agent-scoped pair), then persist via Hermes's env writer.
+eval "$(bash scripts/register-agent.sh)"
+BAND_AGENT_ID="$BAND_AGENT_ID" BAND_AGENT_API_KEY="$BAND_AGENT_API_KEY" \
+  "$HERMES_PY" -c 'import os; from hermes_cli.config import save_env_value as s; s("BAND_AGENT_ID", os.environ["BAND_AGENT_ID"]); s("BAND_API_KEY", os.environ["BAND_AGENT_API_KEY"])'
 "$HERMES_PY" scripts/ensure_access_policy.py   # gateway trusts Band's ACL (idempotent; safe to re-run)
 "$HERMES_PY" scripts/verify_install.py
 "$HERMES_PY" scripts/verify_gateway.py         # hub created + home (main) channel set
@@ -147,10 +150,12 @@ re-installs or re-registers what's already in place.
 5. Ensure agent credentials are present (`BAND_AGENT_ID` + `BAND_API_KEY` in Hermes's `.env`). `scripts/verify_install.py` reports whether they are.
    - Already saved (e.g. the bootstrapper registered the agent before handing off): continue.
    - Pre-created agent: have the user create one at `app.band.ai/agents/new` and save `BAND_AGENT_ID` + `BAND_API_KEY` with Hermes's env writer.
-   - Auto-register from a user key — a **script step, not an LLM step**. Until the SDK CLI is published, use the bundled `scripts/register_agent.py` helper. With `BAND_USER_API_KEY` set in a plain shell, the helper reads it from the environment, mints the agent, and saves agent-scoped creds through Hermes's env writer; it never prints or persists the *user* key:
+   - Auto-register from a user key — a **script step, not an LLM step**. Until the SDK CLI is published, use the bundled `scripts/register-agent.sh` helper. With `BAND_USER_API_KEY` set in a plain shell, the helper reads it from the environment and mints the agent, printing only the agent-scoped pair; persist it through Hermes's env writer. It never prints or persists the *user* key:
      ```bash
-     "$HERMES_PY" scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY through Hermes env writer
-     unset BAND_USER_API_KEY
+     eval "$(bash scripts/register-agent.sh)"   # mints the agent; prints only the agent-scoped pair
+     BAND_AGENT_ID="$BAND_AGENT_ID" BAND_AGENT_API_KEY="$BAND_AGENT_API_KEY" \
+       "$HERMES_PY" -c 'import os; from hermes_cli.config import save_env_value as s; s("BAND_AGENT_ID", os.environ["BAND_AGENT_ID"]); s("BAND_API_KEY", os.environ["BAND_AGENT_API_KEY"])'
+     unset BAND_USER_API_KEY BAND_AGENT_API_KEY
      ```
      This is **idempotent at the flow level**: step 2 only routes here when `verify_install` reports the credentials missing, so a re-run never mints a second agent. **Do not put `BAND_USER_API_KEY` into the agent's own environment or read it yourself** — let the bootstrapper or a plain shell consume it before/outside the agent, so the user key never reaches the LLM. After `band.cli.register_agent` is published in `band-sdk`, replace this helper call with `"$HERMES_PY" -m band.cli.register_agent` only after confirming the SDK CLI sends the same Cloudflare-safe registration headers. Have the user remove `BAND_USER_API_KEY` afterward.
 
@@ -206,7 +211,7 @@ re-installs or re-registers what's already in place.
 - The agent rejecting senders with "not an authorized user" (owner included): the gateway needs Band's effective access policy to be `allowlist`, not just the `enforces_own_access_policy` flag. Run `scripts/ensure_access_policy.py` (records `platforms.band.extra.group_policy=allowlist`) and restart — it's idempotent and version-independent, so it repairs an already-deployed agent without a plugin reinstall.
 - The agent complaining it has "no home" / nowhere to deliver cron or notifications: the hub must be set as the home (main) channel. The adapter wires it on connect and persists `BAND_HOME_ROOM`, but an older build only set it in-memory, so readers that loaded config fresh saw no home. Run `scripts/ensure_home_channel.py` (persists `BAND_HOME_ROOM = BAND_HUB_ROOM`) and restart. If `BAND_HUB_ROOM` is also unset the hub was never created — resolve owner/connection first.
 - Leaving `BAND_USER_API_KEY` in the environment after registration unnecessarily keeps a broad user credential live.
-- Exposing the Band *user* key to the LLM: registration is a script step — the temporary bundled `scripts/register_agent.py` helper reads `BAND_USER_API_KEY` from the environment and saves only agent-scoped credentials. Don't set the user key in the *agent's* own environment or echo it; run registration in the bootstrapper or a plain shell before the agent takes over. Replace the helper with the SDK CLI once `band.cli.register_agent` is published.
+- Exposing the Band *user* key to the LLM: registration is a script step — the temporary bundled `scripts/register-agent.sh` helper reads `BAND_USER_API_KEY` from the environment and prints only agent-scoped credentials (the caller persists them via Hermes's env writer). Don't set the user key in the *agent's* own environment or echo it; run registration in the bootstrapper or a plain shell before the agent takes over. Replace the helper with the SDK CLI once `band.cli.register_agent` is published.
 - Dropping the registration headers when moving to the SDK CLI: the registration endpoint can Cloudflare-1010 sparse script clients. Preserve the helper's browser-like `User-Agent`, `Accept`, and `Accept-Language` headers in `band.cli.register_agent`.
 - Setting `BAND_HOME_ROOM` to another room means cron and notifications use that room instead of the hub.
 

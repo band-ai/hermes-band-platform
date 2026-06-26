@@ -148,8 +148,9 @@ def verify_install() -> dict[str, Any]:
     if "band_agent_id_present" in missing or "band_api_key_present" in missing:
         actions.append(
             "Save agent-scoped credentials in Hermes env: BAND_AGENT_ID and "
-            "BAND_API_KEY. Use scripts/register_agent.py with BAND_USER_API_KEY, "
-            "or paste credentials from a pre-created Band external agent."
+            "BAND_API_KEY. Run scripts/register-agent.sh with BAND_USER_API_KEY "
+            "and persist its output via Hermes's env writer, or paste credentials "
+            "from a pre-created Band external agent."
         )
     if "access_policy_allowlist" in missing:
         actions.append(

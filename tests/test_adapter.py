@@ -3441,3 +3441,238 @@ class TestHubFailover:
         await adapter._record_hub_send("old-hub", ok=False)
 
         link.rest.agent_api_chats.create_agent_chat.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Federated wiki query state machine (federated-wiki-query design, Part 2)
+# ---------------------------------------------------------------------------
+
+_PendingFederation = _band_mod._PendingFederation
+FEDERATION_TIMEOUT_SECONDS = _band_mod.FEDERATION_TIMEOUT_SECONDS
+format_federation_digest = _band_mod.format_federation_digest
+
+
+class TestFormatFederationDigest:
+
+    def test_all_replied(self):
+        pending = _PendingFederation(
+            query="what is X?",
+            local_findings=None,
+            requester_room_id="hub-1",
+            expected_agent_ids=["a1", "a2"],
+            friend_names={"a1": "Alice", "a2": "Bob"},
+            replies={"a1": "X is a widget", "a2": "X is also a gadget"},
+        )
+        text = format_federation_digest(pending)
+        assert "2/2 replies" in text
+        assert "Alice: X is a widget" in text
+        assert "Bob: X is also a gadget" in text
+        assert "Summarize this for the user" in text
+
+    def test_partial_reply_marks_timeout(self):
+        pending = _PendingFederation(
+            query="what is X?",
+            local_findings=None,
+            requester_room_id="hub-1",
+            expected_agent_ids=["a1", "a2"],
+            friend_names={"a1": "Alice", "a2": "Bob"},
+            replies={"a1": "X is a widget"},
+        )
+        text = format_federation_digest(pending)
+        assert "1/2 replies" in text
+        assert "Alice: X is a widget" in text
+        assert "Bob: (no reply, timed out)" in text
+
+    def test_includes_local_findings_when_present(self):
+        pending = _PendingFederation(
+            query="what is X?",
+            local_findings="my wiki says X is a thing",
+            requester_room_id="hub-1",
+            expected_agent_ids=["a1"],
+            friend_names={"a1": "Alice"},
+            replies={},
+        )
+        text = format_federation_digest(pending)
+        assert "my wiki says X is a thing" in text
+
+    def test_omits_local_findings_section_when_none(self):
+        pending = _PendingFederation(
+            query="what is X?",
+            local_findings=None,
+            requester_room_id="hub-1",
+            expected_agent_ids=["a1"],
+            friend_names={"a1": "Alice"},
+            replies={"a1": "hi"},
+        )
+        text = format_federation_digest(pending)
+        assert "Your own wiki" not in text
+
+
+class TestFederationStateMachine:
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        a = _make_adapter(monkeypatch, agent_id="asker-agent")
+        a._agent_id = "asker-agent"
+        a._link = MagicMock()
+        a.handle_message = AsyncMock()
+        a._ack_consumed = AsyncMock()
+        return a
+
+    def _inbound(self, room_id, sender_id, content, sender_type="Agent", msg_id="m1"):
+        return _band_mod._Inbound(
+            payload=SimpleNamespace(),
+            room_id=room_id,
+            msg_id=msg_id,
+            content=content,
+            message_type="text",
+            sender_id=sender_id,
+            sender_type=sender_type,
+            sender_name="Friend",
+        )
+
+    @pytest.mark.asyncio
+    async def test_register_pending_federation_schedules_timeout(self, adapter):
+        adapter.register_pending_federation(
+            room_id="fed-room-1",
+            query="what is X?",
+            local_findings=None,
+            requester_room_id="hub-1",
+            friend_names={"a1": "Alice"},
+        )
+        pending = adapter._pending_federations["fed-room-1"]
+        assert pending.query == "what is X?"
+        assert pending.expected_agent_ids == ["a1"]
+        assert pending.timeout_task is not None
+        assert not pending.timeout_task.done()
+
+        pending.timeout_task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_reply_from_expected_friend_is_recorded(self, adapter):
+        adapter.register_pending_federation(
+            room_id="fed-room-2",
+            query="what is X?",
+            local_findings=None,
+            requester_room_id="hub-1",
+            friend_names={"a1": "Alice", "a2": "Bob"},
+        )
+        inb = self._inbound("fed-room-2", "a1", "X is a widget")
+        handled = await adapter._handle_federation_reply(inb)
+
+        assert handled is True
+        pending = adapter._pending_federations["fed-room-2"]
+        assert pending.replies == {"a1": "X is a widget"}
+        adapter._ack_consumed.assert_awaited_once_with("fed-room-2", "m1")
+        adapter.handle_message.assert_not_called()  # not finalized yet (a2 hasn't replied)
+
+        pending.timeout_task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_last_expected_reply_finalizes_and_cancels_timeout(self, adapter):
+        adapter.register_pending_federation(
+            room_id="fed-room-3",
+            query="what is X?",
+            local_findings="local hit",
+            requester_room_id="hub-1",
+            friend_names={"a1": "Alice"},
+        )
+        timeout_task = adapter._pending_federations["fed-room-3"].timeout_task
+
+        inb = self._inbound("fed-room-3", "a1", "X is a widget")
+        handled = await adapter._handle_federation_reply(inb)
+
+        assert handled is True
+        assert "fed-room-3" not in adapter._pending_federations  # popped on finalize
+        assert timeout_task.cancelled() or timeout_task.done()
+        adapter.handle_message.assert_called_once()
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.internal is True
+        assert evt.source.chat_id == "hub-1"
+        assert "1/1 replies" in evt.text
+        assert "X is a widget" in evt.text
+        assert "local hit" in evt.text
+
+    @pytest.mark.asyncio
+    async def test_reply_from_unexpected_sender_is_acked_but_not_recorded(self, adapter):
+        adapter.register_pending_federation(
+            room_id="fed-room-4",
+            query="what is X?",
+            local_findings=None,
+            requester_room_id="hub-1",
+            friend_names={"a1": "Alice"},
+        )
+        inb = self._inbound("fed-room-4", "not-invited", "hello")
+        handled = await adapter._handle_federation_reply(inb)
+
+        assert handled is True
+        pending = adapter._pending_federations["fed-room-4"]
+        assert pending.replies == {}
+        adapter._ack_consumed.assert_awaited_once_with("fed-room-4", "m1")
+
+        pending.timeout_task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_non_federation_room_returns_false(self, adapter):
+        inb = self._inbound("some-other-room", "a1", "hi")
+        handled = await adapter._handle_federation_reply(inb)
+        assert handled is False
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_timeout_finalizes_with_partial_replies(self, adapter):
+        adapter.register_pending_federation(
+            room_id="fed-room-5",
+            query="what is X?",
+            local_findings=None,
+            requester_room_id="hub-1",
+            friend_names={"a1": "Alice", "a2": "Bob"},
+        )
+        pending = adapter._pending_federations["fed-room-5"]
+        pending.replies["a1"] = "X is a widget"  # a2 never replies
+
+        # Drive the timeout path directly rather than sleeping 5 real minutes.
+        await adapter._finalize_federation("fed-room-5", pending)
+
+        assert "fed-room-5" not in adapter._pending_federations
+        adapter.handle_message.assert_called_once()
+        evt = adapter.handle_message.call_args[0][0]
+        assert "1/2 replies" in evt.text
+        assert "Bob: (no reply, timed out)" in evt.text
+
+    @pytest.mark.asyncio
+    async def test_handle_message_created_intercepts_federation_room(self, adapter, monkeypatch):
+        # _handle_message_created must recognize a pending-federation room and
+        # bypass normal turn dispatch entirely -- no mention gate, no
+        # participant fetch, no forward into a real turn.
+        adapter.register_pending_federation(
+            room_id="fed-room-6",
+            query="what is X?",
+            local_findings=None,
+            requester_room_id="hub-1",
+            friend_names={"a1": "Alice"},
+        )
+        pending = adapter._pending_federations["fed-room-6"]
+
+        event = SimpleNamespace(
+            type="message_created",
+            room_id="fed-room-6",
+            payload=SimpleNamespace(
+                id="m9",
+                content="X is a widget",
+                message_type="text",
+                sender_id="a1",
+                sender_type="Agent",
+                sender_name="Alice",
+                metadata=None,
+            ),
+        )
+        result = await adapter._handle_message_created(event)
+
+        assert result is True
+        assert "fed-room-6" not in adapter._pending_federations  # finalized (only friend)
+        adapter.handle_message.assert_called_once()  # the digest injection, not a normal turn
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.source.chat_id == "hub-1"  # delivered to the requester room, not fed-room-6
+
+        assert pending.timeout_task.cancelled() or pending.timeout_task.done()

@@ -37,7 +37,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, TypedDict
 from urllib.parse import urlsplit
@@ -166,6 +166,11 @@ _OWNER_COMMAND_NOTICE = (
 # may happen (so a platform-wide outage can't spin up rooms without bound).
 _HUB_FAILOVER_THRESHOLD_DEFAULT = 3
 _HUB_FAILOVER_MAX_PER_CONNECT_DEFAULT = 5
+
+# How long a federated wiki query waits for friend agents to reply before
+# finalizing with whatever came in. Fixed, not env-configurable -- KISS
+# per the approved design; add a knob only if a real need for one shows up.
+FEDERATION_TIMEOUT_SECONDS = 300
 
 
 def _int_env(name: str, default: int) -> int:
@@ -517,6 +522,51 @@ class _Inbound:
     sender_name: Optional[str]
 
 
+@dataclass
+class _PendingFederation:
+    """State for one in-flight federated wiki query, keyed by its room id.
+
+    Created by ``register_pending_federation`` when ``band_ask_wikis`` posts
+    a query; consumed by ``_handle_federation_reply`` (early completion) or
+    ``_federation_timeout`` (deadline), whichever fires first.
+    """
+
+    query: str
+    local_findings: Optional[str]
+    requester_room_id: str
+    expected_agent_ids: List[str]
+    friend_names: Dict[str, str]
+    replies: Dict[str, str] = field(default_factory=dict)
+    timeout_task: Optional[asyncio.Task] = None
+
+
+def format_federation_digest(pending: _PendingFederation) -> str:
+    """Render the collected federation replies as one prompt for the LLM.
+
+    Every expected friend appears exactly once, in the order they were asked
+    (``expected_agent_ids`` preserves insertion order); a friend who never
+    replied is shown as "(no reply, timed out)" rather than omitted, so the
+    resulting summary can be honest about partial coverage.
+    """
+    total = len(pending.expected_agent_ids)
+    answered = len(pending.replies)
+    lines = [
+        f'Your federated wiki question "{pending.query}" got {answered}/{total} replies:'
+    ]
+    for agent_id in pending.expected_agent_ids:
+        name = pending.friend_names.get(agent_id, agent_id)
+        if agent_id in pending.replies:
+            lines.append(f"- {name}: {pending.replies[agent_id]}")
+        else:
+            lines.append(f"- {name}: (no reply, timed out)")
+    if pending.local_findings:
+        lines.append("")
+        lines.append(f"Your own wiki: {pending.local_findings}")
+    lines.append("")
+    lines.append("Summarize this for the user in a clear, concise answer.")
+    return "\n".join(lines)
+
+
 class BandAdapter(BasePlatformAdapter):
     """Async Band adapter implementing the BasePlatformAdapter interface.
 
@@ -591,6 +641,12 @@ class BandAdapter(BasePlatformAdapter):
         # ── Per-room caches ──
         self._participants_cache: Dict[str, List[Dict[str, Any]]] = {}  # id/name/handle/type
         self._last_human_sender: Dict[str, Dict[str, Any]] = {}  # for reply @mentions
+
+        # ── Federated wiki queries ──
+        # In-flight band_ask_wikis calls, keyed by the fresh room created for
+        # each query. In-memory only (resets on restart), same caveat as
+        # _last_human_sender / _seen_inbound_ids.
+        self._pending_federations: Dict[str, _PendingFederation] = {}
 
         # ── Dedup backstops ──
         # _sent_ids: our own posts, to drop the platform's echo. _seen_inbound_ids:
@@ -1309,6 +1365,98 @@ class BandAdapter(BasePlatformAdapter):
             )
         )
 
+    def register_pending_federation(
+        self,
+        *,
+        room_id: str,
+        query: str,
+        local_findings: Optional[str],
+        requester_room_id: str,
+        friend_names: Dict[str, str],
+    ) -> None:
+        """Track a just-created federation room until every friend replies or timeout.
+
+        Called by the ``band_ask_wikis`` tool right after it posts the query
+        into ``room_id``. The timeout task is scheduled here (not in the
+        tool) so it keeps running after the tool call itself returns.
+        """
+        pending = _PendingFederation(
+            query=query,
+            local_findings=local_findings,
+            requester_room_id=requester_room_id,
+            expected_agent_ids=list(friend_names.keys()),
+            friend_names=dict(friend_names),
+        )
+        pending.timeout_task = asyncio.create_task(self._federation_timeout(room_id))
+        self._pending_federations[room_id] = pending
+
+    async def _federation_timeout(self, room_id: str) -> None:
+        """Finalize a federation query if it's still pending after the deadline."""
+        try:
+            await asyncio.sleep(FEDERATION_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            return
+        pending = self._pending_federations.get(room_id)
+        if pending is None:
+            return  # already finalized by _handle_federation_reply
+        await self._finalize_federation(room_id, pending)
+
+    @staticmethod
+    async def _cancel_federation_timeout(pending: _PendingFederation) -> None:
+        """Cancel a pending federation's timeout task and wait for it to unwind.
+
+        Awaiting (not just calling ``.cancel()``) guarantees the task is
+        actually cancelled/done by the time this returns -- ``.cancel()``
+        alone only schedules the CancelledError for the task's next resume,
+        which may not happen before an early-completion caller checks state.
+        """
+        task = pending.timeout_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _handle_federation_reply(self, inb: "_Inbound") -> bool:
+        """Record one friend's reply to a pending federation query.
+
+        Returns True whether or not the reply was recorded, so the caller
+        (``_handle_message_created``) never falls through to normal turn
+        dispatch for a federation room -- friends' replies must not make
+        this agent chatter back into the round-table.
+        """
+        pending = self._pending_federations.get(inb.room_id)
+        if pending is None:
+            return False
+        if (
+            inb.sender_type == "Agent"
+            and inb.sender_id in pending.expected_agent_ids
+            and inb.sender_id not in pending.replies
+        ):
+            pending.replies[inb.sender_id] = inb.content
+            if len(pending.replies) >= len(pending.expected_agent_ids):
+                await self._cancel_federation_timeout(pending)
+                await self._finalize_federation(inb.room_id, pending)
+        await self._ack_consumed(inb.room_id, inb.msg_id)
+        return True
+
+    async def _finalize_federation(self, room_id: str, pending: _PendingFederation) -> None:
+        """Deliver one synthesized-answer prompt to wherever the query was asked from."""
+        self._pending_federations.pop(room_id, None)
+        digest = format_federation_digest(pending)
+        await self.handle_message(
+            MessageEvent(
+                text=digest,
+                message_type=MessageType.TEXT,
+                source=self.build_source(
+                    chat_id=pending.requester_room_id, chat_type=_SESSION_CHAT_TYPE
+                ),
+                internal=True,
+            )
+        )
+
     async def _handle_message_created(self, event: Any) -> bool:
         """Normalize an inbound Band message and forward it to the gateway.
 
@@ -1341,6 +1489,13 @@ class BandAdapter(BasePlatformAdapter):
                 _short_id(inb.room_id),
             )
             return False
+
+        # A reply in an in-flight federation room is handled entirely by the
+        # state machine (record + maybe finalize) -- it must never go through
+        # normal mention-gating/dispatch, or this agent would start chattering
+        # back into the round-table after every friend's reply.
+        if inb.room_id in self._pending_federations:
+            return await self._handle_federation_reply(inb)
 
         # Participants drive @mention resolution + last-human-sender. chat_type is
         # the constant _SESSION_CHAT_TYPE, so a roster change can never re-key the

@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Every commit must be DCO-signed: use `git commit -s`.
-- Federation timeout is a fixed constant (`FEDERATION_TIMEOUT_SECONDS = 300`), not a new env var — per Mr. Ofer's decision to favor simplicity (KISS) over an unrequested config knob.
+- Federation timeout is a fixed constant (`FEDERATION_TIMEOUT_SECONDS = 300`), not a new env var — per decision to favor simplicity (KISS) over an unrequested config knob.
 - No new required/optional env vars — this feature needs no new credentials (per the approved spec, `docs/superpowers/specs/2026-07-04-federated-wiki-query-design.md`).
 - Follow the codebase's established convention: each module that constructs `band-sdk` request types keeps its own independent lazy-import guard + rebind function (see `tools.py`'s own copy of the `ChatMessageRequest`/`ChatRoomRequest`/etc. guard, separate from `adapter.py`'s) — do not cross-import these mutable/rebindable names between modules.
 - `adapter.py` must keep importing cleanly with no intra-package imports at module level (existing invariant — `tools.py`/`federation.py`/`contacts.py` import *from* `adapter.py`, never the reverse; `register()` does its `from . import tools` / `from . import contacts` / `from . import federation` as **local** imports inside the function body, exactly like the existing `from . import tools as _band_tools` at `adapter.py:2584`).

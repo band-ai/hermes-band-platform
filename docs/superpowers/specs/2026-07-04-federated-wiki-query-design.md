@@ -1,7 +1,5 @@
 # Federated LLM wiki query between friends — design
 
-Status: approved by Mr. Ofer, pending implementation plan.
-
 ## Motivation
 
 Hermes agents each maintain a local "LLM wiki" (Hermes core's bundled
@@ -13,14 +11,6 @@ is to let a Hermes agent:
 2. Ask a question and get one answer synthesized from its own wiki plus every
    connected friend's wiki, without the user having to manually poll for
    replies.
-
-A prior implementation of this existed in `band-hermes` (the predecessor to
-this plugin), built on a hand-rolled `httpx` REST client with its own contact
-management (`band_connect` / `band_list_friends` / `band_respond_request`) and
-an `/ask_wikis` slash command that broadcast a question into a shared "wiki
-round-table" room and told the user to manually check `/band_inbox` later —
-because that architecture had no live push; a friend's agent only "read" new
-messages when its own user prompted it to check.
 
 This plugin (`hermes-band-platform`) is a full rewrite on `band-sdk` 1.0.0
 with a genuinely different property: `BandAdapter._consume()` proactively
@@ -270,7 +260,7 @@ Adapted from the old repo's skill of the same name. Covers both roles:
   and is invoked by the LLM naturally; this feature only ensures its
   findings get folded into the federated answer.
 - Persisting `_pending_federations` across restarts.
-- A configurable timeout value — fixed at 5 minutes per Mr. Ofer's decision,
+- A configurable timeout value — fixed at 5 minutes per decision,
   favoring simplicity (KISS) over a config knob nobody asked for yet.
 - Removing a contact (`band_remove_contact`) — not required by the stated
   use case; can be added later following the same pattern if needed.

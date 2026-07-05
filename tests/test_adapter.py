@@ -883,12 +883,135 @@ class TestHandleEvent:
 
     @pytest.mark.asyncio
     async def test_unhandled_event_type_is_ignored(self, adapter):
-        # An event the router has no branch for (e.g. a future contact_* event)
-        # falls through silently: no raise, no room subscribe/unsubscribe.
-        event = SimpleNamespace(type="contact_request_received", room_id="some-room")
+        # An event the router has no branch for falls through silently: no
+        # raise, no room subscribe/unsubscribe. contact_* events now have
+        # their own branch (see TestContactEvents), so this uses a type the
+        # router genuinely doesn't handle.
+        event = SimpleNamespace(type="websocket_disconnected", room_id="some-room")
         await adapter._handle_event(event)
         adapter._link.subscribe_room.assert_not_called()
         adapter._link.unsubscribe_room.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Contact events -> owner Hub injection (federated-wiki-query design, Part 1)
+# ---------------------------------------------------------------------------
+
+class TestFormatContactEvent:
+
+    def test_request_received_without_message(self):
+        payload = SimpleNamespace(
+            id="r1", from_handle="dan", from_name="Dan", message=None,
+            status="pending", inserted_at="2026-01-01T00:00:00Z",
+        )
+        text = _band_mod._format_contact_event(
+            SimpleNamespace(type="contact_request_received", payload=payload)
+        )
+        assert "[Contact Request]" in text
+        assert "Dan" in text
+        assert "@dan" in text
+        assert "r1" in text
+        assert "Message:" not in text
+
+    def test_request_received_with_message(self):
+        payload = SimpleNamespace(
+            id="r2", from_handle="@eve/hermes", from_name="Eve",
+            message="let's federate", status="pending", inserted_at="x",
+        )
+        text = _band_mod._format_contact_event(
+            SimpleNamespace(type="contact_request_received", payload=payload)
+        )
+        assert "@eve/hermes" in text
+        assert "let's federate" in text
+
+    def test_request_updated(self):
+        payload = SimpleNamespace(id="r3", status="approved")
+        text = _band_mod._format_contact_event(
+            SimpleNamespace(type="contact_request_updated", payload=payload)
+        )
+        assert "[Contact Request Update]" in text
+        assert "r3" in text
+        assert "approved" in text
+
+    def test_contact_added(self):
+        payload = SimpleNamespace(id="c1", handle="bob/hermes", name="Bob", type="Agent")
+        text = _band_mod._format_contact_event(
+            SimpleNamespace(type="contact_added", payload=payload)
+        )
+        assert "[Contact Added]" in text
+        assert "Bob" in text
+        assert "Agent" in text
+        assert "c1" in text
+
+    def test_contact_removed(self):
+        payload = SimpleNamespace(id="c2")
+        text = _band_mod._format_contact_event(
+            SimpleNamespace(type="contact_removed", payload=payload)
+        )
+        assert "[Contact Removed]" in text
+        assert "c2" in text
+
+    def test_unknown_type_returns_none(self):
+        assert (
+            _band_mod._format_contact_event(
+                SimpleNamespace(type="something_else", payload=SimpleNamespace())
+            )
+            is None
+        )
+
+    def test_none_payload_returns_none(self):
+        assert (
+            _band_mod._format_contact_event(
+                SimpleNamespace(type="contact_added", payload=None)
+            )
+            is None
+        )
+
+
+class TestContactEvents:
+    """contact_* events are injected into the owner Hub session."""
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
+        a._agent_id = "agent-self-id"
+        a._hub_room_id = "hub-room-1"
+        a.handle_message = AsyncMock()
+        return a
+
+    @pytest.mark.asyncio
+    async def test_contact_request_received_is_injected_into_hub(self, adapter):
+        payload = SimpleNamespace(
+            id="req-1", from_handle="alice/hermes", from_name="Alice",
+            message="let's connect", status="pending", inserted_at="2026-01-01T00:00:00Z",
+        )
+        event = SimpleNamespace(type="contact_request_received", room_id=None, payload=payload)
+        await adapter._handle_event(event)
+        adapter.handle_message.assert_called_once()
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.internal is True
+        assert evt.source.chat_id == "hub-room-1"
+        assert "[Contact Request]" in evt.text
+        assert "Alice" in evt.text
+
+    @pytest.mark.asyncio
+    async def test_contact_added_is_injected(self, adapter):
+        payload = SimpleNamespace(id="c-1", handle="bob/hermes", name="Bob", type="Agent")
+        event = SimpleNamespace(type="contact_added", room_id=None, payload=payload)
+        await adapter._handle_event(event)
+        evt = adapter.handle_message.call_args[0][0]
+        assert "[Contact Added]" in evt.text
+
+    @pytest.mark.asyncio
+    async def test_contact_event_dropped_when_hub_not_bootstrapped(self, adapter):
+        adapter._hub_room_id = None
+        payload = SimpleNamespace(
+            id="req-3", from_handle="carol", from_name="Carol",
+            message=None, status="pending", inserted_at="x",
+        )
+        event = SimpleNamespace(type="contact_request_received", room_id=None, payload=payload)
+        await adapter._handle_event(event)
+        adapter.handle_message.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -2363,6 +2486,41 @@ class TestConnectDisconnect:
         assert adapter._consumer_task is not None
 
         # Cleanup
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_subscribes_to_agent_contacts(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        monkeypatch.setattr(
+            "gateway.status.acquire_scoped_lock",
+            lambda scope, identity, metadata=None: (True, None),
+        )
+        monkeypatch.setattr(
+            "gateway.status.release_scoped_lock",
+            lambda scope, identity: None,
+        )
+
+        fake_link = MagicMock()
+        fake_link.connect = AsyncMock()
+        fake_link.subscribe_agent_rooms = AsyncMock()
+        fake_link.subscribe_agent_contacts = AsyncMock()
+        fake_link.subscribe_room = AsyncMock()
+        fake_link.rest.agent_api_identity.get_agent_me = AsyncMock(
+            return_value=SimpleNamespace(
+                data=SimpleNamespace(id="a1", handle="h1", owner_uuid="o1")
+            )
+        )
+        fake_link.rest.agent_api_chats.list_agent_chats = AsyncMock(
+            return_value=SimpleNamespace(data=[], metadata=SimpleNamespace(total_pages=1))
+        )
+        fake_link.__aiter__ = lambda self: self
+        fake_link.__anext__ = AsyncMock(side_effect=StopAsyncIteration)
+        monkeypatch.setattr(_band_mod, "BandLink", lambda *a, **kw: fake_link)
+
+        result = await adapter.connect()
+        assert result is True
+        fake_link.subscribe_agent_contacts.assert_called_once_with(adapter._cfg_agent_id)
+
         await adapter.disconnect()
 
     @pytest.mark.asyncio

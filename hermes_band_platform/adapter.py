@@ -110,6 +110,17 @@ except ImportError:
     def replace_uuid_mentions(content, participants):  # passthrough fallback
         return content
 
+# Reuse the SDK's pure handle-normalizer (ensures a leading "@") rather than
+# re-deriving it -- same "reuse the SDK's pure helper, independent fallback"
+# idiom as replace_uuid_mentions above.
+try:
+    from band.runtime.types import normalize_handle
+except ImportError:
+    def normalize_handle(handle):  # passthrough-with-@ fallback
+        if not handle:
+            return handle
+        return handle if handle.startswith("@") else f"@{handle}"
+
 
 # Default Band host — matches the SDK's own BandLink defaults
 # (wss://app.band.ai/api/v1/socket/websocket, https://app.band.ai).
@@ -261,6 +272,51 @@ def _mention_items(
             )
         )
     return items
+
+
+def _format_contact_event(event: Any) -> Optional[str]:
+    """Render a contact_* event as a human-readable line for the owner Hub.
+
+    Mirrors the minimal fields band-sdk's own ``ContactEventHandler`` uses for
+    its ``HUB_ROOM`` strategy formatting, without the extra API round-trip
+    that strategy does to enrich update events with sender info -- kept
+    simple on purpose (id + status is enough for the owner to correlate with
+    the original request line). Returns None for an event type this plugin
+    doesn't format (never raises).
+    """
+    etype = getattr(event, "type", None)
+    payload = getattr(event, "payload", None)
+    if payload is None:
+        return None
+
+    if etype == "contact_request_received":
+        handle = normalize_handle(getattr(payload, "from_handle", None)) or "?"
+        name = getattr(payload, "from_name", None) or "Someone"
+        message = getattr(payload, "message", None)
+        msg_part = f'\nMessage: "{message}"' if message else ""
+        return (
+            f"[Contact Request] {name} ({handle}) wants to connect.{msg_part}\n"
+            f"Request ID: {getattr(payload, 'id', '?')}"
+        )
+
+    if etype == "contact_request_updated":
+        return (
+            f"[Contact Request Update] Request {getattr(payload, 'id', '?')} "
+            f"status changed to: {getattr(payload, 'status', '?')}"
+        )
+
+    if etype == "contact_added":
+        handle = normalize_handle(getattr(payload, "handle", None)) or "?"
+        name = getattr(payload, "name", None) or "Someone"
+        return (
+            f"[Contact Added] {name} ({handle}) is now a contact.\n"
+            f"Type: {getattr(payload, 'type', '?')}, ID: {getattr(payload, 'id', '?')}"
+        )
+
+    if etype == "contact_removed":
+        return f"[Contact Removed] Contact {getattr(payload, 'id', '?')} was removed."
+
+    return None
 
 
 class _TranscriptRow(TypedDict):
@@ -616,6 +672,7 @@ class BandAdapter(BasePlatformAdapter):
             self._link_loop = asyncio.get_running_loop()
             await self._resolve_identity()
             await self._link.subscribe_agent_rooms(self._cfg_agent_id)
+            await self._subscribe_agent_contacts_safe()
             await self._subscribe_known_rooms()
             await self._bootstrap_hub_safe()
             self._consumer_task = asyncio.create_task(self._consume())
@@ -721,6 +778,18 @@ class BandAdapter(BasePlatformAdapter):
             logger.warning(
                 "[band] Hub bootstrap failed — continuing without hub: %s", e
             )
+
+    async def _subscribe_agent_contacts_safe(self) -> None:
+        """Subscribe to contact_* events -- best-effort, never blocks connect().
+
+        Mirrors ``_bootstrap_hub_safe``: a failure here (e.g. an older
+        band-sdk without this channel) must not prevent messaging from
+        working.
+        """
+        try:
+            await self._link.subscribe_agent_contacts(self._cfg_agent_id)
+        except Exception as e:
+            logger.warning("[band] Could not subscribe to contact events: %s", e)
 
     async def _subscribe_known_rooms(self) -> None:
         """Subscribe to rooms the agent is already a participant of.
@@ -1141,7 +1210,14 @@ class BandAdapter(BasePlatformAdapter):
             await self._handle_participant_change(event, added=(etype == "participant_added"))
             return
 
-        # TODO (contacts pass): handle contact_* events. Ignored this release.
+        if etype in (
+            "contact_request_received",
+            "contact_request_updated",
+            "contact_added",
+            "contact_removed",
+        ):
+            await self._handle_contact_event(event)
+            return
 
     def _reset_room_session(self, room_id: str) -> None:
         """Clear the Hermes session for a removed/deleted room.
@@ -1200,6 +1276,36 @@ class BandAdapter(BasePlatformAdapter):
                 source=self.build_source(chat_id=room_id, chat_type=_SESSION_CHAT_TYPE),
                 internal=True,
                 raw_message=payload,
+            )
+        )
+
+    async def _handle_contact_event(self, event: Any) -> None:
+        """Format a contact_* event and inject it into the owner Hub session.
+
+        Contact events carry no room_id (band-sdk always sets it to None --
+        they are agent-level, not room-scoped), so they are always routed to
+        the Hub, the owner's one persistent control room. Dropped (logged
+        only) when the Hub isn't bootstrapped yet, mirroring the existing
+        fail-closed posture for slash commands when the owner is unresolved.
+        """
+        if not self._hub_room_id:
+            logger.info(
+                "[band] Dropping %s -- hub not bootstrapped yet",
+                getattr(event, "type", "contact_event"),
+            )
+            return
+        text = _format_contact_event(event)
+        if text is None:
+            return
+        await self.handle_message(
+            MessageEvent(
+                text=text,
+                message_type=MessageType.TEXT,
+                source=self.build_source(
+                    chat_id=self._hub_room_id, chat_type=_SESSION_CHAT_TYPE
+                ),
+                internal=True,
+                raw_message=getattr(event, "payload", None),
             )
         )
 

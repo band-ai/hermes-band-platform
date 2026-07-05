@@ -273,6 +273,31 @@ class TestBandPluginRegistration:
 
 
 # ---------------------------------------------------------------------------
+# Contact tool + skill registration (federated-wiki-query design, Part 1)
+# ---------------------------------------------------------------------------
+
+class TestContactToolRegistration:
+
+    def test_register_registers_contact_tools(self):
+        ctx = MagicMock()
+        register(ctx)
+        names = {c.kwargs["name"] for c in ctx.register_tool.call_args_list}
+        for expected in (
+            "band_add_contact",
+            "band_list_contacts",
+            "band_list_contact_requests",
+            "band_respond_contact_request",
+        ):
+            assert expected in names
+
+    def test_register_registers_band_contacts_skill(self):
+        ctx = MagicMock()
+        register(ctx)
+        skill_names = {c.args[0] for c in ctx.register_skill.call_args_list}
+        assert "band-contacts" in skill_names
+
+
+# ---------------------------------------------------------------------------
 # 4. _env_enablement
 # ---------------------------------------------------------------------------
 

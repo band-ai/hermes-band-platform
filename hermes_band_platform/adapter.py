@@ -2581,9 +2581,21 @@ def register(ctx) -> None:
     # async (handlers drive the async REST client) and gated by
     # _check_band_tools_available so the toolset disappears when Band is
     # unconfigured (SDK/creds absent).
+    from . import contacts as _band_contacts
     from . import tools as _band_tools
 
     for name, schema, handler, emoji in _band_tools.BAND_TOOLS:
+        ctx.register_tool(
+            name=name,
+            toolset="band",
+            schema=schema,
+            handler=handler,
+            check_fn=_band_tools._check_band_tools_available,
+            is_async=True,
+            emoji=emoji,
+        )
+
+    for name, schema, handler, emoji in _band_contacts.CONTACT_TOOLS:
         ctx.register_tool(
             name=name,
             toolset="band",
@@ -2621,6 +2633,18 @@ def register(ctx) -> None:
                 description=(
                     "Run a multi-participant Band conversation: addressing, "
                     "turn-taking, mention hygiene, and delegating to other agents."
+                ),
+            )
+        _contacts_md = (
+            _SkillPath(__file__).parent / "skills" / "band-contacts" / "SKILL.md"
+        )
+        if _contacts_md.exists():
+            ctx.register_skill(
+                "band-contacts",
+                _contacts_md,
+                description=(
+                    "Handle incoming Band contact requests and manage friend "
+                    "connections between Hermes agents."
                 ),
             )
     except AttributeError:

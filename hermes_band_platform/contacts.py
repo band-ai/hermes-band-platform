@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from tools.registry import tool_error, tool_result
 
-from .tools import _rest, _tool_exc, _ToolUnavailable
+from .tools import _authorize_band_action, _rest, _tool_exc, _ToolUnavailable
 
 try:
     from band.runtime.contact_tools import ContactTools
@@ -43,6 +43,7 @@ def _load_contact_tools() -> bool:
 async def _handle_add_contact(args: dict, **kwargs) -> str:
     """band_add_contact: send a Band contact request."""
     try:
+        _authorize_band_action()
         if not _load_contact_tools():
             raise _ToolUnavailable("Band not available (band-sdk not installed)")
         handle = str(args.get("handle") or "").strip()
@@ -85,6 +86,7 @@ async def _handle_list_contact_requests(args: dict, **kwargs) -> str:
 async def _handle_respond_contact_request(args: dict, **kwargs) -> str:
     """band_respond_contact_request: approve/reject/cancel a contact request."""
     try:
+        _authorize_band_action()
         if not _load_contact_tools():
             raise _ToolUnavailable("Band not available (band-sdk not installed)")
         action = str(args.get("action") or "").strip().lower()

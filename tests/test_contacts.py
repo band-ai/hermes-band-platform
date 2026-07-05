@@ -163,3 +163,40 @@ class TestContactToolsUnavailable:
         )
         out = _parse(await band_contacts._handle_add_contact({"handle": "@x/y"}))
         assert "error" in out
+
+
+class TestOwnerGate:
+    """The two mutating contact tools must go through ``_authorize_band_action``,
+    just like every other mutating Band tool in ``tools.py``/``federation.py``.
+
+    Mirrors ``tests/test_tools.py::TestOwnerGate``'s rejection idiom: with
+    ``BAND_TOOL_OWNERS`` set to some other identity and no session/owner
+    context established, the caller resolves to ``":"`` which is never on the
+    allowlist, so the action must be refused.
+    """
+
+    @pytest.mark.asyncio
+    async def test_add_contact_refused_for_non_owner(self, monkeypatch):
+        monkeypatch.setenv("BAND_TOOL_OWNERS", "band:someone-else")
+        fake = _make_contact_tools()
+        with _patch_rest(), _patch_contact_tools(fake):
+            out = _parse(
+                await band_contacts._handle_add_contact({"handle": "@alice/hermes"})
+            )
+        assert "error" in out
+        assert "not authorized" in out["error"]
+        fake.add_contact.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_respond_contact_request_refused_for_non_owner(self, monkeypatch):
+        monkeypatch.setenv("BAND_TOOL_OWNERS", "band:someone-else")
+        fake = _make_contact_tools()
+        with _patch_rest(), _patch_contact_tools(fake):
+            out = _parse(
+                await band_contacts._handle_respond_contact_request(
+                    {"action": "approve", "request_id": "req-1"}
+                )
+            )
+        assert "error" in out
+        assert "not authorized" in out["error"]
+        fake.respond_contact_request.assert_not_called()

@@ -297,6 +297,21 @@ class TestContactToolRegistration:
         assert "band-contacts" in skill_names
 
 
+class TestFederationToolRegistration:
+
+    def test_register_registers_ask_wikis_tool(self):
+        ctx = MagicMock()
+        register(ctx)
+        names = {c.kwargs["name"] for c in ctx.register_tool.call_args_list}
+        assert "band_ask_wikis" in names
+
+    def test_register_registers_federated_wiki_search_skill(self):
+        ctx = MagicMock()
+        register(ctx)
+        skill_names = {c.args[0] for c in ctx.register_skill.call_args_list}
+        assert "federated-wiki-search" in skill_names
+
+
 # ---------------------------------------------------------------------------
 # 4. _env_enablement
 # ---------------------------------------------------------------------------

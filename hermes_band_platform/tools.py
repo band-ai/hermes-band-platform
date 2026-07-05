@@ -182,6 +182,24 @@ async def _rest() -> Any:
     return AsyncRestClient(api_key=api_key, base_url=rest_url)
 
 
+def _live_band_adapter() -> Optional[Any]:
+    """Return the live BandAdapter instance from the running gateway, or None.
+
+    ``_rest()`` only returns the link's REST client; callers that need
+    adapter-level state (e.g. ``federation.py`` calling
+    ``register_pending_federation``) need the adapter object itself. Mirrors
+    the same runner-lookup pattern ``_rest()`` / ``_owner_identity()`` /
+    ``_home_room()`` already use inline.
+    """
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        return runner.adapters.get(Platform("band")) if runner else None
+    except Exception:
+        return None
+
+
 def _resolve_room(args: Dict[str, Any]) -> str:
     """Resolve the target room id for a room-context tool.
 

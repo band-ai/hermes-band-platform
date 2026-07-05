@@ -2843,6 +2843,7 @@ def register(ctx) -> None:
     # _check_band_tools_available so the toolset disappears when Band is
     # unconfigured (SDK/creds absent).
     from . import contacts as _band_contacts
+    from . import federation as _band_federation
     from . import tools as _band_tools
 
     for name, schema, handler, emoji in _band_tools.BAND_TOOLS:
@@ -2857,6 +2858,17 @@ def register(ctx) -> None:
         )
 
     for name, schema, handler, emoji in _band_contacts.CONTACT_TOOLS:
+        ctx.register_tool(
+            name=name,
+            toolset="band",
+            schema=schema,
+            handler=handler,
+            check_fn=_band_tools._check_band_tools_available,
+            is_async=True,
+            emoji=emoji,
+        )
+
+    for name, schema, handler, emoji in _band_federation.FEDERATION_TOOLS:
         ctx.register_tool(
             name=name,
             toolset="band",
@@ -2906,6 +2918,18 @@ def register(ctx) -> None:
                 description=(
                     "Handle incoming Band contact requests and manage friend "
                     "connections between Hermes agents."
+                ),
+            )
+        _federated_wiki_md = (
+            _SkillPath(__file__).parent / "skills" / "federated-wiki-search" / "SKILL.md"
+        )
+        if _federated_wiki_md.exists():
+            ctx.register_skill(
+                "federated-wiki-search",
+                _federated_wiki_md,
+                description=(
+                    "Federate an LLM-wiki question to connected Hermes friends' "
+                    "agents and get one consolidated answer back."
                 ),
             )
     except AttributeError:

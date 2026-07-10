@@ -2271,11 +2271,30 @@ class TestMentionParsingDictMetadata:
 
 class TestConnectDisconnect:
 
+    def test_connect_accepts_is_reconnect_kwarg(self):
+        """gateway/run.py calls every adapter as connect(is_reconnect=...).
+
+        hermes-agent pins this contract for its in-tree adapters with an
+        AST-based test (test_adapter_connect_is_reconnect_contract.py), which
+        cannot see an external plugin like this one — so the same contract is
+        pinned here. Without the kwarg the gateway cannot start the adapter
+        at all (TypeError before any connection attempt).
+        """
+        import inspect
+
+        param = inspect.signature(BandAdapter.connect).parameters.get(
+            "is_reconnect"
+        )
+        assert param is not None, "connect() must accept is_reconnect"
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is False
+
     @pytest.mark.asyncio
     async def test_connect_returns_false_when_band_unavailable(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         monkeypatch.setattr(_band_mod, "BAND_AVAILABLE", False)
-        result = await adapter.connect()
+        # Called with the kwarg exactly as gateway/run.py does.
+        result = await adapter.connect(is_reconnect=False)
         assert result is False
         monkeypatch.setattr(_band_mod, "BAND_AVAILABLE", True)
 

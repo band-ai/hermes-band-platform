@@ -598,8 +598,15 @@ class BandAdapter(BasePlatformAdapter):
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Open the Band link, resolve identity, subscribe, start consuming."""
+        # `is_reconnect` is accepted for interface parity with every other
+        # gateway.run.py-invoked adapter (webhook, signal, whatsapp_cloud,
+        # msgraph_webhook, api_server all take it) — required since
+        # hermes-agent's main calls `adapter.connect(is_reconnect=is_reconnect)`
+        # unconditionally. Unused here: Band has no server-side buffered queue
+        # to preserve across a reconnect, the same "ignore if you have no such
+        # queue" pattern webhook.py uses.
         self._reset_failover_state()
         if not self._preflight_ok():
             return False

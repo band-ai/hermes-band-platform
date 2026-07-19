@@ -146,6 +146,10 @@ its platform) into the user-writable `$HERMES_HOME/band-libs/`, verifies `import
 gateway venv is never written to — **no sudo, works when site-packages is read-only**. Re-running
 is safe (idempotent). Env knobs: `HERMES_HOME`, `HERMES_PY` (interpreter override),
 `BAND_SDK_SPEC`.
+
+> Migrating from a pip install? Entry-point plugins **override** directory plugins in the host
+> loader, so a leftover `hermes-band-platform` in the gateway venv shadows this install — the
+> installer warns and prints the exact `uv pip uninstall` to run.
 </details>
 
 <details>

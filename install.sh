@@ -100,6 +100,20 @@ origin = getattr(band, "__file__", None) or "(namespace package)"
 print(f"band-sdk OK:    {origin}")
 PY
 
+# Entry-point plugins override directory plugins on name collision in the host
+# loader, so a leftover pip install of hermes-band-platform in the gateway venv
+# would silently shadow this directory install (and pin whatever version it
+# has). Read-only venvs can't have one; warn on self-managed boxes that do.
+if "$HERMES_PY" -c 'import importlib.metadata as m, sys
+try:
+    m.distribution("hermes-band-platform")
+except m.PackageNotFoundError:
+    sys.exit(1)' 2>/dev/null; then
+  echo "WARNING: hermes-band-platform is pip-installed in the gateway venv and will" >&2
+  echo "         OVERRIDE this directory install. Remove it to make this install take" >&2
+  echo "         effect:  uv pip uninstall --python \"$HERMES_PY\" hermes-band-platform" >&2
+fi
+
 # --- 3. Enable the plugin -----------------------------------------------------
 # --no-allow-tool-override keeps enable non-interactive (band does not replace
 # built-in tools); re-enabling an enabled plugin is a no-op with rc 0.

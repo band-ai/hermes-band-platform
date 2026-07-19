@@ -25,9 +25,13 @@ jobs:
           find staging -name '__pycache__' -type d -prune -exec rm -rf {} +
           find staging -name '*.pyc' -delete
 
+          # Ship the installer next to band/ so an extracted bundle is
+          # self-installing (install.sh detects the band/ layout).
+          cp install.sh staging/
+
           tag="${GITHUB_REF_NAME}"
-          ( cd staging && tar -czf "../hermes-band-platform-${tag}.tar.gz" band )
-          ( cd staging && zip -qr "../hermes-band-platform-${tag}.zip" band )
+          ( cd staging && tar -czf "../hermes-band-platform-${tag}.tar.gz" band install.sh )
+          ( cd staging && zip -qr "../hermes-band-platform-${tag}.zip" band install.sh )
           ls -l hermes-band-platform-*.tar.gz hermes-band-platform-*.zip
 
       - name: Upload bundles to the release

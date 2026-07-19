@@ -43,6 +43,7 @@ Skill helper paths are relative to this skill directory:
 
 - `scripts/gateway_python.py` — resolve + validate the gateway interpreter
 - `scripts/register_agent.py` — temporary registration helper; replace with `band.cli.register_agent` after the SDK CLI is published
+- `scripts/register-agent.sh` — curl-only registration (no SDK, no Python package); what bootstrappers use to mint the agent *before* anything is installed, so the user key never reaches the LLM
 - `scripts/ensure_access_policy.py` — set Band's access policy to `allowlist` so the gateway trusts Band's ACL (idempotent; safe to run anytime)
 - `scripts/ensure_home_channel.py` — set the hub as the home (main) channel by persisting `BAND_HOME_ROOM` (idempotent; safe to run anytime after the hub exists)
 - `scripts/verify_install.py`
@@ -63,21 +64,20 @@ instead of leaving a silent wrong-venv install:
 HERMES_PY="$(scripts/gateway_python.py --print)" || { scripts/gateway_python.py; exit 1; }
 ```
 
-Git-ref package install for now (auto-installs `band-sdk`), then enable with a config fallback for builds whose CLI does not list entry-point plugins. The PyPI-switch PR should change this to a pinned `hermes-band-platform==...` install, but its merge is blocked until the package is published and verified on PyPI:
+Canonical install: the repo's **installer**, which ships the plugin as a **directory plugin** with zero site-packages writes — it works even when the gateway venv (e.g. `/opt/hermes/.venv` on hosted runtimes) is root-owned and read-only. It stages the plugin into `$HERMES_HOME/plugins/band/`, resolves `band-sdk>=1.0.0,<2.0.0` with the gateway interpreter into the user-writable `$HERMES_HOME/band-libs/` (the plugin prepends it to `sys.path` at load), verifies `import band`, and enables the plugin. Idempotent — safe to re-run:
+
+```bash
+# From the repo clone (this skill lives at <repo>/hermes_band_platform/skills/add-band):
+HERMES_PY="$HERMES_PY" ./install.sh    # repo root; honors HERMES_HOME, HERMES_PY
+```
+
+Package install into the gateway's site-packages instead (**only** when the gateway venv is writable — self-managed installs; auto-installs `band-sdk`):
 
 ```bash
 BAND_HERMES_REF="${BAND_HERMES_REF:-main}"
 uv pip install --python "$HERMES_PY" "hermes-band-platform @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF}"
-hermes plugins enable band 2>/dev/null && hermes plugins list | grep -qw band \
+hermes plugins enable band 2>/dev/null && hermes plugins list | grep -w band >/dev/null \
   || "$HERMES_PY" -c "from hermes_cli import plugins_cmd as C; s=C._get_enabled_set(); s.add('band'); C._save_enabled_set(s); print('enabled band via config')"
-```
-Directory plugin install instead (CLI-native, no entry-point caveat; it does **not** install dependencies, so prompt before installing `band-sdk` separately and show the import-check error if the user declines):
-
-```bash
-hermes plugins install band-ai/hermes-band-platform --enable
-echo "Directory plugin installs do not install Python dependencies; installing band-sdk into the gateway Python."
-uv pip install --python "$HERMES_PY" 'band-sdk>=1.0.0,<2.0.0'
-"$HERMES_PY" -c "import band" || { echo "band-sdk is still missing from the gateway Python. Band cannot start until you run: uv pip install --python \"$HERMES_PY\" 'band-sdk>=1.0.0,<2.0.0'" >&2; exit 1; }
 ```
 
 Register (temporary bundled helper — needs `BAND_USER_API_KEY`), ensure the access policy, then verify install / gateway / prove a round-trip (always with the gateway interpreter):
@@ -121,21 +121,19 @@ re-installs or re-registers what's already in place.
    - `access_policy_allowlist` false → set the access policy (step 6).
    - All true → jump to restart + verification (steps 7–9).
 
-3. Install the plugin into `$HERMES_PY` (skip if `package_importable` + `entry_point` are already true).
-   - Git-ref package install for now (auto-installs `band-sdk`). Leave the production PyPI PR blocked until `hermes-band-platform` is published and verified, then switch this to a pinned PyPI version:
+3. Install the plugin (skip if `directory_manifest` or `package_importable` + `entry_point` are already true).
+   - **Canonical: the repo installer** — directory plugin under `$HERMES_HOME`, zero writes to the gateway's site-packages, so it works on hosted runtimes where the gateway venv is read-only. It stages `$HERMES_HOME/plugins/band/`, resolves `band-sdk` into `$HERMES_HOME/band-libs/` with the gateway interpreter, verifies `import band`, and enables the plugin (idempotent):
+     ```bash
+     HERMES_PY="$HERMES_PY" ./install.sh   # at the repo root, three dirs above this skill
+     ```
+   - Package install into site-packages instead — **only when the gateway venv is writable** (self-managed installs; auto-installs `band-sdk`):
      ```bash
      BAND_HERMES_REF="${BAND_HERMES_REF:-main}"
      uv pip install --python "$HERMES_PY" "hermes-band-platform @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF}"
-     ```
-   - Directory install instead (CLI-native; the SDK is not bundled, so explicitly prompt/install it and fail clearly if it remains absent):
-     ```bash
-     hermes plugins install band-ai/hermes-band-platform --enable
-     echo "Directory plugin installs do not install Python dependencies; installing band-sdk into the gateway Python."
-     uv pip install --python "$HERMES_PY" 'band-sdk>=1.0.0,<2.0.0'
-     "$HERMES_PY" -c "import band" || { echo "band-sdk is still missing from the gateway Python. Band cannot start until you run: uv pip install --python \"$HERMES_PY\" 'band-sdk>=1.0.0,<2.0.0'" >&2; exit 1; }
+     hermes plugins enable band
      ```
    - For Nix installs, ensure the package and `band-sdk` are in the gateway Python environment and `plugins.enabled` contains `band`.
-   - **Assert the install landed in the gateway interpreter:** re-run `"$HERMES_PY" scripts/verify_install.py` and confirm `entry_point` (or `directory_manifest`) is now true. This is exactly where the wrong-interpreter trap surfaces — catch it here, not in a silent runtime miss.
+   - **Assert the install landed where the gateway looks:** re-run `"$HERMES_PY" scripts/verify_install.py` and confirm `directory_manifest` (or `entry_point`) plus `sdk_importable` and `band_libs_on_sys_path` are now true. This is exactly where the wrong-interpreter trap surfaces — catch it here, not in a silent runtime miss.
 
 4. Enable the plugin (skip if you used `hermes plugins install … --enable`).
    - Try the CLI; if the build does not list entry-point plugins, write the `plugins.enabled` config directly. The runtime loader honors `plugins.enabled` on every Hermes version. **Never patch Hermes's own source to work around this.**
@@ -197,10 +195,11 @@ re-installs or re-registers what's already in place.
 
 ## Pitfalls
 
-- Installing into a different Python than the gateway's: `import hermes_band_platform` and `hermes plugins list` can look fine from the repo directory (cwd is on `sys.path`), yet the running gateway never discovers it. Always install with `--python "$HERMES_PY"` and confirm from a neutral directory.
+- Installing into a different Python than the gateway's: `import hermes_band_platform` and `hermes plugins list` can look fine from the repo directory (cwd is on `sys.path`), yet the running gateway never discovers it. Always resolve with `--python "$HERMES_PY"` and confirm from a neutral directory.
+- Installing `band-sdk` into the gateway's site-packages on a hosted runtime: the venv (e.g. `/opt/hermes/.venv`) is root-owned and read-only, so `uv pip install --python "$HERMES_PY" band-sdk` dies with `Permission denied`. Use `--target "${HERMES_HOME:-$HOME/.hermes}/band-libs"` (what the installer does) — the plugin prepends that dir to the gateway's `sys.path` at load. Never reach for `sudo`.
 - Patching Hermes's own source to make `hermes plugins enable`/`list` show an entry-point plugin: unnecessary and fragile (it breaks on the next Hermes upgrade and is absent on pip/Docker installs). Use the `plugins.enabled` config fallback instead — the runtime loader honors it regardless.
 - Installing the package but forgetting `hermes plugins enable band` leaves the entry point discovered but inactive.
-- Installing a directory plugin without `band-sdk` in the gateway environment makes the platform unavailable at runtime.
+- Installing a directory plugin without `band-sdk` resolvable by the gateway (in `$HERMES_HOME/band-libs` or site-packages) fails the plugin at load with one actionable error in the gateway log naming the exact `uv pip install --target` fix.
 - Saving `BAND_AGENT_ID` with generic config-setting commands can route it to config YAML instead of Hermes `.env`; use the setup wizard or Hermes env writer.
 - Treating a successful WebSocket connect as full setup is incomplete; the hub must also be created and persisted as `BAND_HUB_ROOM`, **and** the agent must be able to post to it — prove the latter with `scripts/verify_roundtrip.py`, since hub bootstrap runs in a `try/except` that never blocks connect.
 - The agent rejecting senders with "not an authorized user" (owner included): the gateway needs Band's effective access policy to be `allowlist`, not just the `enforces_own_access_policy` flag. Run `scripts/ensure_access_policy.py` (records `platforms.band.extra.group_policy=allowlist`) and restart — it's idempotent and version-independent, so it repairs an already-deployed agent without a plugin reinstall.
@@ -213,7 +212,7 @@ re-installs or re-registers what's already in place.
 ## Verification
 
 - `scripts/gateway_python.py` resolves and version-gates the gateway interpreter (run before anything else).
-- `scripts/verify_install.py` reports package or directory plugin presence, SDK importability, plugin enablement, required credential presence, and whether the access policy authorizes Band traffic (`access_policy_allowlist`). Run it as `$HERMES_PY` so its `entry_point` check reflects the gateway interpreter, not whatever shell python you happen to be in.
+- `scripts/verify_install.py` reports package or directory plugin presence, SDK importability (after applying the same `band-libs` shim the gateway applies — `band_libs_on_sys_path` asserts the shim took effect), plugin enablement, required credential presence, and whether the access policy authorizes Band traffic (`access_policy_allowlist`). Run it as `$HERMES_PY` so its checks reflect the gateway interpreter, not whatever shell python you happen to be in.
 - `scripts/ensure_access_policy.py` sets Band's access policy to `allowlist` so the gateway trusts Band's ACL. Idempotent and safe to run anytime — use it to repair an agent that rejects its owner with "not an authorized user".
 - `scripts/ensure_home_channel.py` persists the hub as the home (main) channel (`BAND_HOME_ROOM`). Idempotent and safe to run anytime after the hub exists — use it to repair an agent that complains it has "no home".
 - `scripts/verify_gateway.py` reports `BAND_HUB_ROOM`, recent Band gateway success signals, and known failure signals.

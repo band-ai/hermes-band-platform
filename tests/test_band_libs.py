@@ -69,6 +69,31 @@ def test_ensure_resolves_band_from_band_libs(monkeypatch, tmp_path, clean_sys_pa
     assert Path(spec.origin).is_relative_to(libs)
 
 
+def test_bootstrap_never_raises_and_logs_the_fix(
+    monkeypatch, tmp_path, clean_sys_path, caplog
+):
+    """Plugin-load-time shim: a missing SDK must NOT abort plugin import —
+    that would drop Band from the platform registry and every channel
+    surface. It logs the one actionable fix instead."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delitem(sys.modules, "band", raising=False)  # auto-restored
+    monkeypatch.setattr(sys, "path", [str(tmp_path / "empty")])
+
+    with caplog.at_level("ERROR", logger="hermes_band_platform._band_libs"):
+        error = _band_libs.bootstrap()  # must not raise
+
+    assert error is not None
+    assert "uv pip install --python" in error
+    assert f'--target "{tmp_path / "band-libs"}"' in error
+    assert any("uv pip install" in r.message for r in caplog.records)
+
+
+def test_bootstrap_returns_none_when_band_resolvable(monkeypatch, tmp_path, clean_sys_path):
+    assert "band" in sys.modules  # conftest stub
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert _band_libs.bootstrap() is None
+
+
 def test_ensure_raises_one_actionable_error(monkeypatch, tmp_path, clean_sys_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delitem(sys.modules, "band", raising=False)  # auto-restored

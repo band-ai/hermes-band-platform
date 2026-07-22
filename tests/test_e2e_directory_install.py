@@ -153,6 +153,8 @@ def test_gateway_loads_plugin_and_sdk_from_user_paths(installed, gateway_venv, g
         import band as band_sdk
         from gateway.platform_registry import platform_registry
 
+        from hermes_cli.gateway import _all_platforms
+
         print(json.dumps({
             "module": band.module.__name__,
             "tools": sorted(band.tools_registered),
@@ -160,6 +162,7 @@ def test_gateway_loads_plugin_and_sdk_from_user_paths(installed, gateway_venv, g
             "band_origin": band_sdk.__file__,
             "band_libs_on_sys_path": any(p.endswith("band-libs") for p in sys.path),
             "platform_registered": platform_registry.is_registered("band"),
+            "band_in_setup_menu": any(p["key"] == "band" for p in _all_platforms()),
         }))
         """
     )
@@ -177,6 +180,36 @@ def test_gateway_loads_plugin_and_sdk_from_user_paths(installed, gateway_venv, g
     assert str(Path(*Path(info["band_origin"]).parts[-3:])).startswith("band-libs")
     assert info["band_libs_on_sys_path"] is True
     assert info["platform_registered"] is True
+    assert info["band_in_setup_menu"] is True
+
+
+def test_band_stays_an_enumerable_channel_without_sdk(
+    installed, gateway_venv, gw_env, hermes_home
+):
+    """REGRESSION GUARD: with band-libs missing (SDK unresolvable), Band must
+    still appear in the gateway's channel enumeration as a degraded channel —
+    an import-time abort silently removed it from every channel surface."""
+    libs = hermes_home / "band-libs"
+    hidden = hermes_home / "band-libs.hidden"
+    libs.rename(hidden)
+    try:
+        probe = textwrap.dedent(
+            """
+            import json
+            from hermes_cli.gateway import _all_platforms
+            keys = [p["key"] for p in _all_platforms()]
+            print(json.dumps({"band_listed": "band" in keys}))
+            """
+        )
+        result = _run(
+            [str(gateway_venv["python"]), "-I", "-c", probe],
+            env=gw_env, timeout=180, cwd=gw_env["HERMES_HOME"],
+        )
+        assert result.returncode == 0, result.stderr
+        info = json.loads(result.stdout.splitlines()[-1])
+        assert info["band_listed"] is True
+    finally:
+        hidden.rename(libs)
 
 
 def test_verify_install_asserts_band_libs_on_gateway_sys_path(

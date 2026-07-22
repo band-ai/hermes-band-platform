@@ -200,13 +200,17 @@ def test_verify_install_asserts_band_libs_on_gateway_sys_path(
 def test_hermes_chat_activates_the_add_band_skill(installed, gw_env):
     """`hermes chat -s band:add-band` must launch and resolve the plugin skill.
 
-    stdin is closed so the REPL exits on EOF; no LLM provider is configured.
-    Skill activation is printed before the first model call, which is all this
-    asserts.
+    A fresh $HERMES_HOME has no LLM provider, so on a clean box (CI — no
+    host-level ~/.hermes auth) `hermes chat` hits the first-run setup gate
+    before it activates any skill. Set a DUMMY OPENAI_API_KEY to clear that
+    gate; it never reaches the network because stdin is closed — the REPL exits
+    on EOF without taking a turn, and skill activation prints before any model
+    call, which is all this asserts.
     """
+    env = {**gw_env, "OPENAI_API_KEY": "sk-not-a-real-key-e2e-offline"}
     result = _run(
         ["hermes", "chat", "-s", "band:add-band"],
-        env=gw_env, timeout=180, stdin=subprocess.DEVNULL,
+        env=env, timeout=180, stdin=subprocess.DEVNULL,
         cwd=gw_env["HERMES_HOME"],
     )
     assert "Activated skills: band:add-band" in result.stdout, result.stdout[-2000:]

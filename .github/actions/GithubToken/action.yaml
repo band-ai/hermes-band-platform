@@ -20,6 +20,27 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    # `required: true` on composite-action inputs is documentation only —
+    # GitHub does not enforce it at runtime, so an unset secret arrives as an
+    # empty string and, unguarded, this action would emit an empty token that
+    # only fails two steps later ("Input required and not supplied: token").
+    # Fail here instead, naming the exact secrets to provision.
+    - name: Validate inputs
+      shell: bash
+      env:
+        app_id: ${{ inputs.app_id }}
+        installation_id: ${{ inputs.installation_id }}
+        private_key: ${{ inputs.private_key }}
+      run: |
+        missing=()
+        [ -n "$app_id" ]          || missing+=("APP_ID")
+        [ -n "$installation_id" ] || missing+=("INSTALLATION_ID")
+        [ -n "$private_key" ]     || missing+=("APP_PRIVATE_KEY")
+        if [ "${#missing[@]}" -gt 0 ]; then
+          echo "::error title=GitHub App secrets not configured::Missing secret(s): ${missing[*]}. Provision them on this repo (or share the band-ai org-level secrets) — same GitHub App as thenvoi-sdk-python. See RELEASING.md, 'One-time setup'."
+          exit 1
+        fi
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -32,7 +53,16 @@ runs:
     - name: Generate token
       id: generate_token_script
       shell: bash
-      run: echo "token=$(python ${{ github.action_path }}/generate_token.py)" >> $GITHUB_OUTPUT
+      run: |
+        # Standalone assignment so `bash -e` propagates the script's exit code
+        # (an `echo "token=$(...)"` one-liner swallows it and emits an empty
+        # token as a green step).
+        token="$(python ${{ github.action_path }}/generate_token.py)"
+        [ -n "$token" ] || { echo "::error::generate_token.py produced an empty token"; exit 1; }
+        # Minted installation tokens are credentials but not workflow secrets —
+        # mask so downstream logging can never echo one.
+        echo "::add-mask::$token"
+        echo "token=$token" >> "$GITHUB_OUTPUT"
       env:
         github_app_id: ${{ inputs.app_id }}
         github_app_installation_id: ${{ inputs.installation_id }}

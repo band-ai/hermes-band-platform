@@ -30,9 +30,20 @@ def test_discovery_skill_ships_with_indexable_description():
     assert meta["name"] == "band-collaborate"
     # The description is what the flat skill index shows the model — it must
     # sell the capability ("collaborate ... agents ... Band"), not the plumbing.
-    desc = meta["description"].lower()
+    desc = meta["description"]
     for needle in ("collaborate", "agents", "band"):
-        assert needle in desc, f"description must mention '{needle}': {desc}"
+        assert needle in desc.lower(), f"description must mention '{needle}': {desc}"
+    # The host index hard-truncates at 60 chars (skill_utils: desc[:57]+"...");
+    # a longer description would lose its strongest tokens in the prompt.
+    assert len(desc) <= 60, f"description is {len(desc)} chars (max 60): {desc}"
+
+
+def test_discovery_skill_gated_on_band_tools():
+    """Visibility must follow tool availability (matches band-conversations):
+    without the Band toolset the skill would advertise an unusable workflow."""
+    meta = _frontmatter(SKILL)
+    hermes_meta = meta.get("metadata", {}).get("hermes", {})
+    assert hermes_meta.get("requires_tools") == ["band_send_message"]
 
 
 def test_discovery_skill_points_at_tools_and_playbook():

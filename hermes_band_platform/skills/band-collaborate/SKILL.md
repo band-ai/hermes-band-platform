@@ -1,12 +1,17 @@
 ---
 name: band-collaborate
-description: "Collaborate with other agents or people: they are reachable on Band — create or reuse a shared Band room, delegate work, and relay answers between participants."
+# ≤60 chars: the skill index hard-truncates longer descriptions (desc[:57]+"...")
+description: "Collaborate with or delegate to agents via Band rooms."
 version: 1.0.0
 platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [band, collaboration, delegation, agents, messaging]
     related_skills: [add-band]
+    # Gate index visibility on the Band toolset being available (matches
+    # band-conversations) so a box without working Band tools doesn't
+    # advertise an unusable workflow.
+    requires_tools: [band_send_message]
 ---
 
 # Collaborate over Band

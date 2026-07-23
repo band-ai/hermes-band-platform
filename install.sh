@@ -80,20 +80,6 @@ cp -R "$plugin_src/." "$tmp/"
 find "$tmp" -name '__pycache__' -type d -prune -exec rm -rf {} +
 find "$tmp" -name '*.pyc' -delete
 
-# --- 1b. Publish the discovery skill into the flat skills tree ----------------
-# Plugin skills never enter the system prompt's skill index (host behavior:
-# opt-in explicit loads only), so outside a Band room the agent has no way to
-# discover that other agents are reachable over Band. The flat
-# $HERMES_HOME/skills tree IS indexed, so stage a thin discovery skill there.
-# Managed by this installer: refreshed (overwritten) on every run.
-flat_skill_dest="$HERMES_HOME/skills/band-collaborate"
-if [ -d "$dest/skills/band-collaborate" ]; then
-  mkdir -p "$HERMES_HOME/skills"
-  rm -rf "$flat_skill_dest"
-  cp -R "$dest/skills/band-collaborate" "$flat_skill_dest"
-  echo "discovery skill: $flat_skill_dest"
-fi
-
 # --- 2. Resolve band-sdk into the user-writable band-libs dir ----------------
 band_libs="$HERMES_HOME/band-libs"
 uv pip install --python "$HERMES_PY" --target "$band_libs" --upgrade "$BAND_SDK_SPEC"
@@ -149,6 +135,21 @@ rm -rf "$dest"
 mv "$tmp" "$dest"
 trap - EXIT
 echo "plugin dir:     $dest"
+
+# --- 4b. Publish the discovery skill into the flat skills tree -----------------
+# Plugin skills never enter the system prompt's skill index (host behavior:
+# opt-in explicit loads only), so outside a Band room the agent has no way to
+# discover that other agents are reachable over Band. The flat
+# $HERMES_HOME/skills tree IS indexed, so stage a thin discovery skill there.
+# Managed by this installer: refreshed (overwritten) on every run. Runs after
+# the swap so it always publishes the version just installed.
+flat_skill_dest="$HERMES_HOME/skills/band-collaborate"
+if [ -d "$dest/skills/band-collaborate" ]; then
+  mkdir -p "$HERMES_HOME/skills"
+  rm -rf "$flat_skill_dest"
+  cp -R "$dest/skills/band-collaborate" "$flat_skill_dest"
+  echo "discovery skill: $flat_skill_dest"
+fi
 
 # --- 5. Enable the plugin -------------------------------------------------------
 # --no-allow-tool-override keeps enable non-interactive (band does not replace

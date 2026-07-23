@@ -66,7 +66,11 @@ sys.exit(0 if (ok_ver and ok_cli) else 1)' \
 fi
 echo "gateway python: $HERMES_PY"
 
-# --- 1. Stage the plugin directory (atomic-ish swap, same filesystem) --------
+# --- 1. Stage the CANDIDATE plugin directory ----------------------------------
+# Staged next to the destination (same filesystem) but NOT swapped in yet:
+# every fallible step below (SDK resolve, import verification, shadow check)
+# runs first, so a failure can never leave a previously-working install
+# replaced by unverified files.
 plugins_dir="$HERMES_HOME/plugins"
 dest="$plugins_dir/band"
 mkdir -p "$plugins_dir"
@@ -75,18 +79,14 @@ trap 'rm -rf "$tmp"' EXIT
 cp -R "$plugin_src/." "$tmp/"
 find "$tmp" -name '__pycache__' -type d -prune -exec rm -rf {} +
 find "$tmp" -name '*.pyc' -delete
-rm -rf "$dest"
-mv "$tmp" "$dest"
-trap - EXIT
-echo "plugin dir:     $dest"
 
 # --- 2. Resolve band-sdk into the user-writable band-libs dir ----------------
 band_libs="$HERMES_HOME/band-libs"
 uv pip install --python "$HERMES_PY" --target "$band_libs" --upgrade "$BAND_SDK_SPEC"
 
 # Prove the gateway will resolve the SDK exactly the way the plugin loads it:
-# through the shipped _band_libs shim, not a hand-rolled sys.path edit.
-HERMES_HOME="$HERMES_HOME" "$HERMES_PY" - "$dest" <<'PY'
+# through the CANDIDATE's _band_libs shim, not a hand-rolled sys.path edit.
+HERMES_HOME="$HERMES_HOME" "$HERMES_PY" -I - "$tmp" <<'PY'
 import importlib.util, sys
 
 shim_path = sys.argv[1] + "/_band_libs.py"
@@ -100,21 +100,43 @@ origin = getattr(band, "__file__", None) or "(namespace package)"
 print(f"band-sdk OK:    {origin}")
 PY
 
+# --- 3. Refuse a pip shadow ----------------------------------------------------
 # Entry-point plugins override directory plugins on name collision in the host
 # loader, so a leftover pip install of hermes-band-platform in the gateway venv
-# would silently shadow this directory install (and pin whatever version it
-# has). Read-only venvs can't have one; warn on self-managed boxes that do.
-if "$HERMES_PY" -c 'import importlib.metadata as m, sys
+# would silently keep the OLD code running while this script reports success.
+# Fail until it is removed (BAND_UNINSTALL_PIP=1 removes it here — a venv that
+# holds a pip copy is by definition writable). With no pip dist present, the
+# directory copy is provably the one the loader uses. Runs after verification
+# so a later failure can't leave the box with neither install.
+# -I (isolated): consult only the gateway venv's own site-packages — a plain
+# -c run from a repo checkout would see its hermes_band_platform.egg-info via
+# cwd on sys.path and report a phantom pip install.
+if "$HERMES_PY" -I -c 'import importlib.metadata as m, sys
 try:
     m.distribution("hermes-band-platform")
 except m.PackageNotFoundError:
     sys.exit(1)' 2>/dev/null; then
-  echo "WARNING: hermes-band-platform is pip-installed in the gateway venv and will" >&2
-  echo "         OVERRIDE this directory install. Remove it to make this install take" >&2
-  echo "         effect:  uv pip uninstall --python \"$HERMES_PY\" hermes-band-platform" >&2
+  if [ "${BAND_UNINSTALL_PIP:-}" = "1" ]; then
+    echo "removing pip-installed hermes-band-platform from the gateway venv (BAND_UNINSTALL_PIP=1)"
+    uv pip uninstall --python "$HERMES_PY" hermes-band-platform \
+      || die "could not uninstall the pip copy; remove it manually and re-run"
+  else
+    die "hermes-band-platform is pip-installed in the gateway venv and would OVERRIDE this
+directory install (the old code would keep running). Remove it first:
+  uv pip uninstall --python \"$HERMES_PY\" hermes-band-platform
+or re-run with BAND_UNINSTALL_PIP=1 to let the installer remove it."
+  fi
 fi
 
-# --- 3. Enable the plugin -----------------------------------------------------
+# --- 4. Swap the verified candidate into place ---------------------------------
+# The only destructive moment: same-filesystem rm+mv after everything fallible
+# has already succeeded.
+rm -rf "$dest"
+mv "$tmp" "$dest"
+trap - EXIT
+echo "plugin dir:     $dest"
+
+# --- 5. Enable the plugin -------------------------------------------------------
 # --no-allow-tool-override keeps enable non-interactive (band does not replace
 # built-in tools); re-enabling an enabled plugin is a no-op with rc 0.
 hermes plugins enable --no-allow-tool-override band || die "hermes plugins enable band failed"

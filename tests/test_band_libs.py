@@ -69,6 +69,31 @@ def test_ensure_resolves_band_from_band_libs(monkeypatch, tmp_path, clean_sys_pa
     assert Path(spec.origin).is_relative_to(libs)
 
 
+def test_no_unsafe_sdk_install_guidance_in_package():
+    """Every band-sdk remediation the plugin can emit must be the
+    read-only-venv-safe ``--target`` form (sourced from
+    ``_band_libs.sdk_install_command``). A bare install into the gateway
+    Python reproduces the hosted-runtime ``Permission denied`` failure."""
+    pkg = Path(_band_libs.__file__).parent
+    offenders = []
+    for py in pkg.rglob("*.py"):
+        for lineno, line in enumerate(py.read_text().splitlines(), 1):
+            if (
+                "pip install" in line
+                and "band-sdk" in line.lower()
+                and "--target" not in line
+            ):
+                offenders.append(f"{py.relative_to(pkg)}:{lineno}: {line.strip()}")
+    assert not offenders, "unsafe band-sdk install guidance:\n" + "\n".join(offenders)
+
+
+def test_sdk_install_command_is_target_form():
+    cmd = _band_libs.sdk_install_command()
+    assert cmd.startswith("uv pip install --python")
+    assert f'--target "{_band_libs.band_libs_dir()}"' in cmd
+    assert _band_libs.BAND_SDK_SPEC in cmd
+
+
 def test_bootstrap_never_raises_and_logs_the_fix(
     monkeypatch, tmp_path, clean_sys_path, caplog
 ):

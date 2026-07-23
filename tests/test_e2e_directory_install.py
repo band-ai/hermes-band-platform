@@ -253,3 +253,35 @@ def test_installer_is_idempotent(installed, gw_env):
     result = _run(["bash", str(REPO / "install.sh")], env=gw_env, cwd=REPO)
     assert result.returncode == 0, f"re-run failed:\n{result.stdout}\n{result.stderr}"
     assert "already enabled" in result.stdout
+
+
+def test_failed_sdk_resolve_preserves_previous_install(installed, gw_env, hermes_home):
+    """REGRESSION GUARD: fallible steps (here: SDK resolution) run against the
+    staged candidate BEFORE the destructive swap — a failure must leave the
+    previously-installed plugin untouched and no staging litter behind."""
+    marker = hermes_home / "plugins" / "band" / ".previous-install-marker"
+    marker.write_text("previous")
+    try:
+        env = {**gw_env, "BAND_SDK_SPEC": "band-sdk==999.999.999"}
+        result = _run(["bash", str(REPO / "install.sh")], env=env, cwd=REPO)
+        assert result.returncode != 0
+        assert marker.is_file(), "previous install was replaced despite a failed step"
+        assert list((hermes_home / "plugins").glob(".band.staging.*")) == []
+    finally:
+        marker.unlink(missing_ok=True)
+
+
+def test_installer_refuses_pip_shadow(gw_env, tmp_path):
+    """A pip-installed hermes-band-platform in the gateway venv overrides the
+    directory plugin, so the installer must FAIL (before the swap) rather than
+    report a success that keeps the old code running. This test's own venv has
+    the editable pip install — the exact shadow scenario."""
+    home = tmp_path / "shadow-home"
+    home.mkdir()
+    env = {**gw_env, "HERMES_HOME": str(home), "HERMES_PY": sys.executable}
+    result = _run(["bash", str(REPO / "install.sh")], env=env, cwd=REPO)
+    assert result.returncode != 0
+    out = result.stdout + result.stderr
+    assert "OVERRIDE" in out and "uv pip uninstall" in out
+    # Refusal happened before the swap: no plugin dir was installed.
+    assert not (home / "plugins" / "band").exists()

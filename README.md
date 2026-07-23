@@ -148,8 +148,10 @@ is safe (idempotent). Env knobs: `HERMES_HOME`, `HERMES_PY` (interpreter overrid
 `BAND_SDK_SPEC`.
 
 > Migrating from a pip install? Entry-point plugins **override** directory plugins in the host
-> loader, so a leftover `hermes-band-platform` in the gateway venv shadows this install — the
-> installer warns and prints the exact `uv pip uninstall` to run.
+> loader, so a leftover `hermes-band-platform` in the gateway venv would silently keep the old
+> code running — the installer **refuses to complete** until it's removed, printing the exact
+> `uv pip uninstall` command (or run with `BAND_UNINSTALL_PIP=1` to let it remove the pip copy
+> itself).
 </details>
 
 <details>

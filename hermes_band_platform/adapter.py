@@ -654,10 +654,12 @@ class BandAdapter(BasePlatformAdapter):
     def _preflight_ok(self) -> bool:
         """Require the SDK to be installed and credentials present (fail-closed)."""
         if not BAND_AVAILABLE:
+            # Single source of truth for the remediation: the read-only-venv-safe
+            # --target form. A bare install into the gateway Python dies with
+            # Permission denied on hosted runtimes.
             msg = (
                 "band-sdk not installed. Directory plugin installs do not install "
-                "Python dependencies; install into the gateway Python with: "
-                "uv pip install --python <gateway-python> 'band-sdk>=1.0.0,<2.0.0'"
+                f"Python dependencies; fix with: {_band_libs.sdk_install_command()}"
             )
             logger.error("[band] %s", msg)
             self._set_fatal_error("dependency_missing", msg, retryable=False)

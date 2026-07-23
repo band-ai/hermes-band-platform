@@ -11,6 +11,50 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# The plugin root that ships this skill: scripts/ -> add-band/ -> skills/ -> root.
+# Repo layout: <repo>/hermes_band_platform; installed: $HERMES_HOME/plugins/band.
+_PLUGIN_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _load_band_libs_shim() -> Any:
+    """Import the plugin's ``_band_libs`` shim by path (no package import)."""
+    path = _PLUGIN_ROOT / "_band_libs.py"
+    if not path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("_band_libs_verify", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception:
+        return None
+
+
+def _apply_band_libs_shim() -> dict[str, Any]:
+    """Mirror the gateway's startup shim: prepend ``$HERMES_HOME/band-libs``.
+
+    Returns ``{present, on_sys_path, dir}`` — run this *before* probing
+    ``import band`` so an SDK that lives only in ``band-libs`` (the read-only
+    site-packages install path) counts as importable, exactly as it does in the
+    gateway process.
+    """
+    shim = _load_band_libs_shim()
+    if shim is None:
+        home = Path(os.environ.get("HERMES_HOME", "").strip() or Path.home() / ".hermes")
+        libs = home / "band-libs"
+        if libs.is_dir() and str(libs) not in sys.path:
+            sys.path.insert(0, str(libs))
+    else:
+        libs = shim.band_libs_dir()
+        shim.prepend_band_libs()
+    return {
+        "present": libs.is_dir(),
+        "on_sys_path": str(libs) in sys.path,
+        "dir": str(libs),
+    }
+
 
 def _entry_points_for_group() -> list[Any]:
     eps = importlib.metadata.entry_points()
@@ -29,7 +73,15 @@ def _has_band_entry_point() -> bool:
 
 
 def _has_directory_manifest() -> bool:
-    root = Path(__file__).resolve().parents[4]
+    # Installed directory plugin ($HERMES_HOME/plugins/band) or repo package
+    # dir: manifest + entry module at the plugin root that ships this skill.
+    if (_PLUGIN_ROOT / "plugin.yaml").exists() and (_PLUGIN_ROOT / "__init__.py").exists():
+        return True
+    # Legacy git-clone-root install: the repo root carries a generated shim.
+    try:
+        root = Path(__file__).resolve().parents[4]
+    except IndexError:
+        return False
     return (root / "plugin.yaml").exists() and (root / "__init__.py").exists()
 
 
@@ -104,6 +156,10 @@ def _conversations_skill_present() -> bool:
 
 
 def verify_install() -> dict[str, Any]:
+    # Apply the gateway's band-libs shim first so ``sdk_importable`` reflects
+    # what the gateway process actually resolves (band-libs is prepended to
+    # sys.path at plugin load; site-packages stays the fallback).
+    band_libs = _apply_band_libs_shim()
     package_importable = importlib.util.find_spec("hermes_band_platform") is not None
     sdk_importable = importlib.util.find_spec("band") is not None
     entry_point = _has_band_entry_point()
@@ -113,9 +169,16 @@ def verify_install() -> dict[str, Any]:
     api_key_present = bool(_env_value("BAND_API_KEY").strip())
     access_policy = _access_policy_allowlist()
     conversations_skill = _conversations_skill_present()
+    # ``band-libs`` must be on the gateway's sys.path whenever the directory
+    # install owns the SDK. When the SDK resolves from site-packages instead
+    # (wheel/self-managed install), the check is satisfied vacuously.
+    band_libs_on_sys_path = band_libs["on_sys_path"] or (
+        sdk_importable and not band_libs["present"]
+    )
     checks = {
         "package_importable": package_importable,
         "sdk_importable": sdk_importable,
+        "band_libs_on_sys_path": band_libs_on_sys_path,
         "entry_point": entry_point,
         "directory_manifest": directory_manifest,
         "plugin_enabled": enabled,
@@ -126,18 +189,27 @@ def verify_install() -> dict[str, Any]:
     }
     missing = [name for name, ok in checks.items() if not ok]
     actions: list[str] = []
-    if "package_importable" in missing or "entry_point" in missing:
+    if not directory_manifest and (
+        "package_importable" in missing or "entry_point" in missing
+    ):
         actions.append(
-            "Install the package into the gateway Python: "
+            "Install the plugin. Canonical (works on read-only gateway venvs, "
+            "no sudo): clone https://github.com/band-ai/hermes-band-platform "
+            "and run ./install.sh — it stages $HERMES_HOME/plugins/band, "
+            "resolves band-sdk into $HERMES_HOME/band-libs, and enables the "
+            "plugin. Package alternative (writable gateway venv only): "
             "uv pip install --python \"$HERMES_PY\" "
             "\"hermes-band-platform @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}\""
         )
-    if "sdk_importable" in missing:
+    if "sdk_importable" in missing or "band_libs_on_sys_path" in missing:
         actions.append(
             "band-sdk is missing. Directory plugin installs do not install Python "
-            "dependencies; install it into the gateway Python with: "
-            "uv pip install --python \"$HERMES_PY\" 'band-sdk>=1.0.0,<2.0.0' "
-            "or \"$HERMES_PY\" -m pip install 'band-sdk>=1.0.0,<2.0.0'."
+            "dependencies, and the gateway's site-packages may be read-only; "
+            "resolve it into the user-writable band-libs dir (needs no sudo and "
+            "no site-packages write): "
+            'uv pip install --python "$HERMES_PY" --target '
+            f"\"{band_libs['dir']}\" 'band-sdk>=1.0.0,<2.0.0' "
+            "— then restart the gateway."
         )
     if "plugin_enabled" in missing:
         actions.append(
@@ -161,14 +233,16 @@ def verify_install() -> dict[str, Any]:
         actions.append(
             "The band-conversations runtime skill is missing (older build); the "
             "agent will connect but lack the multi-participant/delegation playbook. "
-            "Upgrade the package in the gateway Python: uv pip install --python "
-            "\"$HERMES_PY\" --upgrade \"hermes-band-platform @ "
-            "git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}\", "
+            "Refresh the install (re-run ./install.sh from a fresh clone, or for "
+            "package installs: uv pip install --python \"$HERMES_PY\" --upgrade "
+            "\"hermes-band-platform @ "
+            "git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}\"), "
             "then restart the gateway."
         )
     return {
         "success": (
             sdk_importable
+            and band_libs_on_sys_path
             and (package_importable or directory_manifest)
             and (entry_point or directory_manifest)
             and enabled
@@ -178,6 +252,7 @@ def verify_install() -> dict[str, Any]:
             and conversations_skill
         ),
         "checks": checks,
+        "band_libs_dir": band_libs["dir"],
         "missing": missing,
         "actions": actions,
     }

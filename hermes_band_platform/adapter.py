@@ -52,6 +52,8 @@ from gateway.platforms.base import (  # noqa: E402
 )
 from gateway.session import SessionSource, build_session_key  # noqa: E402
 
+from . import _band_libs  # noqa: E402  (stdlib-only shim; safe at module top)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -652,10 +654,12 @@ class BandAdapter(BasePlatformAdapter):
     def _preflight_ok(self) -> bool:
         """Require the SDK to be installed and credentials present (fail-closed)."""
         if not BAND_AVAILABLE:
+            # Single source of truth for the remediation: the read-only-venv-safe
+            # --target form. A bare install into the gateway Python dies with
+            # Permission denied on hosted runtimes.
             msg = (
                 "band-sdk not installed. Directory plugin installs do not install "
-                "Python dependencies; install into the gateway Python with: "
-                "uv pip install --python <gateway-python> 'band-sdk>=1.0.0,<2.0.0'"
+                f"Python dependencies; fix with: {_band_libs.sdk_install_command()}"
             )
             logger.error("[band] %s", msg)
             self._set_fatal_error("dependency_missing", msg, retryable=False)
@@ -2345,6 +2349,15 @@ def check_band_requirements() -> bool:
 
     if BAND_AVAILABLE:
         return True
+    # Re-apply the band-libs shim first: if the SDK was resolved into
+    # $HERMES_HOME/band-libs after this module was imported (the dir didn't
+    # exist at load), the retry below should see it without a restart.
+    try:
+        from ._band_libs import prepend_band_libs
+
+        prepend_band_libs()
+    except Exception:
+        pass
     try:
         from band.platform.link import BandLink as _BandLink
         from band.platform.event import (
@@ -2540,7 +2553,10 @@ def register(ctx) -> None:
         validate_config=validate_config,
         is_connected=_is_connected,
         required_env=["BAND_AGENT_ID", "BAND_API_KEY"],
-        install_hint="pip install 'band-sdk>=1.0.0,<2.0.0'",
+        # Copy-pasteable on read-only gateway venvs too: resolves with the
+        # gateway interpreter but installs to the user-writable band-libs dir
+        # (a bare `pip install` dies with Permission denied on hosted runtimes).
+        install_hint=_band_libs.sdk_install_command(),
         # Interactive setup wizard — gives Band the same native ``hermes gateway
         # setup`` flow as Slack/Discord (called with no args via this hook).
         setup_fn=interactive_setup,

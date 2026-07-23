@@ -35,15 +35,21 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
    Cloudflare 1010 from sparse script fingerprints.
 
 2. Ground rules — honor these even where a step is ambiguous:
-   • Install the plugin into the SAME Python that runs `hermes`, never another venv.
-   • Use the Git-ref package install path until `hermes-band-platform` is published on
-     PyPI. The later PR that switches to pinned PyPI install is blocked until publication
-     is verified.
-   • If you choose `hermes plugins install ... --enable` directory mode, explicitly prompt
-     before installing `band-sdk>=1.0.0,<2.0.0` into the gateway Python and fail with a
-     clear message if `"$HERMES_PY" -c "import band"` still fails.
-   • Never edit or patch Hermes's own source. If the CLI can't enable the plugin, use the
-     plugins.enabled config fallback the skill describes.
+   • Install with the repo's installer: `/tmp/hbp/install.sh`. It ships the plugin as a
+     DIRECTORY plugin under $HERMES_HOME (default ~/.hermes) and resolves
+     `band-sdk>=1.0.0,<2.0.0` into $HERMES_HOME/band-libs with the gateway's interpreter
+     (Python 3.11–3.13) — ZERO writes to the gateway's site-packages, so it works on hosted
+     runtimes where the gateway venv (e.g. /opt/hermes/.venv) is root-owned and read-only.
+   • Never `sudo`, never write to the gateway venv, never edit the gateway's launch env
+     (PYTHONPATH etc.) — the hosting platform resets such changes on redeploy. Everything
+     must land under $HERMES_HOME.
+   • Dependency resolution always uses the gateway interpreter (`--python "$HERMES_PY"`),
+     even though files land in --target $HERMES_HOME/band-libs; wheels must match the
+     gateway's Python. If `import band` still fails after the installer, surface the
+     gateway log's one-line fix verbatim — do not improvise another install route.
+   • Never edit or patch Hermes's own source. `hermes plugins enable band` works natively
+     for directory plugins; the plugins.enabled config fallback is for legacy package
+     installs only.
    • Never make me paste a Band *user* API key into a command — I'll set BAND_USER_API_KEY
      for the one registration step, then remove it.
 
@@ -61,15 +67,14 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
 
 ## Notes
 
-- **Reachability:** the agent must be able to install from
-  `git+https://github.com/band-ai/hermes-band-platform.git@<ref>` for now. Switch
-  to `pip install hermes-band-platform==...` only after the package is published
-  and verified on PyPI.
+- **Reachability:** the agent must be able to clone
+  `https://github.com/band-ai/hermes-band-platform` and let `uv` fetch `band-sdk`
+  wheels from PyPI. No package install of `hermes-band-platform` itself is needed —
+  the installer ships it as a directory plugin.
 - **Already installed?** Once the plugin is installed and the gateway restarted,
-  the skill is also available natively as `hermes /add-band` — the clone step is
-  only needed for the first install on a fresh box.
-- **Directory install alternative:** on Hermes builds whose CLI doesn't list
-  entry-point plugins, `hermes plugins install band-ai/hermes-band-platform
-  --enable` avoids the config fallback and preserves the `plugin.yaml` manifest,
-  but it still requires a separate prompted `band-sdk` install into the gateway
-  Python plus an explicit `import band` check. The skill covers both paths.
+  the skill is also available natively as `hermes chat -s band:add-band` — the
+  clone step is only needed for the first install on a fresh box.
+- **Read-only gateway venv (hosted runtimes — the common case):** the installer is
+  the only supported path; a `pip`/`uv pip` install into the gateway's Python dies
+  with `Permission denied` by design. Package installs into site-packages remain an
+  option solely for self-managed boxes with a writable venv; the skill covers both.

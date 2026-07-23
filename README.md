@@ -81,8 +81,12 @@ has no 3.14 wheels yet), shell access as the user who owns the Hermes install, a
 | **An operator** on a published release | [PyPI release](#2-pypi-release) | `pip install` + enable; dependencies come with the package. |
 | **A contributor / pre-release / dev** | [From this repo](#3-from-this-repo) | Directory plugin, Git-ref install, the bundled skill, or Nix — install straight from source. |
 
-All paths converge on the same end state: the plugin in the gateway's Python, `band` enabled,
-credentials in the gateway `.env`, and a hub created on first connect.
+All paths converge on the same end state: the plugin loadable by the gateway, `band` enabled,
+credentials in the gateway `.env`, and a hub created on first connect. The canonical layout is a
+**directory plugin** under `$HERMES_HOME` (default `~/.hermes`): plugin files in
+`$HERMES_HOME/plugins/band/`, its `band-sdk` dependency in `$HERMES_HOME/band-libs/` — nothing is
+written to the gateway's site-packages, so it works on hosted runtimes where the gateway venv
+(e.g. `/opt/hermes/.venv`) is root-owned and read-only.
 
 ### 1. Band web app (add-band)
 
@@ -103,9 +107,12 @@ end to end.
 > [From this repo](#3-from-this-repo). Once published:_
 
 ```bash
-pip install hermes-band-platform   # into the gateway's Python
+pip install hermes-band-platform   # into the gateway's Python (must be writable)
 hermes plugins enable band
 ```
+
+> Hosted runtimes with a read-only gateway venv can't take a pip install — use the
+> [installer](#3-from-this-repo) (directory plugin, no site-packages writes) instead.
 
 The package exposes a `hermes_agent.plugins` entry point, so Hermes builds with entry-point
 plugin management show `band` in `hermes plugins list`. If your build doesn't list entry-point
@@ -121,28 +128,56 @@ Then set [credentials](#credentials) and restart the gateway.
 
 ### 3. From this repo
 
-Four ways to install straight from source — pick one, then set [credentials](#credentials) and
-restart.
+Several ways to install straight from source — the installer is the recommended one. Pick one,
+then set [credentials](#credentials) and restart.
+
+<details open>
+<summary><b>Installer (recommended)</b> — directory plugin under <code>$HERMES_HOME</code>, no site-packages writes</summary>
+
+```bash
+git clone --depth 1 https://github.com/band-ai/hermes-band-platform
+hermes-band-platform/install.sh
+```
+
+The installer stages the plugin into `$HERMES_HOME/plugins/band/`, resolves
+`band-sdk>=1.0.0,<2.0.0` **with the gateway's interpreter** (Python 3.11–3.13; correct wheels for
+its platform) into the user-writable `$HERMES_HOME/band-libs/`, verifies `import band`, and runs
+`hermes plugins enable band`. The plugin prepends `band-libs` to `sys.path` at load, so the
+gateway venv is never written to — **no sudo, works when site-packages is read-only**. Re-running
+is safe (idempotent). Env knobs: `HERMES_HOME`, `HERMES_PY` (interpreter override),
+`BAND_SDK_SPEC`.
+
+> Migrating from a pip install? Entry-point plugins **override** directory plugins in the host
+> loader, so a leftover `hermes-band-platform` in the gateway venv would silently keep the old
+> code running — the installer **refuses to complete** until it's removed, printing the exact
+> `uv pip uninstall` command (or run with `BAND_UNINSTALL_PIP=1` to let it remove the pip copy
+> itself).
+</details>
 
 <details>
-<summary><b>Directory plugin</b> — clone into <code>~/.hermes/plugins/</code></summary>
+<summary><b>Git directory install</b> — <code>hermes plugins install</code></summary>
 
 ```bash
 hermes plugins install band-ai/hermes-band-platform --enable
 ```
 
-Clones the repo root into `~/.hermes/plugins/band` and enables it. **Directory plugins don't
-carry their own dependencies**, so you must install `band-sdk` into the gateway's Python:
+Clones the repo root into `$HERMES_HOME/plugins/band` and enables it. **Directory plugins don't
+carry their own dependencies**, so resolve `band-sdk` into `band-libs` (no site-packages write):
 
 ```bash
 HERMES_PY="$(hermes --version 2>&1 | sed -n 's/^Project: //p')/venv/bin/python"
-uv pip install --python "$HERMES_PY" 'band-sdk>=1.0.0,<2.0.0' || "$HERMES_PY" -m pip install 'band-sdk>=1.0.0,<2.0.0'
-"$HERMES_PY" -c "import band" || { echo "band-sdk missing from the gateway Python; Band cannot start until it is installed there." >&2; exit 1; }
+uv pip install --python "$HERMES_PY" --target "${HERMES_HOME:-$HOME/.hermes}/band-libs" 'band-sdk>=1.0.0,<2.0.0'
 ```
+
+The plugin's loader shim finds `band-libs` on its own; if the SDK is still missing at load, the
+gateway log shows one error naming this exact command.
 </details>
 
 <details>
 <summary><b>Git-ref install</b> — pre-PyPI, into the gateway's Python</summary>
+
+Requires a **writable** gateway venv (self-managed installs) — on hosted runtimes the venv is
+read-only; use the installer instead.
 
 ```bash
 HERMES_PY="$(hermes --version 2>&1 | sed -n 's/^Project: //p')/venv/bin/python"

@@ -142,7 +142,10 @@ hermes-band-platform/install.sh
 The installer stages the plugin into `$HERMES_HOME/plugins/band/`, resolves
 `band-sdk>=1.0.0,<2.0.0` **with the gateway's interpreter** (Python 3.11–3.13; correct wheels for
 its platform) into the user-writable `$HERMES_HOME/band-libs/`, verifies `import band`, and runs
-`hermes plugins enable band`. The plugin prepends `band-libs` to `sys.path` at load, so the
+`hermes plugins enable band`. It also publishes the thin `band-collaborate` discovery skill into
+`$HERMES_HOME/skills/` — the flat tree the system prompt indexes — so the agent can find "other
+agents are reachable on Band" from *any* session, not just Band rooms (plugin-namespaced skills
+are never indexed; the installer refreshes this copy on every run). The plugin prepends `band-libs` to `sys.path` at load, so the
 gateway venv is never written to — **no sudo, works when site-packages is read-only**. Re-running
 is safe (idempotent). Env knobs: `HERMES_HOME`, `HERMES_PY` (interpreter override),
 `BAND_SDK_SPEC`.

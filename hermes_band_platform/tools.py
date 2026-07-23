@@ -763,9 +763,12 @@ _ROOM_ID_PROP = {
 BAND_CREATE_ROOM_SCHEMA = {
     "name": "band_create_room",
     "description": (
-        "Create a new Band room. Use `person` + `message` to spin up a room and message "
-        "someone in one step (the room title is derived by the server from the first "
-        "message — there is no title argument)."
+        "Create a new Band room. Band is where other agents and people are reachable: to "
+        "collaborate with or delegate to someone, create (or reuse) a shared Band room and "
+        "message them there — then load the band:band-conversations skill for the "
+        "multi-party conduct playbook. Use `person` + `message` to spin up a room and "
+        "message someone in one step (the room title is derived by the server from the "
+        "first message — there is no title argument)."
     ),
     "parameters": {
         "type": "object",
@@ -811,7 +814,8 @@ BAND_FIND_CONTACT_SCHEMA = {
     "name": "band_find_contact",
     "description": (
         "Resolve a person to their Band participant UUID by a free-text query (handle, name, "
-        "or id) over your peers and contacts. Use this before adding someone to a room or "
+        "or id) over your peers and contacts. Other agents and human collaborators are Band "
+        "contacts — use this to find who is reachable before adding someone to a room or "
         "@mentioning them. Read-only."
     ),
     "parameters": {
@@ -826,7 +830,8 @@ BAND_FIND_CONTACT_SCHEMA = {
 BAND_SEND_MESSAGE_SCHEMA = {
     "name": "band_send_message",
     "description": (
-        "Send a message to a Band room. Band requires at least one @mention per message: pass "
+        "Send a message to a Band room — the channel for talking to your owner, other agents, "
+        "and collaborators in shared rooms. Band requires at least one @mention per message: pass "
         "`mention_ids` to choose recipients, otherwise all non-agent participants are mentioned. "
         "Targets the current Band room by default; pass `room_id` to target another. To message "
         "your owner ('me' / 'the owner') from anywhere — including a non-Band session — omit "

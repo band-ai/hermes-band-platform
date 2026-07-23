@@ -127,6 +127,8 @@ def test_installer_lands_everything_under_hermes_home(installed, hermes_home):
     assert (plugin / "skills" / "add-band" / "scripts" / "register_agent.py").is_file()
     assert (plugin / "skills" / "add-band" / "scripts" / "register-agent.sh").is_file()
     assert (hermes_home / "band-libs" / "band" / "__init__.py").is_file()
+    # Discovery skill published into the FLAT tree (the one the prompt indexes).
+    assert (hermes_home / "skills" / "band-collaborate" / "SKILL.md").is_file()
 
 
 def test_installer_never_wrote_to_site_packages(installed, gateway_venv):
@@ -247,6 +249,19 @@ def test_hermes_chat_activates_the_add_band_skill(installed, gw_env):
         cwd=gw_env["HERMES_HOME"],
     )
     assert "Activated skills: band:add-band" in result.stdout, result.stdout[-2000:]
+
+
+def test_flat_discovery_skill_resolves_by_bare_name(installed, gw_env):
+    """The band-collaborate copy in $HERMES_HOME/skills is a flat-tree skill —
+    loadable by bare name from any session (and indexed in the system prompt),
+    unlike plugin skills which need the band: namespace."""
+    env = {**gw_env, "OPENAI_API_KEY": "sk-not-a-real-key-e2e-offline"}
+    result = _run(
+        ["hermes", "chat", "-s", "band-collaborate"],
+        env=env, timeout=180, stdin=subprocess.DEVNULL,
+        cwd=gw_env["HERMES_HOME"],
+    )
+    assert "Activated skills: band-collaborate" in result.stdout, result.stdout[-2000:]
 
 
 def test_installer_is_idempotent(installed, gw_env):

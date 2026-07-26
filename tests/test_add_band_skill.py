@@ -103,6 +103,42 @@ def test_verify_install_reports_missing_requirements(monkeypatch):
     assert "entry_point" in result["missing"]
     assert "band_api_key_present" in result["missing"]
     assert "access_policy_allowlist" in result["missing"]
+    # With no directory manifest, nothing is excused: blocking == missing.
+    assert result["blocking"] == result["missing"]
+
+
+def test_verify_install_does_not_block_on_a_directory_plugin_layout(monkeypatch):
+    """A correct directory install has no importable package and no entry point.
+
+    Those stay in `missing[]` (it is the raw check list) but must not reach
+    `blocking[]`, which is what SKILL.md routes on — otherwise the setup agent is
+    told to re-install a plugin that is already correctly installed.
+    """
+    module = _load_script("verify_install.py")
+    # The package is not importable under this layout; the SDK is (band-libs).
+    monkeypatch.setattr(
+        module.importlib.util,
+        "find_spec",
+        lambda name: None if name == "hermes_band_platform" else SimpleNamespace(origin="x"),
+    )
+    monkeypatch.setattr(module, "_has_band_entry_point", lambda: False)
+    monkeypatch.setattr(module, "_has_directory_manifest", lambda: True)
+    monkeypatch.setattr(module, "_plugin_enabled", lambda: True)
+    monkeypatch.setattr(module, "_env_value", lambda name: "set")
+    monkeypatch.setattr(module, "_access_policy_allowlist", lambda: True)
+    monkeypatch.setattr(module, "_conversations_skill_present", lambda: True)
+    monkeypatch.setattr(
+        module,
+        "_apply_band_libs_shim",
+        lambda: {"dir": "/h/band-libs", "present": True, "on_sys_path": True},
+    )
+
+    result = module.verify_install()
+
+    assert "package_importable" in result["missing"]
+    assert "entry_point" in result["missing"]
+    assert result["blocking"] == []
+    assert not any("Install the plugin" in action for action in result["actions"])
 
 
 def _install_fake_hermes_config(monkeypatch, store: dict):

@@ -188,6 +188,12 @@ def verify_install() -> dict[str, Any]:
         "conversations_skill_present": conversations_skill,
     }
     missing = [name for name, ok in checks.items() if not ok]
+    # `missing` is the raw check list, so on a *correct* directory-plugin install
+    # it still lists package_importable/entry_point — that layout has neither, by
+    # design. Routing off it tells the setup agent to re-install something that is
+    # already installed, so publish the checks that actually gate success.
+    satisfied_by_directory = {"package_importable", "entry_point"} if directory_manifest else set()
+    blocking = [name for name in missing if name not in satisfied_by_directory]
     actions: list[str] = []
     if not directory_manifest and (
         "package_importable" in missing or "entry_point" in missing
@@ -254,6 +260,7 @@ def verify_install() -> dict[str, Any]:
         "checks": checks,
         "band_libs_dir": band_libs["dir"],
         "missing": missing,
+        "blocking": blocking,
         "actions": actions,
     }
 

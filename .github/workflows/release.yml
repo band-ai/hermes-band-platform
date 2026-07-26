@@ -35,19 +35,39 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Generate GitHub App Token
-        id: app_token_generator
-        uses: ./.github/actions/GithubToken
-        with:
-          app_id: ${{ secrets.APP_ID }}
-          installation_id: ${{ secrets.INSTALLATION_ID }}
+      # `create-github-app-token` reports an unset secret as an opaque auth
+      # failure, and an org secret that isn't scoped to this repo arrives as an
+      # empty string with no warning at all — the shape that cost this pipeline
+      # every run from 2026-06-18 on. Name the missing secret and the fix.
+      - name: Check App secrets are visible to this repo
+        env:
+          client_id: ${{ secrets.APP_CLIENT_ID }}
           private_key: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          missing=()
+          [ -n "$client_id" ]   || missing+=("APP_CLIENT_ID")
+          [ -n "$private_key" ] || missing+=("APP_PRIVATE_KEY")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=GitHub App secrets not visible to this repo::Missing secret(s): ${missing[*]}. These exist as band-ai org secrets scoped to selected repositories (band-sdk-python can see them) — add hermes-band-platform to that access list. See RELEASING.md, 'One-time setup'."
+            exit 1
+          fi
+
+      # Same App and inputs as band-ai/band-sdk-python, which publishes band-sdk
+      # to PyPI on every run. The official action derives the installation from
+      # the App, so APP_ID/INSTALLATION_ID are not needed (and don't exist in
+      # this org).
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
       - name: Release Please
         uses: googleapis/release-please-action@v5
         id: release
         with:
-          token: ${{ steps.app_token_generator.outputs.token }}
+          token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           target-branch: main
@@ -59,7 +79,7 @@ jobs:
         # the version bump and `main` is never stale.
         if: ${{ steps.release.outputs.pr }}
         env:
-          GH_TOKEN: ${{ steps.app_token_generator.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           BRANCH='${{ fromJSON(steps.release.outputs.pr).headBranchName }}'

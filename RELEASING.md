@@ -32,13 +32,23 @@ and `flake.nix` (the last two via the `# x-release-please-version` annotations).
 ## One-time setup (required before the first publish)
 
 1. **GitHub App token** — `release.yml` and `promote-dev-to-main.yml` mint a
-   token via `.github/actions/GithubToken`, so the repo (or org) needs these
-   secrets, same as `thenvoi-sdk-python`:
-   - `APP_ID`
-   - `INSTALLATION_ID`
+   token with `actions/create-github-app-token@v3`, which needs two secrets:
+   - `APP_CLIENT_ID`
    - `APP_PRIVATE_KEY`
-   If they're org-level secrets shared across the `band-ai` org, this repo
-   inherits them. Until they exist, the `release` job fails on push to `main`.
+
+   Both already exist as **`band-ai` org secrets**, but they are scoped to
+   *selected repositories* — `band-sdk-python` can see them and this repo
+   cannot. An org owner must add `hermes-band-platform` to that access list
+   (GitHub → org Settings → Secrets and variables → Actions → each secret →
+   Repository access). Nothing new needs to be created.
+
+   A secret that isn't scoped to this repo arrives as an **empty string** with
+   no warning, so both workflows preflight for it and fail with the missing
+   name. Until the scoping is fixed, the `release` job fails on push to `main`.
+
+   > `band-ai/band-sdk-python` is the working reference for this whole pipeline —
+   > same App, same action, same `gh-action-pypi-publish` step. Diff against it
+   > first when releases break.
 2. **`release` environment** — GitHub → Settings → Environments → create
    `release` (add required reviewers there if you want an approval gate before
    the PyPI upload).

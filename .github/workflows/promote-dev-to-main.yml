@@ -29,13 +29,27 @@ jobs:
           fetch-depth: 0
           ref: dev
 
-      - name: Generate GitHub App Token
-        id: app_token_generator
-        uses: ./.github/actions/GithubToken
-        with:
-          app_id: ${{ secrets.APP_ID }}
-          installation_id: ${{ secrets.INSTALLATION_ID }}
+      # See release.yml for why only these two secrets are needed, and why an
+      # unscoped org secret arrives empty rather than erroring.
+      - name: Check App secrets are visible to this repo
+        env:
+          client_id: ${{ secrets.APP_CLIENT_ID }}
           private_key: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          missing=()
+          [ -n "$client_id" ]   || missing+=("APP_CLIENT_ID")
+          [ -n "$private_key" ] || missing+=("APP_PRIVATE_KEY")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=GitHub App secrets not visible to this repo::Missing secret(s): ${missing[*]}. These exist as band-ai org secrets scoped to selected repositories (band-sdk-python can see them) — add hermes-band-platform to that access list. See RELEASING.md, 'One-time setup'."
+            exit 1
+          fi
+
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
       - name: Fetch main
         run: git fetch origin main
@@ -102,7 +116,7 @@ jobs:
       - name: Create Pull Request
         if: steps.check_promotion.outputs.needs_promotion == 'true' && inputs.dry_run == false
         env:
-          GH_TOKEN: ${{ steps.app_token_generator.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           gh pr create \
             --base main \

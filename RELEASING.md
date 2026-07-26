@@ -47,14 +47,21 @@ and `flake.nix` (the last two via the `# x-release-please-version` annotations).
 2. **`release` environment** — GitHub → Settings → Environments → create
    `release` (add required reviewers there if you want an approval gate before
    the PyPI upload).
-3. **PyPI Trusted Publisher** — on PyPI, add a *pending publisher* for the
-   project (it does not exist yet), which also reserves the name on first upload:
+3. **PyPI Trusted Publisher** — add a *pending publisher* for the project (it
+   does not exist on PyPI yet), which also reserves the name on first upload.
+   Add it **from inside the [`Band` PyPI organization](https://pypi.org/org/Band/)**
+   — the org that already owns `band-sdk`, `band-mcp`, `band-client-rest`,
+   `codeband`, `band-testing-python`, and `phoenix-channels-python-client` — so
+   the project is owned by the org rather than one person's account:
    - PyPI project name: `hermes-band`
-   - Owner: `band-ai` (the **GitHub** org — Trusted Publishing keys off GitHub,
-     not a PyPI Organization; there is no `band-ai` PyPI org today)
+   - Owner: `band-ai` — the **GitHub** org. Trusted Publishing keys off GitHub,
+     which is independent of the PyPI org the project lives in.
    - Repository: `hermes-band-platform` (the repo name, unchanged)
    - Workflow name: `release.yml`
    - Environment name: `release`
+
+   > Note the PyPI org slug is `Band` (case-sensitive; `band` redirects to it),
+   > *not* `band-ai` — that 404s and is easy to mistake for "we have no org".
 4. **Branch model** — make `dev` the default working branch and protect `main`.
 
 Until step 3 is done the upload step fails by design — nothing leaks.

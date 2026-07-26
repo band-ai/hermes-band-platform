@@ -6,9 +6,11 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -985,3 +987,202 @@ def test_verify_roundtrip_requires_a_hub_room(monkeypatch, capsys):
     assert rc == 1
     assert payload["success"] is False
     assert "HUB_ROOM" in payload["error"]
+
+
+# ---------------------------------------------------------------------------
+# Install-layout resolution (_plugin_env)
+#
+# The scripts ship inside the plugin, and the plugin lands in three different
+# places. verify_roundtrip.py used to anchor on the package *name* — which does
+# not exist under a directory-plugin install — so the final setup check was
+# unrunnable on exactly the hosts that install path exists for.
+# ---------------------------------------------------------------------------
+
+PLUGIN_FILES = ("adapter.py", "plugin.yaml", "__init__.py")
+
+
+def _fake_directory_install(tmp_path: Path, *, with_sdk: bool = True) -> Path:
+    """Materialize `$HERMES_HOME/plugins/band` the way install.sh stages it.
+
+    The package *contents* are copied in under the name `band`, so nothing named
+    `hermes_band_platform` exists. `_band_libs.py` and `scripts/` are the real
+    files; the rest are markers, so no host `gateway` package is needed.
+    """
+    home = tmp_path / "home"
+    root = home / "plugins" / "band"
+    (root / "skills" / "add-band").mkdir(parents=True)
+    for name in PLUGIN_FILES:
+        (root / name).write_text("")
+    shutil.copy(ROOT / "hermes_band_platform" / "_band_libs.py", root / "_band_libs.py")
+    shutil.copytree(SKILL_DIR / "scripts", root / "skills" / "add-band" / "scripts")
+    if with_sdk:
+        sdk = home / "band-libs" / "band"
+        sdk.mkdir(parents=True)
+        (sdk / "__init__.py").write_text("")
+    return home
+
+
+def _load_plugin_env_from(root: Path):
+    """Load the `_plugin_env` copy that ships in a given tree."""
+    path = root / "skills" / "add-band" / "scripts" / "_plugin_env.py"
+    spec = importlib.util.spec_from_file_location(f"_plugin_env_{id(path)}", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_plugin_env_resolves_a_directory_install(monkeypatch, tmp_path):
+    home = _fake_directory_install(tmp_path)
+    root = home / "plugins" / "band"
+    module = _load_plugin_env_from(root)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    layout = module.resolve_layout(require_sdk=False)
+
+    assert layout.root == root  # found by markers, not by the name it lost
+    assert layout.source == "script-tree"
+    assert layout.hermes_home == home
+    assert layout.band_libs_dir == home / "band-libs"
+    assert layout.error is None
+
+
+def test_plugin_env_infers_hermes_home_from_the_plugin_path(monkeypatch, tmp_path):
+    """A hand-run script with no HERMES_HOME must not point band-libs at ~/.hermes.
+
+    `_band_libs.hermes_home()` reads only the env var, so an unset HERMES_HOME
+    made it emit an install command targeting the wrong directory entirely.
+    """
+    home = _fake_directory_install(tmp_path)
+    module = _load_plugin_env_from(home / "plugins" / "band")
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    # The host API answers with the *machine's* home, which is not this tree's.
+    monkeypatch.setattr(module, "_host_home", lambda: Path.home() / ".hermes")
+
+    layout = module.resolve_layout(require_sdk=False)
+
+    assert layout.hermes_home == home
+    assert layout.hermes_home_source == "inferred-from-plugin-path"
+    assert layout.band_libs_dir == home / "band-libs"
+    # The shim reads the env var, so it has to agree with what we resolved.
+    assert os.environ["HERMES_HOME"] == str(home)
+
+
+def test_plugin_env_prefers_an_explicit_hermes_home(monkeypatch, tmp_path):
+    home = _fake_directory_install(tmp_path)
+    module = _load_plugin_env_from(home / "plugins" / "band")
+    elsewhere = tmp_path / "explicit"
+    monkeypatch.setenv("HERMES_HOME", str(elsewhere))
+
+    layout = module.resolve_layout(require_sdk=False)
+
+    assert layout.hermes_home == elsewhere  # env wins over inference
+    assert layout.hermes_home_source == "env"
+
+
+def test_plugin_env_does_not_put_the_plugin_parent_on_sys_path(monkeypatch, tmp_path):
+    """The regression: `plugins/` on sys.path makes `import band` find the
+    *plugin* package and shadow the SDK, so `band.client` stops existing."""
+    home = _fake_directory_install(tmp_path)
+    root = home / "plugins" / "band"
+    module = _load_plugin_env_from(root)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    module.resolve_layout(require_sdk=False)
+
+    assert str(root.parent) not in sys.path
+    assert str(root) not in sys.path
+    origin = module._sdk_origin()
+    assert origin is None or not Path(origin).resolve().is_relative_to(root)
+
+
+def test_plugin_env_reports_a_shadowed_sdk(monkeypatch, tmp_path):
+    """If anything else shadows the SDK, say so instead of letting
+    `No module named 'band.client'` stand as the whole explanation."""
+    home = _fake_directory_install(tmp_path)
+    root = home / "plugins" / "band"
+    module = _load_plugin_env_from(root)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(module, "_sdk_origin", lambda: str(root / "__init__.py"))
+
+    layout = module.resolve_layout(require_sdk=False)
+
+    assert "shadowing" in (layout.error or "")
+    assert str(root.parent) in layout.error
+
+
+def test_plugin_env_resolves_the_repo_checkout(monkeypatch, tmp_path):
+    module = _load_script("_plugin_env.py")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "unused-home"))
+
+    layout = module.resolve_layout(require_sdk=False)
+
+    assert layout.root == ROOT / "hermes_band_platform"
+    assert layout.source == "script-tree"
+    assert layout.hermes_home_source == "env"  # never inferred outside a plugins/ tree
+
+
+def test_plugin_env_errors_name_every_candidate(monkeypatch, tmp_path):
+    """A scripts-only copy (e.g. ~/.hermes/skills/add-band) has no tree above it."""
+    orphan = tmp_path / "skills" / "add-band" / "scripts"
+    orphan.mkdir(parents=True)
+    shutil.copy(SKILL_DIR / "scripts" / "_plugin_env.py", orphan / "_plugin_env.py")
+    spec = importlib.util.spec_from_file_location("_plugin_env_orphan", orphan / "_plugin_env.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: None)
+
+    layout = module.resolve_layout(require_sdk=True)
+
+    assert layout.root is None
+    assert "install.sh" in layout.error
+    assert [c["source"] for c in layout.candidates] == ["script-tree", "hermes-home"]
+    assert all(c["usable"] is False for c in layout.candidates)
+
+
+# --- drift guards: the inlined copies must agree with the adapter -----------
+
+def test_verify_roundtrip_url_derivation_matches_the_adapter():
+    module = _load_script("verify_roundtrip.py")
+    from hermes_band_platform.adapter import _derive_urls
+
+    for base in ("", "app.band.ai", "https://band.example.com", "http://127.0.0.1:4000"):
+        assert module._rest_url(base) == _derive_urls(base)[1]
+
+
+@pytest.mark.asyncio
+async def test_verify_roundtrip_mentions_match_the_adapter(monkeypatch):
+    """The inlined mention builder must stay equivalent to `_mention_items`."""
+    module = _load_script("verify_roundtrip.py")
+    from hermes_band_platform.adapter import _mention_items
+
+    peers = [
+        SimpleNamespace(id="u1", handle="owner", name="Owner", type="User"),
+        SimpleNamespace(id="bot", handle="agent", name="Agent", type="Agent"),
+        SimpleNamespace(id="self", handle="me", name="Me", type="User"),
+        SimpleNamespace(id=None, handle="ghost", name="Ghost", type="User"),
+    ]
+
+    class _Rest:
+        class agent_api_participants:
+            @staticmethod
+            async def list_agent_chat_participants(chat_id, request_options=None):
+                return SimpleNamespace(data=peers)
+
+    monkeypatch.setattr(module, "_env_value", lambda name: "self" if name == "BAND_AGENT_ID" else "")
+
+    inlined = await module._mentions_for(_Rest(), "room-1")
+    expected = _mention_items(
+        [
+            {"id": p.id, "handle": p.handle, "name": p.name, "type": p.type}
+            for p in peers
+        ],
+        agent_id="self",
+        explicit_ids=None,
+    )
+
+    assert [(m.id, m.handle, m.name) for m in inlined] == [
+        (m.id, m.handle, m.name) for m in expected
+    ]
+    assert [m.id for m in inlined] == ["u1"]  # not the agent, not self, not id-less

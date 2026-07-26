@@ -210,6 +210,69 @@ def test_band_stays_an_enumerable_channel_without_sdk(
         hidden.rename(libs)
 
 
+def test_verify_roundtrip_runs_from_the_directory_install(
+    installed, gateway_venv, gw_env, hermes_home
+):
+    """The round-trip check must be *runnable* here — it used to be impossible.
+
+    It anchored on the package name `hermes_band_platform`, which this layout
+    does not have (the tree is staged as `plugins/band`), and the same line put
+    `plugins/` on `sys.path`, shadowing the `band` SDK with the plugin package.
+
+    Run it with **no BAND_API_KEY**: reaching the credential gate is the proof
+    that the plugin tree, HERMES_HOME, band-libs and the SDK all resolved — with
+    no network, no Band account, and nothing sent.
+    """
+    script = (
+        hermes_home / "plugins" / "band" / "skills" / "add-band" / "scripts"
+        / "verify_roundtrip.py"
+    )
+    env = {**gw_env, "BAND_HUB_ROOM": "room-does-not-matter", "BAND_API_KEY": ""}
+    result = _run(
+        [str(gateway_venv["python"]), "-I", str(script)],
+        env=env, timeout=180, cwd=gw_env["HERMES_HOME"],
+    )
+    report = json.loads(result.stdout)
+
+    assert result.returncode == 1
+    assert report["error"] == "BAND_API_KEY not set"  # got past every layout gate
+    assert "Traceback" not in result.stderr
+    layout = report["layout"]
+    assert layout["plugin_root"] == str(hermes_home / "plugins" / "band")
+    assert layout["hermes_home"] == str(hermes_home)
+    assert layout["band_libs_dir"] == str(hermes_home / "band-libs")
+    assert layout["band_libs_present"] is True
+    # The SDK resolved out of band-libs, not out of the plugin tree.
+    assert "band-libs" in (layout["sdk_origin"] or "")
+
+
+def test_verify_roundtrip_reports_a_missing_sdk_without_a_traceback(
+    installed, gateway_venv, gw_env, hermes_home
+):
+    """With band-libs hidden, fail on the SDK naming the right --target dir."""
+    script = (
+        hermes_home / "plugins" / "band" / "skills" / "add-band" / "scripts"
+        / "verify_roundtrip.py"
+    )
+    libs = hermes_home / "band-libs"
+    hidden = hermes_home / "band-libs.hidden"
+    libs.rename(hidden)
+    try:
+        result = _run(
+            [str(gateway_venv["python"]), "-I", str(script)],
+            env={**gw_env, "BAND_API_KEY": "unused"}, timeout=180,
+            cwd=gw_env["HERMES_HOME"],
+        )
+        report = json.loads(result.stdout)
+        assert result.returncode == 1
+        assert "Traceback" not in result.stderr
+        assert "Band SDK is not importable" in report["error"]
+        assert str(libs) in report["error"]  # the install hint targets the real dir
+        assert report["layout"]["band_libs_present"] is False
+    finally:
+        hidden.rename(libs)
+
+
 def test_verify_install_asserts_band_libs_on_gateway_sys_path(
     installed, gateway_venv, gw_env, hermes_home
 ):

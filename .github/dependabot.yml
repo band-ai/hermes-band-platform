@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # GitHub Actions. The release and publish workflows pin full commit SHAs with
+  # a trailing version comment; Dependabot resolves those the same as tag pins
+  # and updates both the hash and the comment in its PRs. Without this, the pins
+  # silently age — the cost of pinning by SHA is that nothing else moves them.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "main"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"

@@ -1,11 +1,18 @@
 name: Release
 
-# Mirrors the thenvoi-sdk-python publishing model: release-please drives
-# versioning + changelog + GitHub releases from conventional commits, and on a
-# created release the package is built with uv and published to PyPI via
-# Trusted Publishing (OIDC — no API tokens). See RELEASING.md for the one-time
-# setup (GitHub App secrets, the `release` environment, the PyPI trusted
-# publisher) and the dev → main promotion flow.
+# Versioning only. release-please turns conventional-commit history on `main`
+# into a release PR, then a tag + GitHub Release when that PR merges.
+#
+# Nothing is published here. The two publish paths both react to the GitHub
+# Release this workflow creates:
+#   - pypi-publish.yml  → the hermes-band distribution on PyPI
+#   - package.yml       → the drop-in directory-plugin bundles on the Release
+# Keying both off the durable Release means no failure after the tag can strand
+# a tagged release unpublished, and either is re-runnable on its own.
+#
+# Modeled on band-ai/band-sdk-python, which publishes band-sdk on every run —
+# same App, same action, same release-please setup. Diff against it first when
+# releases break. See RELEASING.md for the one-time setup.
 
 on:
   push:
@@ -15,7 +22,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  id-token: write
 
 jobs:
   release:
@@ -31,23 +37,44 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0
 
-      - name: Generate GitHub App Token
-        id: app_token_generator
-        uses: ./.github/actions/GithubToken
-        with:
-          app_id: ${{ secrets.APP_ID }}
-          installation_id: ${{ secrets.INSTALLATION_ID }}
+      # Deviation from band-sdk-python, kept deliberately: an org secret that
+      # isn't scoped to this repo arrives as an empty string with no warning,
+      # and create-github-app-token reports it as an opaque auth failure. That
+      # exact shape cost this pipeline every run from 2026-06-18 to 2026-07-26.
+      # Six lines to name the missing secret instead of rediscovering it.
+      - name: Check App secrets are visible to this repo
+        env:
+          client_id: ${{ secrets.APP_CLIENT_ID }}
           private_key: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          missing=()
+          [ -n "$client_id" ]   || missing+=("APP_CLIENT_ID")
+          [ -n "$private_key" ] || missing+=("APP_PRIVATE_KEY")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error title=GitHub App secrets not visible to this repo::Missing secret(s): ${missing[*]}. They are band-ai org secrets scoped to selected repositories — check that hermes-band-platform is on the access list for each, AND that it is on the band-release-please-public App installation's repository list. See RELEASING.md, 'One-time setup'."
+            exit 1
+          fi
+
+      # The official action derives the installation from the App, so APP_ID and
+      # INSTALLATION_ID are not needed (and do not exist in this org).
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ secrets.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
       - name: Release Please
-        uses: googleapis/release-please-action@v5
+        # Commit-pinned to prevent mutable release tags from changing the
+        # release workflow; Dependabot updates this SHA with each v5 release.
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5
         id: release
         with:
-          token: ${{ steps.app_token_generator.outputs.token }}
+          token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           target-branch: main
@@ -59,54 +86,40 @@ jobs:
         # the version bump and `main` is never stale.
         if: ${{ steps.release.outputs.pr }}
         env:
-          GH_TOKEN: ${{ steps.app_token_generator.outputs.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # A step's env templates are evaluated even when its `if` is false, so
+          # this must stay total on release-creating merges, where the `pr`
+          # output is empty and a bare fromJSON('') fails the whole job.
+          PR_BRANCH: ${{ fromJSON(steps.release.outputs.pr || '{}').headBranchName }}
         run: |
           set -euo pipefail
-          BRANCH='${{ fromJSON(steps.release.outputs.pr).headBranchName }}'
-          git fetch origin "$BRANCH"
-          git checkout "$BRANCH"
+          git fetch origin "$PR_BRANCH"
+          git checkout "$PR_BRANCH"
           python3 scripts/sync_root_manifest.py --write
           if ! git diff --quiet -- plugin.yaml; then
-            git config user.name "thenvoi-release-bot"
-            git config user.email "release-bot@users.noreply.github.com"
+            git config user.name "band-release-bot"
+            git config user.email "release-bot@band.ai"
             git add plugin.yaml
             git commit -m "chore: regenerate root plugin.yaml from packaged manifest"
-            git -c http.extraheader="AUTHORIZATION: bearer $GH_TOKEN" push origin "HEAD:$BRANCH"
+            # Push with the App token (not the default GITHUB_TOKEN) so the PR's
+            # CI re-runs against the regenerated manifest.
+            git -c http.extraheader="AUTHORIZATION: bearer $GH_TOKEN" push origin "HEAD:$PR_BRANCH"
           fi
 
-  publish:
-    needs: [release]
-    if: needs.release.outputs.release_created == 'true'
-    runs-on: ubuntu-latest
-    environment: release
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
-      - name: Build hermes-band-platform package
-        run: uv build
-
-      - name: Publish hermes-band-platform to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-
   summary:
-    needs: [release, publish]
-    if: needs.release.outputs.release_created == 'true'
+    needs: [release]
+    if: ${{ always() && needs.release.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Publish release summary
         run: |
-          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Version:** ${{ needs.release.outputs.major }}.${{ needs.release.outputs.minor }}.${{ needs.release.outputs.patch }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Tag:** ${{ needs.release.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Release Summary"
+            echo ""
+            echo "**Version:** ${{ needs.release.outputs.major }}.${{ needs.release.outputs.minor }}.${{ needs.release.outputs.patch }}"
+            echo "**Tag:** ${{ needs.release.outputs.tag_name }}"
+            echo ""
+            echo "Publishing runs in the release-triggered workflows:"
+            echo "- \`pypi-publish\` — hermes-band to PyPI"
+            echo "- \`package\` — directory-plugin bundles onto the Release"
+          } >> "$GITHUB_STEP_SUMMARY"

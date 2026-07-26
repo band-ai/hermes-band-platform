@@ -154,6 +154,19 @@ is safe (idempotent). Env knobs: `HERMES_HOME`, `HERMES_PY` (interpreter overrid
 > itself).
 </details>
 
+Everything below installs into `$HERMES_PY`, **the interpreter that runs the gateway** — install
+anywhere else and the plugin stays invisible to Hermes. Derive it once from the `hermes` console
+script, whose shebang points at its own interpreter (don't guess `<project>/venv/bin/python`: the
+directory is `.venv` as often as `venv`, and FHS installs have neither):
+
+```bash
+HERMES_PY="${HERMES_PY:-$(sed -n '1s/^#!\([^ ]*\).*/\1/p' "$(command -v hermes)")}"
+case "$HERMES_PY" in */python*) ;; *) echo "set HERMES_PY to the Python that runs hermes" >&2 ;; esac
+```
+
+Once the plugin is installed, `scripts/gateway_python.py --print` does this properly — it
+validates the interpreter instead of deriving it, and the setup skill uses it for every step.
+
 <details>
 <summary><b>Git directory install</b> — <code>hermes plugins install</code></summary>
 
@@ -165,7 +178,6 @@ Clones the repo root into `$HERMES_HOME/plugins/band` and enables it. **Director
 carry their own dependencies**, so resolve `band-sdk` into `band-libs` (no site-packages write):
 
 ```bash
-HERMES_PY="$(hermes --version 2>&1 | sed -n 's/^Project: //p')/venv/bin/python"
 uv pip install --python "$HERMES_PY" --target "${HERMES_HOME:-$HOME/.hermes}/band-libs" 'band-sdk>=1.0.0,<2.0.0'
 ```
 
@@ -180,7 +192,6 @@ Requires a **writable** gateway venv (self-managed installs) — on hosted runti
 read-only; use the installer instead.
 
 ```bash
-HERMES_PY="$(hermes --version 2>&1 | sed -n 's/^Project: //p')/venv/bin/python"
 uv pip install --python "$HERMES_PY" "hermes-band-platform @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}"
 hermes plugins enable band
 ```
@@ -238,7 +249,7 @@ mints an agent and saves only the agent-scoped pair; the user key never reaches 
 
 ```bash
 export BAND_USER_API_KEY=...
-HERMES_PY="$(hermes --version 2>&1 | sed -n 's/^Project: //p')/venv/bin/python"
+HERMES_PY="$(hermes_band_platform/skills/add-band/scripts/gateway_python.py --print)" || exit 1
 "$HERMES_PY" hermes_band_platform/skills/add-band/scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY
 unset BAND_USER_API_KEY
 ```

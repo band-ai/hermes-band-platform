@@ -102,28 +102,34 @@ PY
 
 # --- 3. Refuse a pip shadow ----------------------------------------------------
 # Entry-point plugins override directory plugins on name collision in the host
-# loader, so a leftover pip install of hermes-band-platform in the gateway venv
-# would silently keep the OLD code running while this script reports success.
-# Fail until it is removed (BAND_UNINSTALL_PIP=1 removes it here — a venv that
-# holds a pip copy is by definition writable). With no pip dist present, the
-# directory copy is provably the one the loader uses. Runs after verification
-# so a later failure can't leave the box with neither install.
+# loader, so a leftover pip install in the gateway venv would silently keep the
+# OLD code running while this script reports success. Fail until it is removed
+# (BAND_UNINSTALL_PIP=1 removes it here — a venv that holds a pip copy is by
+# definition writable). With no pip dist present, the directory copy is provably
+# the one the loader uses. Runs after verification so a later failure can't
+# leave the box with neither install.
+# Two names are checked: `hermes-band` (current) and `hermes-band-platform`
+# (pre-rename — gateways set up from the old docs still carry it).
 # -I (isolated): consult only the gateway venv's own site-packages — a plain
 # -c run from a repo checkout would see its hermes_band_platform.egg-info via
 # cwd on sys.path and report a phantom pip install.
-if "$HERMES_PY" -I -c 'import importlib.metadata as m, sys
-try:
-    m.distribution("hermes-band-platform")
-except m.PackageNotFoundError:
-    sys.exit(1)' 2>/dev/null; then
+pip_shadow="$("$HERMES_PY" -I -c 'import importlib.metadata as m
+for name in ("hermes-band", "hermes-band-platform"):
+    try:
+        m.distribution(name)
+    except m.PackageNotFoundError:
+        continue
+    print(name)
+    break' 2>/dev/null || true)"
+if [ -n "$pip_shadow" ]; then
   if [ "${BAND_UNINSTALL_PIP:-}" = "1" ]; then
-    echo "removing pip-installed hermes-band-platform from the gateway venv (BAND_UNINSTALL_PIP=1)"
-    uv pip uninstall --python "$HERMES_PY" hermes-band-platform \
+    echo "removing pip-installed $pip_shadow from the gateway venv (BAND_UNINSTALL_PIP=1)"
+    uv pip uninstall --python "$HERMES_PY" "$pip_shadow" \
       || die "could not uninstall the pip copy; remove it manually and re-run"
   else
-    die "hermes-band-platform is pip-installed in the gateway venv and would OVERRIDE this
+    die "$pip_shadow is pip-installed in the gateway venv and would OVERRIDE this
 directory install (the old code would keep running). Remove it first:
-  uv pip uninstall --python \"$HERMES_PY\" hermes-band-platform
+  uv pip uninstall --python \"$HERMES_PY\" $pip_shadow
 or re-run with BAND_UNINSTALL_PIP=1 to let the installer remove it."
   fi
 fi

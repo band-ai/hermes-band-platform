@@ -3,7 +3,7 @@ requires = ["setuptools>=77.0.0,<78"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hermes-band-platform"
+name = "hermes-band"
 version = "1.0.0"
 description = "Band platform adapter for the Hermes Agent gateway."
 readme = "README.md"

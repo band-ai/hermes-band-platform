@@ -235,7 +235,7 @@ def verify_install() -> dict[str, Any]:
             "agent will connect but lack the multi-participant/delegation playbook. "
             "Refresh the install (re-run ./install.sh from a fresh clone, or for "
             "package installs: uv pip install --python \"$HERMES_PY\" --upgrade "
-            "\"hermes-band-platform @ "
+            "\"hermes-band @ "
             "git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}\"), "
             "then restart the gateway."
         )

@@ -1,4 +1,9 @@
-# Releasing `hermes-band-platform`
+# Releasing `hermes-band`
+
+> The PyPI distribution is **`hermes-band`**. The GitHub repository keeps its
+> `hermes-band-platform` name, and the import package stays `hermes_band_platform`.
+> `hermes-band-platform` on PyPI belongs to an unrelated third party — never publish
+> there. See INT-1137.
 
 Publishing uses the same model as `thenvoi-sdk-python`: **release-please** turns
 conventional-commit history into version bumps + a changelog + a GitHub release,
@@ -42,10 +47,12 @@ and `flake.nix` (the last two via the `# x-release-please-version` annotations).
 2. **`release` environment** — GitHub → Settings → Environments → create
    `release` (add required reviewers there if you want an approval gate before
    the PyPI upload).
-3. **PyPI Trusted Publisher** — on PyPI, add a trusted publisher for the project
-   (or a *pending publisher* before it exists):
-   - Owner: `band-ai`
-   - Repository: `hermes-band-platform`
+3. **PyPI Trusted Publisher** — on PyPI, add a *pending publisher* for the
+   project (it does not exist yet), which also reserves the name on first upload:
+   - PyPI project name: `hermes-band`
+   - Owner: `band-ai` (the **GitHub** org — Trusted Publishing keys off GitHub,
+     not a PyPI Organization; there is no `band-ai` PyPI org today)
+   - Repository: `hermes-band-platform` (the repo name, unchanged)
    - Workflow name: `release.yml`
    - Environment name: `release`
 4. **Branch model** — make `dev` the default working branch and protect `main`.
@@ -55,7 +62,7 @@ Until step 3 is done the upload step fails by design — nothing leaks.
 ## Verify a published release
 
 ```bash
-pip install hermes-band-platform        # also pulls in band-sdk
+pip install hermes-band                 # also pulls in band-sdk
 python -c "import hermes_band_platform; print(hermes_band_platform.__version__)"
 ```
 

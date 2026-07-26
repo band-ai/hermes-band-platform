@@ -272,7 +272,7 @@ def test_failed_sdk_resolve_preserves_previous_install(installed, gw_env, hermes
 
 
 def test_installer_refuses_pip_shadow(gw_env, tmp_path):
-    """A pip-installed hermes-band-platform in the gateway venv overrides the
+    """A pip-installed hermes-band in the gateway venv overrides the
     directory plugin, so the installer must FAIL (before the swap) rather than
     report a success that keeps the old code running. This test's own venv has
     the editable pip install — the exact shadow scenario."""

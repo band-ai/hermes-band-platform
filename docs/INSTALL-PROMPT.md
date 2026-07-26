@@ -69,8 +69,8 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
 
 - **Reachability:** the agent must be able to clone
   `https://github.com/band-ai/hermes-band-platform` and let `uv` fetch `band-sdk`
-  wheels from PyPI. No package install of `hermes-band-platform` itself is needed —
-  the installer ships it as a directory plugin.
+  wheels from PyPI. No package install of `hermes-band` itself is needed — the
+  installer ships it as a directory plugin.
 - **Already installed?** Once the plugin is installed and the gateway restarted,
   the skill is also available natively as `hermes chat -s band:add-band` — the
   clone step is only needed for the first install on a fresh box.

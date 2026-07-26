@@ -75,7 +75,7 @@ Package install into the gateway's site-packages instead (**only** when the gate
 
 ```bash
 BAND_HERMES_REF="${BAND_HERMES_REF:-main}"
-uv pip install --python "$HERMES_PY" "hermes-band-platform @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF}"
+uv pip install --python "$HERMES_PY" "hermes-band @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF}"
 hermes plugins enable band 2>/dev/null && hermes plugins list | grep -w band >/dev/null \
   || "$HERMES_PY" -c "from hermes_cli import plugins_cmd as C; s=C._get_enabled_set(); s.add('band'); C._save_enabled_set(s); print('enabled band via config')"
 ```
@@ -129,7 +129,7 @@ re-installs or re-registers what's already in place.
    - Package install into site-packages instead — **only when the gateway venv is writable** (self-managed installs; auto-installs `band-sdk`):
      ```bash
      BAND_HERMES_REF="${BAND_HERMES_REF:-main}"
-     uv pip install --python "$HERMES_PY" "hermes-band-platform @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF}"
+     uv pip install --python "$HERMES_PY" "hermes-band @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF}"
      hermes plugins enable band
      ```
    - For Nix installs, ensure the package and `band-sdk` are in the gateway Python environment and `plugins.enabled` contains `band`.

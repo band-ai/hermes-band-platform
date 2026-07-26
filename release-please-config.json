@@ -4,7 +4,7 @@
   "include-component-in-tag": false,
   "packages": {
     ".": {
-      "package-name": "hermes-band-platform",
+      "package-name": "hermes-band",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
         "hermes_band_platform/__init__.py",

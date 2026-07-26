@@ -199,7 +199,7 @@ def verify_install() -> dict[str, Any]:
             "resolves band-sdk into $HERMES_HOME/band-libs, and enables the "
             "plugin. Package alternative (writable gateway venv only): "
             "uv pip install --python \"$HERMES_PY\" "
-            "\"hermes-band-platform @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}\""
+            "\"hermes-band @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}\""
         )
     if "sdk_importable" in missing or "band_libs_on_sys_path" in missing:
         actions.append(
@@ -235,7 +235,7 @@ def verify_install() -> dict[str, Any]:
             "agent will connect but lack the multi-participant/delegation playbook. "
             "Refresh the install (re-run ./install.sh from a fresh clone, or for "
             "package installs: uv pip install --python \"$HERMES_PY\" --upgrade "
-            "\"hermes-band-platform @ "
+            "\"hermes-band @ "
             "git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}\"), "
             "then restart the gateway."
         )

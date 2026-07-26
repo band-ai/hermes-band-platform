@@ -64,6 +64,10 @@ instead of leaving a silent wrong-venv install:
 HERMES_PY="$(scripts/gateway_python.py --print)" || { scripts/gateway_python.py; exit 1; }
 ```
 
+If the user already knows the interpreter, pre-set `HERMES_PY` (or `HERMES_PYTHON`) and the
+resolver validates it instead of detecting — an override that can't import `hermes_cli.config`
+is a hard error, never silently replaced by a guess.
+
 Canonical install: the repo's **installer**, which ships the plugin as a **directory plugin** with zero site-packages writes — it works even when the gateway venv (e.g. `/opt/hermes/.venv` on hosted runtimes) is root-owned and read-only. It stages the plugin into `$HERMES_HOME/plugins/band/`, resolves `band-sdk>=1.0.0,<2.0.0` with the gateway interpreter into the user-writable `$HERMES_HOME/band-libs/` (the plugin prepends it to `sys.path` at load), verifies `import band`, and enables the plugin. Idempotent — safe to re-run:
 
 ```bash
@@ -107,7 +111,10 @@ re-installs or re-registers what's already in place.
      HERMES_PY="$(scripts/gateway_python.py --print)" || { scripts/gateway_python.py; exit 1; }
      ```
    - On failure, run `scripts/gateway_python.py` (no `--print`) for the JSON reason
-     (wrong version, `hermes_cli` not importable, candidates tried) and resolve that first.
+     (wrong version, `hermes_cli.config` not importable — with the underlying
+     `ModuleNotFoundError` — and every candidate tried) and resolve that first.
+   - `HERMES_PY` / `HERMES_PYTHON`, if already set, is used and validated instead of
+     detection. Prefer that over guessing when the user knows their layout.
 
 2. Take stock — run `scripts/verify_install.py` with the gateway interpreter and read
    `missing[]`. Do **only** the steps whose checks are missing; skip the rest.
@@ -197,6 +204,7 @@ re-installs or re-registers what's already in place.
 
 - Installing into a different Python than the gateway's: `import hermes_band_platform` and `hermes plugins list` can look fine from the repo directory (cwd is on `sys.path`), yet the running gateway never discovers it. Always resolve with `--python "$HERMES_PY"` and confirm from a neutral directory.
 - Installing `band-sdk` into the gateway's site-packages on a hosted runtime: the venv (e.g. `/opt/hermes/.venv`) is root-owned and read-only, so `uv pip install --python "$HERMES_PY" band-sdk` dies with `Permission denied`. Use `--target "${HERMES_HOME:-$HOME/.hermes}/band-libs"` (what the installer does) — the plugin prepends that dir to the gateway's `sys.path` at load. Never reach for `sudo`.
+- Hand-rolling interpreter detection, or trusting `python -c "import hermes_cli"` as proof: cwd is on `sys.path` for `-c` and `PYTHONPATH` is inherited, so from a Hermes source tree *any* interpreter passes that check — and then fails later with `ModuleNotFoundError: yaml` under a Python that was never the gateway's. Use `scripts/gateway_python.py`, which probes with `-E` from an empty directory and performs the real import.
 - Patching Hermes's own source to make `hermes plugins enable`/`list` show an entry-point plugin: unnecessary and fragile (it breaks on the next Hermes upgrade and is absent on pip/Docker installs). Use the `plugins.enabled` config fallback instead — the runtime loader honors it regardless.
 - Installing the package but forgetting `hermes plugins enable band` leaves the entry point discovered but inactive.
 - Installing a directory plugin without `band-sdk` resolvable by the gateway (in `$HERMES_HOME/band-libs` or site-packages) fails the plugin at load with one actionable error in the gateway log naming the exact `uv pip install --target` fix.

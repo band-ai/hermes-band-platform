@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -337,49 +340,226 @@ def test_register_agent_headers_allow_user_agent_override(monkeypatch):
     assert headers["User-Agent"] == "BandTest/1.0"
 
 
-def _stub_candidates(module, monkeypatch, banner=None, shebang=None, procs=()):
-    monkeypatch.setattr(module, "_from_version_banner", lambda: banner)
+def _stub_candidates(module, monkeypatch, banner=(), sibling=(), shebang=None, procs=()):
+    """Pin every candidate source so a test controls the whole chain."""
+    for var in module.OVERRIDE_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(module, "_from_launcher_sibling", lambda: list(sibling))
+    monkeypatch.setattr(module, "_from_version_banner", lambda: list(banner))
     monkeypatch.setattr(module, "_from_launcher_shebang", lambda: shebang)
     monkeypatch.setattr(module, "_from_running_process", lambda: list(procs))
 
 
+def _usable(module, version=(3, 12, 1)):
+    return module.Probe(version=version, has_hermes_cli=True, prefix="/gw/.venv", base_prefix="/usr")
+
+
+def _unusable(module, version=(3, 13, 0), import_error="ModuleNotFoundError: No module named 'yaml'"):
+    return module.Probe(version=version, has_hermes_cli=False, import_error=import_error)
+
+
+def _fake_hermes_cli(root: Path) -> Path:
+    """A `hermes_cli` package that is importable only via a path leak."""
+    package = root / "hermes_cli"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "config.py").write_text("def save_env_value(name, value):\n    pass\n")
+    return package
+
+
 def test_gateway_python_accepts_supported_interpreter(monkeypatch):
     module = _load_script("gateway_python.py")
-    _stub_candidates(module, monkeypatch, banner="/gw/venv/bin/python")
+    _stub_candidates(module, monkeypatch, shebang="/gw/.venv/bin/python")
     # First candidate imports hermes_cli at a supported version → it wins.
-    monkeypatch.setattr(module, "_probe", lambda path: ((3, 12, 1), True))
+    monkeypatch.setattr(module, "_probe", lambda path: _usable(module))
 
     result = module.resolve()
 
     assert result["ok"] is True
-    assert result["python"] == "/gw/venv/bin/python"
-    assert result["method"] == "version-banner"
+    assert result["python"] == "/gw/.venv/bin/python"
+    assert result["method"] == "launcher-shebang"
     assert result["error"] is None
 
 
 def test_gateway_python_rejects_unsupported_version(monkeypatch):
     module = _load_script("gateway_python.py")
-    _stub_candidates(module, monkeypatch, banner="/gw/venv/bin/python")
-    monkeypatch.setattr(module, "_probe", lambda path: ((3, 14, 0), True))
+    _stub_candidates(module, monkeypatch, shebang="/gw/.venv/bin/python")
+    monkeypatch.setattr(module, "_probe", lambda path: _usable(module, version=(3, 14, 0)))
 
     result = module.resolve()
 
     assert result["ok"] is False
-    assert result["python"] == "/gw/venv/bin/python"  # found, but version-gated
+    assert result["python"] == "/gw/.venv/bin/python"  # found, but version-gated
     assert "3.14" in result["error"]
 
 
 def test_gateway_python_fails_when_no_candidate_has_hermes_cli(monkeypatch):
     module = _load_script("gateway_python.py")
-    _stub_candidates(module, monkeypatch, banner="/some/python")
+    _stub_candidates(module, monkeypatch, shebang="/some/python")
     # No candidate can import hermes_cli (incl. the self fallback).
-    monkeypatch.setattr(module, "_probe", lambda path: ((3, 12, 0), False))
+    monkeypatch.setattr(module, "_probe", lambda path: _unusable(module))
 
     result = module.resolve()
 
     assert result["ok"] is False
     assert result["python"] is None
     assert "hermes_cli" in result["error"]
+
+
+def test_gateway_python_reports_the_missing_dependency(monkeypatch):
+    """A source tree without its deps must name the real cause, not 'not found'.
+
+    This is the `ModuleNotFoundError: yaml` that used to surface only later,
+    inside register_agent.py, under an interpreter already declared good.
+    """
+    module = _load_script("gateway_python.py")
+    _stub_candidates(module, monkeypatch, shebang="/usr/bin/python3.13")
+    monkeypatch.setattr(module, "_probe", lambda path: _unusable(module))
+
+    result = module.resolve()
+
+    assert result["ok"] is False
+    assert "yaml" in result["error"]
+    assert any(entry.get("import_error") for entry in result["candidates"])
+
+
+@pytest.mark.parametrize("var", ["HERMES_PY", "HERMES_PYTHON"])
+def test_gateway_python_honors_the_documented_override(monkeypatch, var):
+    module = _load_script("gateway_python.py")
+    _stub_candidates(module, monkeypatch, shebang="/wrong/python")
+    monkeypatch.setenv(var, "/opt/hermes/.venv/bin/python3")
+    monkeypatch.setattr(module, "_probe", lambda path: _usable(module))
+
+    result = module.resolve()
+
+    assert result["ok"] is True
+    assert result["python"] == "/opt/hermes/.venv/bin/python3"
+    assert result["method"] == "env"
+
+
+def test_gateway_python_override_failure_does_not_fall_through(monkeypatch):
+    """An override the operator got wrong must be loud, never quietly replaced."""
+    module = _load_script("gateway_python.py")
+    _stub_candidates(module, monkeypatch, shebang="/usr/bin/python3.13")
+    monkeypatch.setenv("HERMES_PY", "/opt/hermes/bin/python3")
+    probes = {"/opt/hermes/bin/python3": _unusable(module)}
+    monkeypatch.setattr(module, "_probe", lambda path: probes.get(path, _usable(module)))
+
+    result = module.resolve()
+
+    assert result["ok"] is False
+    assert result["python"] is None  # the usable fallback is NOT substituted
+    assert "HERMES_PY" in result["error"]
+    assert "yaml" in result["error"]
+
+
+def test_gateway_python_finds_a_dot_venv_project_layout(monkeypatch, tmp_path):
+    """`.venv` is the layout the resolver used to miss — it only tried `venv/`."""
+    module = _load_script("gateway_python.py")
+    interpreter = tmp_path / ".venv" / "bin" / "python3"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.touch()
+    monkeypatch.setattr(module, "_hermes_launcher", lambda: "/usr/local/bin/hermes")
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(
+            a[0], 0, stdout=f"hermes 0.18.0\nProject: {tmp_path}\n", stderr=""
+        ),
+    )
+    for var in module.OVERRIDE_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(module, "_from_launcher_sibling", list)
+    monkeypatch.setattr(module, "_from_launcher_shebang", lambda: None)
+    monkeypatch.setattr(module, "_from_running_process", list)
+    monkeypatch.setattr(module, "_probe", lambda path: _usable(module))
+
+    result = module.resolve()
+
+    assert result["ok"] is True
+    assert result["python"] == str(interpreter)
+    assert result["method"] == "version-banner"
+
+
+def test_gateway_python_banner_covers_known_venv_layouts(monkeypatch):
+    module = _load_script("gateway_python.py")
+    monkeypatch.setattr(module, "_hermes_launcher", lambda: "/usr/local/bin/hermes")
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, stdout="Project: /opt/hermes\n", stderr=""),
+    )
+
+    paths = module._from_version_banner()
+
+    assert "/opt/hermes/.venv/bin/python3" in paths
+    assert "/opt/hermes/venv/bin/python" in paths
+    assert any(path.endswith("Scripts/python.exe") for path in paths)
+
+
+def test_probe_ignores_a_hermes_cli_in_the_callers_cwd(monkeypatch, tmp_path):
+    """The regression: cwd is on `sys.path` for `python -c`, so *any* interpreter
+    looked like the gateway's when run from a Hermes source tree."""
+    module = _load_script("gateway_python.py")
+    _fake_hermes_cli(tmp_path)
+    # The fake is genuinely importable from that directory — the test is not vacuous.
+    sanity = subprocess.run(
+        [sys.executable, "-c", "import hermes_cli.config"], cwd=tmp_path, capture_output=True
+    )
+    assert sanity.returncode == 0
+    monkeypatch.chdir(tmp_path)
+
+    probed = module._probe(sys.executable)
+
+    assert probed is not None
+    assert str(tmp_path) not in (probed.origin or "")
+    if not probed.has_hermes_cli:
+        assert probed.import_error  # rejection always carries a reason
+
+
+def test_probe_ignores_a_hermes_cli_on_pythonpath(monkeypatch, tmp_path):
+    module = _load_script("gateway_python.py")
+    _fake_hermes_cli(tmp_path)
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+    sanity = subprocess.run(
+        [sys.executable, "-c", "import hermes_cli.config"], env=env, capture_output=True
+    )
+    assert sanity.returncode == 0
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+
+    probed = module._probe(sys.executable)
+
+    assert probed is not None
+    assert str(tmp_path) not in (probed.origin or "")
+
+
+def test_probe_survives_a_chatty_import(monkeypatch):
+    """Anything printed during import must not corrupt the probe's JSON report."""
+    module = _load_script("gateway_python.py")
+    report = json.dumps(
+        {
+            "version": [3, 12, 4],
+            "prefix": "/opt/hermes/.venv",
+            "base_prefix": "/usr",
+            "hermes_cli": True,
+            "origin": "/opt/hermes/.venv/lib/python3.12/site-packages/hermes_cli/config.py",
+            "origin_in_prefix": True,
+        }
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(
+            a[0], 0, stdout="loading config...\n" + module._MARKER + report, stderr=""
+        ),
+    )
+
+    probed = module._probe("/opt/hermes/.venv/bin/python3")
+
+    assert probed is not None
+    assert probed.version == (3, 12, 4)
+    assert probed.has_hermes_cli is True
+    assert probed.is_venv is True
 
 
 def test_verify_roundtrip_requires_a_hub_room(monkeypatch, capsys):

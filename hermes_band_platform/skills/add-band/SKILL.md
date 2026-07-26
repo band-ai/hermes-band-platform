@@ -115,6 +115,10 @@ re-installs or re-registers what's already in place.
      `ModuleNotFoundError` — and every candidate tried) and resolve that first.
    - `HERMES_PY` / `HERMES_PYTHON`, if already set, is used and validated instead of
      detection. Prefer that over guessing when the user knows their layout.
+   - A `warning:` line on stderr (`is_venv: false` in JSON) means the resolved
+     interpreter is a system Python, not a venv. Exit status is still 0 and the path is
+     still valid — a system-wide Hermes is a real install. Treat it as a prompt to
+     confirm with the user, not a failure; if it's wrong, set `HERMES_PY`.
 
 2. Take stock — run `scripts/verify_install.py` with the gateway interpreter and read
    `missing[]`. Do **only** the steps whose checks are missing; skip the rest.

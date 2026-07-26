@@ -25,9 +25,10 @@ Set ``HERMES_PY`` (or ``HERMES_PYTHON``) to skip detection. An override that
 fails validation is a hard error — it is never silently replaced by a guess.
 
 Modes:
-  (default)   emit JSON ``{ok, python, version, method, candidates, error}``
+  (default)   emit JSON
+              ``{ok, python, version, method, is_venv, candidates, warnings, error}``
   --print     print only the resolved interpreter path (for ``$(...)`` capture);
-              exit non-zero with the reason on stderr if it can't be validated.
+              warnings and, if it can't be validated, the reason go to stderr.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -240,20 +242,102 @@ def _from_launcher_shebang() -> Optional[str]:
     return None
 
 
-def _from_running_process() -> list[str]:
-    """Best-effort: interpreters of running ``hermes`` processes (Linux ``/proc``)."""
-    found: list[str] = []
+# The shapes a real gateway is launched in — ``<python> -m hermes_cli.main
+# [--profile <name>] gateway run`` (service units) and ``<python> <venv>/bin/hermes
+# … gateway run`` or plain ``hermes … gateway run`` (manual/tmux/nohup). Matching a
+# bare "hermes" substring instead also matches this resolver's own path (it lives
+# under ``~/.hermes/``), a ``tail -f ~/.hermes/logs/gateway.log``, an editor, an
+# ``ssh hermes-server`` tunnel, and the bootstrap shell. POSIX ERE only — no GNU
+# shorthand — because BSD ``pgrep`` has to accept it too.
+_GATEWAY_CMDLINE_RE = re.compile(
+    r"(hermes_cli\.main|(^|/)hermes)( +--profile +[a-z0-9][a-z0-9_-]*)? +gateway +run"
+)
+
+
+def _pgrep_gateway_pids() -> list[int]:
+    """PIDs whose full argv looks like an actual gateway launch."""
     try:
         out = subprocess.run(
-            ["pgrep", "-f", "hermes"], capture_output=True, text=True, timeout=10
+            ["pgrep", "-f", _GATEWAY_CMDLINE_RE.pattern],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
-        return found
-    for pid in out.stdout.split():
+        return []
+    pids: list[int] = []
+    for token in out.stdout.split():
         try:
-            found.append(str(Path(f"/proc/{pid}/exe").resolve()))
-        except OSError:
+            pids.append(int(token))
+        except ValueError:
             continue
+    return pids
+
+
+def _proc_cmdline_path(pid: int) -> Path:
+    return Path(f"/proc/{pid}/cmdline")
+
+
+def _argv0_from_proc(pid: int) -> Optional[str]:
+    """argv[0] from Linux ``/proc``. The ``exists()`` check is the platform gate."""
+    path = _proc_cmdline_path(pid)
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    first = raw.split(b"\x00")[0]
+    return first.decode("utf-8", "replace") if first else None
+
+
+def _argv0_from_ps(pid: int) -> Optional[str]:
+    """argv[0] via ``ps`` (macOS/BSD, or any host without ``/proc``).
+
+    Takes the first whitespace-separated token, so an interpreter path containing
+    spaces is not recoverable this way — it simply yields no candidate.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "args=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    args = out.stdout.strip()
+    return args.split(" ", 1)[0] if args else None
+
+
+def _argv0_for_pid(pid: int) -> Optional[str]:
+    """argv[0] exactly as exec'd, or None.
+
+    Deliberately **not** ``/proc/<pid>/exe`` (nor ``ps -o comm=``): a venv's
+    ``bin/python`` is usually a symlink to a base interpreter, and dereferencing it
+    hands back that base interpreter — which cannot see the venv's site-packages
+    and is therefore never the answer we want. It is also how a gateway running
+    ``/opt/hermes/.venv/bin/python3`` gets reported as ``/usr/bin/python3.13``.
+    """
+    return _argv0_from_proc(pid) or _argv0_from_ps(pid)
+
+
+def _from_running_process() -> list[str]:
+    """Interpreters of running gateway processes.
+
+    The only source that still works when ``hermes`` is absent from the invoking
+    shell's PATH (a containerized gateway, or one owned by another user).
+    """
+    exclude = {os.getpid(), os.getppid()}
+    found: list[str] = []
+    for pid in _pgrep_gateway_pids():
+        if pid in exclude:
+            continue
+        argv0 = _argv0_for_pid(pid)
+        if argv0 and "python" in Path(argv0).name:
+            found.append(argv0)
     return found
 
 
@@ -303,7 +387,7 @@ def resolve() -> dict[str, Any]:
         add(banner_python, "version-banner", require_exists=True)
     add(_from_launcher_shebang(), "launcher-shebang")
     for proc_py in _from_running_process():
-        add(proc_py, "running-process")
+        add(proc_py, "running-process", require_exists=True)
     add(sys.executable, "self")
 
     tried: list[dict[str, Any]] = []
@@ -316,12 +400,26 @@ def resolve() -> dict[str, Any]:
         if probed is not None and probed.has_hermes_cli and probed.version is not None:
             vstr = ".".join(str(part) for part in probed.version)
             in_range = MIN_VERSION <= probed.version[:2] <= MAX_VERSION
+            # Shape is a nudge, never a verdict. A system-wide Hermes (distro
+            # package, `pip --break-system-packages`, single-python container) is a
+            # legitimate install, and which candidate *wins* stays a question of
+            # evidence — the method order — not of looks. An explicit override is
+            # the operator's own statement, so it is never second-guessed here.
+            warnings: list[str] = []
+            if in_range and method != "env" and not probed.is_venv:
+                warnings.append(
+                    f"{path} looks like a system Python (sys.prefix == sys.base_prefix), "
+                    "not a virtualenv. If Hermes actually runs from a project venv, set "
+                    "HERMES_PY to point at it."
+                )
             return {
                 "ok": in_range,
                 "python": path,
                 "version": vstr,
                 "method": method,
+                "is_venv": probed.is_venv,
                 "candidates": tried,
+                "warnings": warnings,
                 "error": None if in_range else _version_error(vstr),
             }
 
@@ -338,7 +436,9 @@ def resolve() -> dict[str, Any]:
                 "python": None,
                 "version": None,
                 "method": None,
+                "is_venv": None,
                 "candidates": tried,
+                "warnings": [],
                 "error": (
                     f"{var} points at an interpreter that is not the gateway's: "
                     f"{_rejection(path, probed)}. Fix {var} or unset it to auto-detect."
@@ -353,7 +453,9 @@ def resolve() -> dict[str, Any]:
         "python": None,
         "version": None,
         "method": None,
+        "is_venv": None,
         "candidates": tried,
+        "warnings": [],
         "error": (
             "Could not locate the Python that runs the Hermes gateway — none of the "
             f"candidates could import hermes_cli.config [{detail or 'no candidates'}]. "
@@ -375,6 +477,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     result = resolve()
     if args.print_only:
         if result["ok"] and result["python"]:
+            # stdout stays path-only — callers capture it with `$(...)`.
+            for warning in result.get("warnings") or ():
+                sys.stderr.write(f"warning: {warning}\n")
             print(result["python"])
             return 0
         sys.stderr.write((result.get("error") or "interpreter not resolved") + "\n")

@@ -358,6 +358,11 @@ def _unusable(module, version=(3, 13, 0), import_error="ModuleNotFoundError: No 
     return module.Probe(version=version, has_hermes_cli=False, import_error=import_error)
 
 
+def _system(module, version=(3, 12, 1)):
+    """A usable interpreter that is not a virtualenv (prefix == base_prefix)."""
+    return module.Probe(version=version, has_hermes_cli=True, prefix="/usr", base_prefix="/usr")
+
+
 def _fake_hermes_cli(root: Path) -> Path:
     """A `hermes_cli` package that is importable only via a path leak."""
     package = root / "hermes_cli"
@@ -379,6 +384,8 @@ def test_gateway_python_accepts_supported_interpreter(monkeypatch):
     assert result["python"] == "/gw/.venv/bin/python"
     assert result["method"] == "launcher-shebang"
     assert result["error"] is None
+    assert result["is_venv"] is True
+    assert result["warnings"] == []
 
 
 def test_gateway_python_rejects_unsupported_version(monkeypatch):
@@ -495,6 +502,202 @@ def test_gateway_python_banner_covers_known_venv_layouts(monkeypatch):
     assert "/opt/hermes/.venv/bin/python3" in paths
     assert "/opt/hermes/venv/bin/python" in paths
     assert any(path.endswith("Scripts/python.exe") for path in paths)
+
+
+def test_gateway_python_warns_when_the_winner_is_a_system_interpreter(monkeypatch):
+    module = _load_script("gateway_python.py")
+    _stub_candidates(module, monkeypatch, shebang="/usr/bin/python3")
+    monkeypatch.setattr(module, "_probe", lambda path: _system(module))
+
+    result = module.resolve()
+
+    assert result["ok"] is True  # a system-wide Hermes is legitimate, never a failure
+    assert result["is_venv"] is False
+    assert len(result["warnings"]) == 1
+    assert "/usr/bin/python3" in result["warnings"][0]
+    assert result["error"] is None
+
+
+def test_gateway_python_does_not_warn_when_the_version_is_rejected(monkeypatch):
+    """One problem at a time — don't stack a shape nudge on a hard rejection."""
+    module = _load_script("gateway_python.py")
+    _stub_candidates(module, monkeypatch, shebang="/usr/bin/python3.14")
+    monkeypatch.setattr(module, "_probe", lambda path: _system(module, version=(3, 14, 0)))
+
+    result = module.resolve()
+
+    assert result["ok"] is False
+    assert result["warnings"] == []
+
+
+def test_gateway_python_override_suppresses_the_venv_warning(monkeypatch):
+    """An explicit override is the operator's statement; don't second-guess it."""
+    module = _load_script("gateway_python.py")
+    _stub_candidates(module, monkeypatch, shebang="/gw/.venv/bin/python")
+    monkeypatch.setenv("HERMES_PY", "/usr/bin/python3")
+    monkeypatch.setattr(module, "_probe", lambda path: _system(module))
+
+    result = module.resolve()
+
+    assert result["ok"] is True
+    assert result["method"] == "env"
+    assert result["warnings"] == []
+
+
+def test_gateway_python_prefers_the_earlier_method_over_venv_shape(monkeypatch, tmp_path):
+    """Venv preference is a warning, never a reordering.
+
+    A stronger-confidence method pointing at a system Python still wins over a
+    weaker-confidence candidate that merely *looks* like a venv — shape is not
+    evidence about which interpreter runs the gateway.
+    """
+    module = _load_script("gateway_python.py")
+    system_py = tmp_path / "usr" / "bin" / "python3"
+    venv_py = tmp_path / "gw" / ".venv" / "bin" / "python3"
+    for path in (system_py, venv_py):
+        path.parent.mkdir(parents=True)
+        path.touch()
+    _stub_candidates(module, monkeypatch, sibling=[str(system_py)], banner=[str(venv_py)])
+    probes = {str(system_py): _system(module), str(venv_py): _usable(module)}
+    monkeypatch.setattr(module, "_probe", lambda path: probes[path])
+
+    result = module.resolve()
+
+    assert result["python"] == str(system_py)
+    assert result["method"] == "launcher-sibling"
+    assert result["is_venv"] is False
+    assert len(result["warnings"]) == 1  # nudged, not overridden
+
+
+def test_gateway_python_print_mode_keeps_stdout_path_only(monkeypatch, capsys):
+    """The `$(...)` contract: warnings go to stderr, stdout stays parseable."""
+    module = _load_script("gateway_python.py")
+    monkeypatch.setattr(
+        module,
+        "resolve",
+        lambda: {
+            "ok": True,
+            "python": "/usr/bin/python3",
+            "warnings": ["/usr/bin/python3 looks like a system Python"],
+        },
+    )
+
+    rc = module.main(["--print"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert captured.out == "/usr/bin/python3\n"
+    assert "warning: /usr/bin/python3 looks like a system Python" in captured.err
+
+
+@pytest.mark.parametrize(
+    "cmdline",
+    [
+        "/opt/hermes/.venv/bin/python -m hermes_cli.main gateway run --replace",
+        "/opt/hermes/.venv/bin/python -m hermes_cli.main --profile coder gateway run",
+        "/opt/hermes/.venv/bin/python /opt/hermes/.venv/bin/hermes gateway run",
+        "hermes gateway run",
+    ],
+)
+def test_gateway_cmdline_regex_matches_real_launch_shapes(cmdline):
+    module = _load_script("gateway_python.py")
+    assert module._GATEWAY_CMDLINE_RE.search(cmdline)
+
+
+@pytest.mark.parametrize(
+    "cmdline",
+    [
+        # Every one of these matched the old bare-"hermes" pattern.
+        "python3 /root/.hermes/plugins/band/skills/add-band/scripts/gateway_python.py",
+        "tail -f /root/.hermes/logs/gateway.log",
+        "/usr/bin/ssh -N -T -o BatchMode=yes hermes-server",
+        "bash /home/nirs/band/add-band/hermes/bootstrap.sh",
+        "/root/.hermes/hermes-agent/venv/bin/python /root/.hermes/hermes-agent/tools/"
+        "mcp_stdio_watchdog.py --ppid 7385",
+        "hermes chat -s band:add-band",
+    ],
+)
+def test_gateway_cmdline_regex_rejects_incidental_hermes_mentions(cmdline):
+    module = _load_script("gateway_python.py")
+    assert not module._GATEWAY_CMDLINE_RE.search(cmdline)
+
+
+def test_pgrep_gateway_pids_parses_the_pid_list(monkeypatch):
+    module = _load_script("gateway_python.py")
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, stdout="111\n222\n", stderr=""),
+    )
+
+    assert module._pgrep_gateway_pids() == [111, 222]
+
+
+def test_pgrep_gateway_pids_survives_a_missing_pgrep(monkeypatch):
+    module = _load_script("gateway_python.py")
+
+    def _boom(*a, **kw):
+        raise FileNotFoundError("pgrep")
+
+    monkeypatch.setattr(module.subprocess, "run", _boom)
+
+    assert module._pgrep_gateway_pids() == []
+
+
+def test_argv0_from_proc_reads_the_nul_separated_cmdline(monkeypatch, tmp_path):
+    module = _load_script("gateway_python.py")
+    cmdline = tmp_path / "cmdline"
+    cmdline.write_bytes(b"/opt/hermes/.venv/bin/python3\x00-m\x00hermes_cli.main\x00gateway\x00run\x00")
+    monkeypatch.setattr(module, "_proc_cmdline_path", lambda pid: cmdline)
+
+    assert module._argv0_from_proc(1) == "/opt/hermes/.venv/bin/python3"
+
+
+def test_argv0_from_ps_takes_the_first_argument(monkeypatch):
+    module = _load_script("gateway_python.py")
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(
+            a[0], 0, stdout="/opt/hermes/.venv/bin/python3 -m hermes_cli.main gateway run\n", stderr=""
+        ),
+    )
+
+    assert module._argv0_from_ps(1) == "/opt/hermes/.venv/bin/python3"
+
+
+def test_argv0_for_pid_falls_back_to_ps_without_proc(monkeypatch, tmp_path):
+    """No /proc (macOS/BSD) is the common case, not an error path."""
+    module = _load_script("gateway_python.py")
+    monkeypatch.setattr(module, "_proc_cmdline_path", lambda pid: tmp_path / "absent" / "cmdline")
+    monkeypatch.setattr(module, "_argv0_from_ps", lambda pid: "/opt/hermes/.venv/bin/python3")
+
+    assert module._argv0_for_pid(1) == "/opt/hermes/.venv/bin/python3"
+
+
+def test_argv0_for_pid_never_invents_a_proc_path(monkeypatch, tmp_path):
+    """The regression: `/proc/<pid>/exe` used to be returned verbatim on macOS,
+    because non-strict `resolve()` normalizes a nonexistent path instead of failing."""
+    module = _load_script("gateway_python.py")
+    monkeypatch.setattr(module, "_proc_cmdline_path", lambda pid: tmp_path / "absent" / "cmdline")
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *a, **kw: subprocess.CompletedProcess(a[0], 1, stdout="", stderr=""),
+    )
+
+    assert module._argv0_for_pid(7385) is None
+
+
+def test_from_running_process_drops_self_parent_and_non_python(monkeypatch):
+    module = _load_script("gateway_python.py")
+    monkeypatch.setattr(module.os, "getpid", lambda: 10)
+    monkeypatch.setattr(module.os, "getppid", lambda: 11)
+    monkeypatch.setattr(module, "_pgrep_gateway_pids", lambda: [10, 11, 333, 444])
+    argv0 = {10: "/self/python3", 11: "/parent/python3", 333: "/bin/bash", 444: "/opt/hermes/.venv/bin/python3"}
+    monkeypatch.setattr(module, "_argv0_for_pid", lambda pid: argv0[pid])
+
+    assert module._from_running_process() == ["/opt/hermes/.venv/bin/python3"]
 
 
 def test_probe_ignores_a_hermes_cli_in_the_callers_cwd(monkeypatch, tmp_path):

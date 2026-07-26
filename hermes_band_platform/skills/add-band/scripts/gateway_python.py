@@ -49,6 +49,12 @@ MAX_VERSION = (3, 13)  # inclusive; band-sdk has no 3.14 wheels yet
 
 OVERRIDE_VARS = ("HERMES_PY", "HERMES_PYTHON")
 
+# The ``kind`` the gateway stamps into ``$HERMES_HOME/gateway.pid``.
+_GATEWAY_PID_KIND = "hermes-gateway"
+
+# Methods whose evidence is the *running* gateway rather than this shell's PATH.
+_PROCESS_METHODS = ("pid-file", "running-process")
+
 # Venv layouts seen in the wild under a Hermes project directory. `hermes --version`
 # reports the project, not the interpreter, and the layout is not fixed: uv's
 # `.venv`, a classic `venv`, and FHS-style installs with `bin/` at the root.
@@ -225,13 +231,14 @@ def _from_version_banner() -> list[str]:
     return []
 
 
-def _from_launcher_shebang() -> Optional[str]:
-    """Read the ``hermes`` launcher's shebang interpreter, if it's a real path."""
-    hermes = _hermes_launcher()
-    if not hermes:
-        return None
+def _shebang_interpreter(script: str) -> Optional[str]:
+    """The interpreter named in ``script``'s shebang, if it is a real path.
+
+    A console script installed into a venv carries that venv's interpreter on line
+    one, which is how a non-Python argv[0] still yields an interpreter.
+    """
     try:
-        with open(hermes, "rb") as handle:
+        with open(script, "rb") as handle:
             first = handle.readline(256).decode("utf-8", "replace").strip()
     except OSError:
         return None
@@ -242,15 +249,43 @@ def _from_launcher_shebang() -> Optional[str]:
     return None
 
 
-# The shapes a real gateway is launched in — ``<python> -m hermes_cli.main
-# [--profile <name>] gateway run`` (service units) and ``<python> <venv>/bin/hermes
-# … gateway run`` or plain ``hermes … gateway run`` (manual/tmux/nohup). Matching a
-# bare "hermes" substring instead also matches this resolver's own path (it lives
-# under ``~/.hermes/``), a ``tail -f ~/.hermes/logs/gateway.log``, an editor, an
-# ``ssh hermes-server`` tunnel, and the bootstrap shell. POSIX ERE only — no GNU
-# shorthand — because BSD ``pgrep`` has to accept it too.
+def _from_launcher_shebang() -> Optional[str]:
+    """Read the ``hermes`` launcher's shebang interpreter, if it's a real path."""
+    hermes = _hermes_launcher()
+    return _shebang_interpreter(hermes) if hermes else None
+
+
+# The shapes a real gateway is launched in. This mirrors the host's own
+# tokenizing matcher (``gateway/status.py::_gateway_command_subcommand``), which
+# cannot be reused directly: it is a function inside the interpreter this script
+# exists to find. Covered:
+#
+#   <python> -m hermes_cli.main [-p <name>] gateway run      (service units)
+#   <python> <venv>/bin/hermes --profile=<name> gateway run  (manual/tmux/nohup)
+#   <python> <site-packages>/gateway/run.py                  (runtime entry point)
+#   hermes-gateway[.exe]                                     (dedicated launcher)
+#
+# ``hermes -p <profile> gateway run --replace`` is what the host writes into every
+# non-default profile's service unit (``hermes_cli/service_manager.py:705``), so
+# not matching ``-p``/``--profile=`` means finding no gateway at all whenever a
+# profile is in use. A bare ``gateway`` defaults to ``run``, hence ``( +run|$)`` —
+# which still rejects the management subcommands (``gateway status``, ``stop``,
+# ``restart``). Matching a loose "hermes" substring instead would match this
+# resolver's own path (it lives under ``~/.hermes/``), a ``tail -f
+# ~/.hermes/logs/gateway.log``, an ``ssh hermes-server`` tunnel, and the
+# bootstrap shell. POSIX ERE only — no GNU shorthand, no inline flags — because
+# BSD ``pgrep`` has to accept the identical pattern.
+_PROFILE_SELECTOR = r"(--profile|-p)( +|=)[A-Za-z0-9][A-Za-z0-9_.-]*"
+
 _GATEWAY_CMDLINE_RE = re.compile(
-    r"(hermes_cli\.main|(^|/)hermes)( +--profile +[a-z0-9][a-z0-9_-]*)? +gateway +run"
+    # Entry points that *are* the gateway — no subcommand follows them.
+    r"((^|/)gateway/run\.py"
+    r"|(^|/)hermes-gateway(\.exe)?( |$)"
+    # …and the `hermes … gateway [run]` dispatch. Profile selectors may sit
+    # between the launcher and the subcommand (the host strips them before
+    # argparse), and a profile may legally be *named* "gateway".
+    r"|(hermes_cli\.main|hermes_cli/main\.py|(^|/)hermes)"
+    r"( +" + _PROFILE_SELECTOR + r")* +gateway( +run|$))"
 )
 
 
@@ -291,12 +326,8 @@ def _argv0_from_proc(pid: int) -> Optional[str]:
     return first.decode("utf-8", "replace") if first else None
 
 
-def _argv0_from_ps(pid: int) -> Optional[str]:
-    """argv[0] via ``ps`` (macOS/BSD, or any host without ``/proc``).
-
-    Takes the first whitespace-separated token, so an interpreter path containing
-    spaces is not recoverable this way — it simply yields no candidate.
-    """
+def _cmdline_from_ps(pid: int) -> Optional[str]:
+    """The full command line via ``ps`` (macOS/BSD, or any host without ``/proc``)."""
     try:
         out = subprocess.run(
             ["ps", "-o", "args=", "-p", str(pid)],
@@ -308,8 +339,34 @@ def _argv0_from_ps(pid: int) -> Optional[str]:
         return None
     if out.returncode != 0:
         return None
-    args = out.stdout.strip()
+    return out.stdout.strip() or None
+
+
+def _argv0_from_ps(pid: int) -> Optional[str]:
+    """argv[0] via ``ps`` (macOS/BSD, or any host without ``/proc``).
+
+    Takes the first whitespace-separated token, so an interpreter path containing
+    spaces is not recoverable this way — it simply yields no candidate.
+    """
+    args = _cmdline_from_ps(pid)
     return args.split(" ", 1)[0] if args else None
+
+
+def _cmdline_from_proc(pid: int) -> Optional[str]:
+    """The full command line from Linux ``/proc``, NUL separators flattened."""
+    path = _proc_cmdline_path(pid)
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    return raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip() or None
+
+
+def _cmdline_for_pid(pid: int) -> Optional[str]:
+    """A process's full command line, for deciding *whether* it is the gateway."""
+    return _cmdline_from_proc(pid) or _cmdline_from_ps(pid)
 
 
 def _argv0_for_pid(pid: int) -> Optional[str]:
@@ -324,11 +381,120 @@ def _argv0_for_pid(pid: int) -> Optional[str]:
     return _argv0_from_proc(pid) or _argv0_from_ps(pid)
 
 
-def _from_running_process() -> list[str]:
-    """Interpreters of running gateway processes.
+def _interpreters_for_argv0(argv0: str) -> list[str]:
+    """Interpreter candidates implied by a process's argv[0].
 
-    The only source that still works when ``hermes`` is absent from the invoking
-    shell's PATH (a containerized gateway, or one owned by another user).
+    ``<python> -m hermes_cli.main …`` names the interpreter outright. A console
+    script launch (``/opt/hermes/.venv/bin/hermes gateway run``) does not — and
+    requiring "python" in the name, as this used to, silently yielded *no*
+    candidate for that entire launch shape. The script's shebang and its sibling
+    ``python`` both name the venv it was installed into, so derive from those
+    instead. Anything that is neither a Python nor a ``hermes*`` launcher gets no
+    guess at all: that filter is what keeps unrelated PIDs from contributing junk.
+    """
+    name = Path(argv0).name
+    if "python" in name:
+        return [argv0]
+    if not name.startswith("hermes"):
+        return []
+    found: list[str] = []
+    shebang = _shebang_interpreter(argv0)
+    if shebang:
+        found.append(shebang)
+    bindir = Path(argv0).parent
+    found.extend(str(bindir / candidate) for candidate in ("python3", "python", "python.exe"))
+    return found
+
+
+def _hermes_home() -> Path:
+    """The Hermes home whose gateway state this resolver should read.
+
+    Env-or-default on purpose, never ``hermes_cli.config.get_hermes_home()``:
+    importing the host requires the very interpreter being identified. This
+    mirrors the host's own ``_get_process_hermes_home()``, which exists for the
+    related reason that gateway identity files always belong to the home the
+    gateway process was launched with.
+    """
+    explicit = os.environ.get("HERMES_HOME", "").strip()
+    return Path(explicit).expanduser() if explicit else Path.home() / ".hermes"
+
+
+def _gateway_pid_record() -> Optional[dict[str, Any]]:
+    """Hermes's own record of the running gateway (``$HERMES_HOME/gateway.pid``).
+
+    The strongest evidence there is: the gateway wrote it about itself, and it is
+    scoped to *this* home, so a profile's gateway is never confused with the root
+    one. It records ``{pid, kind, argv, start_time}`` — note that ``argv[0]`` is
+    the *script* (``…/hermes_cli/main.py``), never the interpreter. So the record
+    identifies the process, and the live process supplies the interpreter.
+    """
+    try:
+        raw = (_hermes_home() / "gateway.pid").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or not isinstance(record.get("pid"), int):
+        return None
+    kind = record.get("kind")
+    if kind is not None and kind != _GATEWAY_PID_KIND:
+        return None
+    return record
+
+
+def _pid_is_live(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True  # alive, just owned by another user (container/system service)
+    except OSError:
+        return False
+    return True
+
+
+def _from_pid_file() -> list[str]:
+    """The interpreter of the gateway Hermes itself says is running.
+
+    Ranked above every PATH-derived source: when ``hermes`` on this PATH belongs
+    to one environment while the service runs from another, the launcher is a
+    guess and this is a fact. Ranked above ``pgrep`` too, because it is scoped to
+    one Hermes home instead of picking arbitrarily among several gateways.
+    """
+    record = _gateway_pid_record()
+    if record is None:
+        return []
+    pid = int(record["pid"])
+    if not _pid_is_live(pid):
+        return []
+    argv0 = _argv0_for_pid(pid)
+    if not argv0:
+        return []
+    # PID-reuse guard: the recorded PID may since have been recycled by something
+    # unrelated. Compare against the *recorded* argv rather than
+    # ``_GATEWAY_CMDLINE_RE``, so a launch shape this pattern doesn't know about
+    # still validates — that record came from the gateway itself.
+    cmdline = _cmdline_for_pid(pid) or ""
+    argv = record.get("argv")
+    tail = " ".join(str(part) for part in argv[1:]) if isinstance(argv, list) else ""
+    if tail:
+        if tail not in cmdline:
+            return []
+    elif not _GATEWAY_CMDLINE_RE.search(cmdline):
+        return []
+    return _interpreters_for_argv0(argv0)
+
+
+def _from_running_process() -> list[str]:
+    """Interpreters of running gateway processes, found by scanning.
+
+    The fallback for when there is no readable pid record — a gateway in another
+    Hermes home, in a container, or owned by another user. It stays *below* the
+    launcher sources because a match here is unscoped: with several gateways
+    running, which one is found first is arbitrary.
     """
     exclude = {os.getpid(), os.getppid()}
     found: list[str] = []
@@ -336,9 +502,17 @@ def _from_running_process() -> list[str]:
         if pid in exclude:
             continue
         argv0 = _argv0_for_pid(pid)
-        if argv0 and "python" in Path(argv0).name:
-            found.append(argv0)
+        if argv0:
+            found.extend(_interpreters_for_argv0(argv0))
     return found
+
+
+def _same_path(left: str, right: str) -> bool:
+    """Whether two candidate paths name the same interpreter (symlinks included)."""
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return left == right
 
 
 def _version_error(vstr: str) -> str:
@@ -380,7 +554,14 @@ def resolve() -> dict[str, Any]:
         seen.add(real)
         candidates.append((path, method))
 
+    # Order is evidence, strongest first. The operator's own statement, then the
+    # gateway's record of itself, then what this shell's PATH implies, then a
+    # scan, then this interpreter. Everything below `pid-file` describes an
+    # environment that *may* be the gateway's; `pid-file` describes the one that
+    # is.
     add(_from_override(), "env")
+    for pid_file_python in _from_pid_file():
+        add(pid_file_python, "pid-file", require_exists=True)
     for sibling in _from_launcher_sibling():
         add(sibling, "launcher-sibling", require_exists=True)
     for banner_python in _from_version_banner():
@@ -412,6 +593,23 @@ def resolve() -> dict[str, Any]:
                     "not a virtualenv. If Hermes actually runs from a project venv, set "
                     "HERMES_PY to point at it."
                 )
+            # A PATH-derived winner while the live gateway points somewhere else is
+            # the wrong-interpreter bug in the making. It can only get here when the
+            # process evidence was unusable or unscoped (a gateway in another home,
+            # so it stays ranked below) — either way, say so instead of installing
+            # quietly into the wrong environment.
+            if in_range and method != "env" and method not in _PROCESS_METHODS:
+                disagreeing = [
+                    candidate
+                    for candidate, candidate_method in candidates
+                    if candidate_method in _PROCESS_METHODS and not _same_path(candidate, path)
+                ]
+                if disagreeing:
+                    warnings.append(
+                        f"{path} came from {method}, but a running gateway reports "
+                        f"{disagreeing[0]}. This shell's PATH and the live process "
+                        f"disagree; if the process is right, set HERMES_PY={disagreeing[0]}."
+                    )
             return {
                 "ok": in_range,
                 "python": path,

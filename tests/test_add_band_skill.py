@@ -340,10 +340,18 @@ def test_register_agent_headers_allow_user_agent_override(monkeypatch):
     assert headers["User-Agent"] == "BandTest/1.0"
 
 
-def _stub_candidates(module, monkeypatch, banner=(), sibling=(), shebang=None, procs=()):
-    """Pin every candidate source so a test controls the whole chain."""
+def _stub_candidates(
+    module, monkeypatch, banner=(), sibling=(), shebang=None, procs=(), pid_file=()
+):
+    """Pin every candidate source so a test controls the whole chain.
+
+    ``_from_pid_file`` included: it reads ``$HERMES_HOME/gateway.pid``, so leaving
+    it live would make any ordering assertion depend on whether the developer
+    running the suite happens to have a gateway up.
+    """
     for var in module.OVERRIDE_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(module, "_from_pid_file", lambda: list(pid_file))
     monkeypatch.setattr(module, "_from_launcher_sibling", lambda: list(sibling))
     monkeypatch.setattr(module, "_from_version_banner", lambda: list(banner))
     monkeypatch.setattr(module, "_from_launcher_shebang", lambda: shebang)
@@ -476,6 +484,7 @@ def test_gateway_python_finds_a_dot_venv_project_layout(monkeypatch, tmp_path):
     )
     for var in module.OVERRIDE_VARS:
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(module, "_from_pid_file", list)
     monkeypatch.setattr(module, "_from_launcher_sibling", list)
     monkeypatch.setattr(module, "_from_launcher_shebang", lambda: None)
     monkeypatch.setattr(module, "_from_running_process", list)
@@ -597,6 +606,24 @@ def test_gateway_python_print_mode_keeps_stdout_path_only(monkeypatch, capsys):
         "/opt/hermes/.venv/bin/python -m hermes_cli.main --profile coder gateway run",
         "/opt/hermes/.venv/bin/python /opt/hermes/.venv/bin/hermes gateway run",
         "hermes gateway run",
+        # Every profile-selector spelling the host accepts. `hermes -p <profile>
+        # gateway run --replace` is what it writes into non-default profile service
+        # units, so missing these found no gateway at all whenever a profile was in
+        # use — and profile names are not lowercase-only.
+        "/opt/hermes/.venv/bin/python -m hermes_cli.main -p work gateway run --replace",
+        "/opt/hermes/.venv/bin/python -m hermes_cli.main --profile=work gateway run",
+        "/opt/hermes/.venv/bin/python -m hermes_cli.main -p=work gateway run",
+        "/opt/hermes/.venv/bin/python -m hermes_cli.main --profile Work gateway run",
+        "/opt/hermes/.venv/bin/python -m hermes_cli.main -p clean-test gateway run",
+        # A profile may legally be *named* `gateway`.
+        "hermes -p gateway gateway run",
+        # Script-path and dedicated-entry-point launches.
+        "/usr/bin/python3 /Users/n/.hermes/hermes-agent/hermes_cli/main.py gateway run --replace",
+        "/opt/hermes/.venv/bin/python /opt/hermes/.venv/lib/python3.12/site-packages/gateway/run.py",
+        "/usr/local/bin/hermes-gateway",
+        # A bare `gateway` subcommand defaults to `run`.
+        "hermes gateway",
+        "hermes -p work gateway",
     ],
 )
 def test_gateway_cmdline_regex_matches_real_launch_shapes(cmdline):
@@ -615,6 +642,17 @@ def test_gateway_cmdline_regex_matches_real_launch_shapes(cmdline):
         "/root/.hermes/hermes-agent/venv/bin/python /root/.hermes/hermes-agent/tools/"
         "mcp_stdio_watchdog.py --ppid 7385",
         "hermes chat -s band:add-band",
+        # Accepting a bare `gateway` must not swallow the management subcommands:
+        # those processes are not the gateway and do not name its interpreter.
+        "hermes gateway status",
+        "hermes gateway stop",
+        "hermes gateway restart",
+        "hermes -p work gateway status",
+        # An SSH host that merely happens to be called `hermes-gateway`. The host's
+        # own tokenizer matches this one (it accepts the basename in any argv
+        # position); requiring a path boundary is deliberately stricter, because a
+        # false positive here would hand back `/usr/bin/ssh` as an interpreter.
+        "/usr/bin/ssh hermes-gateway",
     ],
 )
 def test_gateway_cmdline_regex_rejects_incidental_hermes_mentions(cmdline):
@@ -698,6 +736,178 @@ def test_from_running_process_drops_self_parent_and_non_python(monkeypatch):
     monkeypatch.setattr(module, "_argv0_for_pid", lambda pid: argv0[pid])
 
     assert module._from_running_process() == ["/opt/hermes/.venv/bin/python3"]
+
+
+def test_interpreters_for_a_console_script_argv0(tmp_path):
+    """A console-script launch (`…/bin/hermes gateway run`) has a non-Python
+    argv[0]. Requiring "python" in the name yielded *no* candidate for that whole
+    launch shape; the shebang and the sibling interpreter both name its venv."""
+    module = _load_script("gateway_python.py")
+    bindir = tmp_path / ".venv" / "bin"
+    bindir.mkdir(parents=True)
+    launcher = bindir / "hermes"
+    launcher.write_text("#!/gw/.venv/bin/python3.11\n# -*- coding: utf-8 -*-\n")
+
+    found = module._interpreters_for_argv0(str(launcher))
+
+    assert found[0] == "/gw/.venv/bin/python3.11"  # shebang first: it is explicit
+    assert str(bindir / "python3") in found
+
+
+def test_interpreters_for_argv0_refuses_to_guess_from_an_unrelated_process(tmp_path):
+    """The junk-candidate guard: derive only from a Python or a `hermes*` launcher."""
+    module = _load_script("gateway_python.py")
+
+    assert module._interpreters_for_argv0("/bin/bash") == []
+    assert module._interpreters_for_argv0("/usr/bin/ssh") == []
+    assert module._interpreters_for_argv0("/opt/py/bin/python3.12") == ["/opt/py/bin/python3.12"]
+
+
+def _write_pid_record(home: Path, **overrides):
+    """A gateway.pid shaped exactly like the host's `_build_pid_record()`."""
+    record = {
+        "pid": 7385,
+        "kind": "hermes-gateway",
+        "argv": ["/opt/hermes/hermes_cli/main.py", "gateway", "run", "--replace"],
+        "start_time": 178472379047,
+    }
+    record.update(overrides)
+    (home / "gateway.pid").write_text(json.dumps(record), encoding="utf-8")
+    return record
+
+
+def _stub_live_gateway(module, monkeypatch, argv0, cmdline):
+    monkeypatch.setattr(module, "_pid_is_live", lambda pid: True)
+    monkeypatch.setattr(module, "_argv0_for_pid", lambda pid: argv0)
+    monkeypatch.setattr(module, "_cmdline_for_pid", lambda pid: cmdline)
+
+
+def test_from_pid_file_reads_the_gateways_own_record(monkeypatch, tmp_path):
+    """Hermes records the running gateway's PID in `$HERMES_HOME/gateway.pid`.
+    Its `argv[0]` is the *script*, so the record identifies the process and the
+    live process supplies the interpreter."""
+    module = _load_script("gateway_python.py")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_pid_record(tmp_path)
+    _stub_live_gateway(
+        module,
+        monkeypatch,
+        "/opt/hermes/.venv/bin/python3",
+        "/opt/hermes/.venv/bin/python3 -m hermes_cli.main gateway run --replace",
+    )
+
+    assert module._from_pid_file() == ["/opt/hermes/.venv/bin/python3"]
+
+
+def test_from_pid_file_is_scoped_to_the_profile_home(monkeypatch, tmp_path):
+    """A profile's gateway.pid lives in that profile's home, so pointing
+    HERMES_HOME at a profile must not report the root gateway."""
+    module = _load_script("gateway_python.py")
+    profile_home = tmp_path / "profiles" / "clean-test"
+    profile_home.mkdir(parents=True)
+    _write_pid_record(tmp_path)  # the root gateway, which must not be consulted
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    assert module._from_pid_file() == []
+
+
+def test_from_pid_file_ignores_a_dead_pid(monkeypatch, tmp_path):
+    module = _load_script("gateway_python.py")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_pid_record(tmp_path)
+    monkeypatch.setattr(module, "_pid_is_live", lambda pid: False)
+
+    assert module._from_pid_file() == []
+
+
+def test_from_pid_file_ignores_a_recycled_pid(monkeypatch, tmp_path):
+    """PID reuse: the recorded PID is live but is now something else entirely.
+    The guard compares the *recorded* argv tail, not a launch-shape pattern, so a
+    shape the regex doesn't know about still validates."""
+    module = _load_script("gateway_python.py")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_pid_record(tmp_path)
+    _stub_live_gateway(module, monkeypatch, "/usr/bin/python3", "/usr/bin/python3 /tmp/unrelated.py")
+
+    assert module._from_pid_file() == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["not json at all", '{"pid": "not-an-int"}', '{"kind": "hermes-gateway"}', "[]"],
+)
+def test_from_pid_file_survives_a_malformed_record(monkeypatch, tmp_path, content):
+    module = _load_script("gateway_python.py")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "gateway.pid").write_text(content, encoding="utf-8")
+
+    assert module._from_pid_file() == []
+
+
+def test_from_pid_file_rejects_a_foreign_record_kind(monkeypatch, tmp_path):
+    module = _load_script("gateway_python.py")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_pid_record(tmp_path, kind="something-else")
+
+    assert module._from_pid_file() == []
+
+
+def test_gateway_python_prefers_the_live_gateway_over_the_path_launcher(monkeypatch, tmp_path):
+    """The regression this ordering exists for: `hermes` on PATH belongs to
+    environment A while the service actually runs from environment B. A used to
+    win — silently, because A is itself a perfectly good venv, so the venv-shape
+    warning stayed quiet and the install went into the wrong interpreter."""
+    module = _load_script("gateway_python.py")
+    env_a = tmp_path / "a" / ".venv" / "bin" / "python3"  # what PATH implies
+    env_b = tmp_path / "b" / ".venv" / "bin" / "python3"  # what is actually running
+    for path in (env_a, env_b):
+        path.parent.mkdir(parents=True)
+        path.touch()
+    _stub_candidates(module, monkeypatch, sibling=[str(env_a)], pid_file=[str(env_b)])
+    monkeypatch.setattr(module, "_probe", lambda path: _usable(module))
+
+    result = module.resolve()
+
+    assert result["python"] == str(env_b)
+    assert result["method"] == "pid-file"
+    assert result["warnings"] == []
+
+
+def test_gateway_python_warns_when_the_live_gateway_disagrees_with_path(monkeypatch, tmp_path):
+    """`running-process` stays ranked below the launcher (a scan is unscoped: with
+    several gateways up, which one it finds is arbitrary). So when they disagree,
+    say so — silence is what produced the original bug."""
+    module = _load_script("gateway_python.py")
+    env_a = tmp_path / "a" / ".venv" / "bin" / "python3"
+    env_b = tmp_path / "b" / ".venv" / "bin" / "python3"
+    for path in (env_a, env_b):
+        path.parent.mkdir(parents=True)
+        path.touch()
+    _stub_candidates(module, monkeypatch, sibling=[str(env_a)], procs=[str(env_b)])
+    monkeypatch.setattr(module, "_probe", lambda path: _usable(module))
+
+    result = module.resolve()
+
+    assert result["python"] == str(env_a)
+    assert result["method"] == "launcher-sibling"
+    assert len(result["warnings"]) == 1
+    assert f"HERMES_PY={env_b}" in result["warnings"][0]
+
+
+def test_gateway_python_does_not_warn_when_the_process_agrees(monkeypatch, tmp_path):
+    """Same path reached two ways is agreement, not conflict — no noise."""
+    module = _load_script("gateway_python.py")
+    interpreter = tmp_path / ".venv" / "bin" / "python3"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.touch()
+    _stub_candidates(
+        module, monkeypatch, sibling=[str(interpreter)], procs=[str(interpreter)]
+    )
+    monkeypatch.setattr(module, "_probe", lambda path: _usable(module))
+
+    result = module.resolve()
+
+    assert result["warnings"] == []
 
 
 def test_probe_ignores_a_hermes_cli_in_the_callers_cwd(monkeypatch, tmp_path):

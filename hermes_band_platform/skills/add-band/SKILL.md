@@ -115,10 +115,22 @@ re-installs or re-registers what's already in place.
      `ModuleNotFoundError` — and every candidate tried) and resolve that first.
    - `HERMES_PY` / `HERMES_PYTHON`, if already set, is used and validated instead of
      detection. Prefer that over guessing when the user knows their layout.
-   - A `warning:` line on stderr (`is_venv: false` in JSON) means the resolved
-     interpreter is a system Python, not a venv. Exit status is still 0 and the path is
-     still valid — a system-wide Hermes is a real install. Treat it as a prompt to
-     confirm with the user, not a failure; if it's wrong, set `HERMES_PY`.
+   - A `warning:` line on stderr never means failure — exit status is still 0 and the
+     path is still valid. Two kinds, both a prompt to confirm with the user rather than
+     to stop:
+     - `looks like a system Python` (`is_venv: false`) — a system-wide Hermes is a real
+       install, so this is a nudge, not a verdict.
+     - `a running gateway reports <other path>` — this shell's `PATH` and the live
+       gateway process disagree, which is how a plugin gets installed into an
+       interpreter the gateway never loads. The warning names the path to use: prefer
+       `HERMES_PY=<that path>` unless the user says otherwise.
+   - `method` in the JSON says what the answer rests on, strongest first: `env` (you set
+     it) → `pid-file` (Hermes's own record of the running gateway, read from
+     `$HERMES_HOME/gateway.pid`) → `launcher-sibling` / `version-banner` /
+     `launcher-shebang` (inferred from `hermes` on this `PATH`) → `running-process` (a
+     `pgrep` scan) → `self`. Anything below `pid-file` describes an environment that
+     *may* be the gateway's; set `HERMES_HOME` first if the user runs a named profile,
+     so the resolver reads that profile's gateway record.
 
 2. Take stock — run `scripts/verify_install.py` with the gateway interpreter and read
    `missing[]`. Do **only** the steps whose checks are missing; skip the rest.

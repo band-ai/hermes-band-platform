@@ -52,7 +52,7 @@ Skill helper paths are relative to this skill directory:
 
 Registration temporarily ships as `scripts/register_agent.py` because the SDK CLI is not published yet. The helper saves `BAND_AGENT_ID` + `BAND_API_KEY` through Hermes's env writer and never prints the user key. It also sends a browser-like request fingerprint to avoid Cloudflare 1010 blocks on `app.band.ai`; the future `band-register-agent` / `band.cli.register_agent` path must keep equivalent headers before the bundled helper is removed. The setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
 
-This skill is **resumable**: run `verify_install.py` first and act *only* on what's missing, so re-running after a partial failure never double-installs or re-registers.
+This skill is **resumable**: run `verify_install.py` first and act *only* on what it reports as `blocking[]`, so re-running after a partial failure never double-installs or re-registers.
 
 ## Quick Reference
 
@@ -133,11 +133,16 @@ re-installs or re-registers what's already in place.
      so the resolver reads that profile's gateway record.
 
 2. Take stock — run `scripts/verify_install.py` with the gateway interpreter and read
-   `missing[]`. Do **only** the steps whose checks are missing; skip the rest.
+   `blocking[]`. Do **only** the steps it lists; skip the rest. (Read `blocking[]`, not
+   `missing[]`: a correct directory-plugin install has no importable package and no entry
+   point by design, so those two always appear in `missing[]` there. `blocking[]` is
+   `missing[]` minus what the *installed* tree already satisfies — `installed_plugin_root`
+   in the JSON names it, and is `null` when you are looking at a checkout rather than an
+   install, in which case nothing is excused.)
    ```bash
    "$HERMES_PY" scripts/verify_install.py
    ```
-   - `package_importable` / `entry_point` false → install (step 3).
+   - `package_importable` / `entry_point` blocking → install (step 3).
    - `sdk_importable` false → install `band-sdk` (step 3 note).
    - `plugin_enabled` false → enable (step 4).
    - `band_agent_id_present` / `band_api_key_present` false → credentials (step 5).

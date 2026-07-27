@@ -40,6 +40,19 @@ on:
 permissions:
   contents: read
 
+# One upload of a given version at a time. The `release: published` run and a
+# manual recovery dispatch for the same tag are two independent entry points into
+# the same upload, and PyPI rejects a re-POST of a file it is already storing —
+# concurrent runs turn that race into a red build on a release that in fact
+# published. Keyed on the tag so different versions still publish in parallel.
+#
+# Never cancel: an upload in flight has already sent some files. Killing it mid
+# stream leaves a partially published version with no job to finish it, which is
+# strictly worse than the second run waiting and then no-oping via skip-existing.
+concurrency:
+  group: pypi-publish-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
   build:
     # Guard the event path: never auto-publish a prerelease to PyPI.
@@ -48,20 +61,38 @@ jobs:
     env:
       TAG: ${{ inputs.tag || github.event.release.tag_name }}
     steps:
+      # Format first, before anything consumes the tag. Everything downstream
+      # interpolates this string — the checkout ref above all — and on a dispatch
+      # it is free text typed by whoever ran the workflow. Reject anything that is
+      # not exactly vX.Y.Z here so no later step is the first to touch it. The
+      # remaining checks (on main, version match) need the tree and so must wait
+      # for the checkout; this one deliberately does not.
+      - name: Validate the tag format
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::'${TAG}' is not a vX.Y.Z release tag"; exit 1; }
+
       - name: Checkout the release tag
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full refs/tags/ path: a branch that happens to share the name can
           # never shadow the tag.
           ref: refs/tags/${{ inputs.tag || github.event.release.tag_name }}
+          # Load-bearing, not a convenience: at depth 0 checkout fetches
+          # +refs/heads/*:refs/remotes/origin/* as well as the tag, which is the
+          # only reason `origin/main` exists for the ancestor check below. Lower
+          # this and that check fails on a missing ref — do not touch it to save
+          # clone time.
           fetch-depth: 0
 
       - name: Validate the tag is a main-anchored release
         run: |
           set -euo pipefail
-          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || {
-            echo "::error::'${TAG}' is not a vX.Y.Z release tag"; exit 1; }
-          tag_version="${BASH_REMATCH[1]}"
+          # The format is already proven, so the version is just the tag minus
+          # its `v`; re-matching the regex only to read BASH_REMATCH would give
+          # this step a second, drifting copy of the accepted format.
+          tag_version="${TAG#v}"
           git merge-base --is-ancestor HEAD origin/main || {
             echo "::error::${TAG} does not point at a commit on main"; exit 1; }
           project_version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")

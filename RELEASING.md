@@ -39,7 +39,9 @@ merge to `main`
 - Merging the release PR is the publish trigger — there is no manual upload step.
   `workflow_dispatch` on `release.yml` just re-runs release-please.
 - Tags are plain `vX.Y.Z` (`include-component-in-tag: false`). `pypi-publish.yml`
-  validates that format, so changing it means changing that check too.
+  checks that format before checkout, then re-checks after checkout that the tag
+  sits on `main` and matches `pyproject.toml`'s version — so changing the tag
+  shape means updating both checks.
 
 release-please keeps every version location in sync (configured in
 [`release-please-config.json`](release-please-config.json)): `pyproject.toml`,
@@ -47,6 +49,20 @@ release-please keeps every version location in sync (configured in
 and `flake.nix` (the last two via the `# x-release-please-version` annotations).
 `.release-please-manifest.json` tracks the current released version, and
 `release.yml` regenerates the root `plugin.yaml` on the release PR.
+
+### First release: pin `1.0.0`
+
+`pyproject.toml` and `.release-please-manifest.json` both already read `1.0.0`,
+no tag has ever been cut, and a `feat(packaging)` commit already sits on
+`main` — so left alone, release-please's first release PR computes **1.1.0**,
+not `1.0.0`. To debut on `1.0.0`, a commit landing on `main` must carry a
+`Release-As: 1.0.0` trailer in its commit body; release-please reads the
+trailer from commits on `main`, not from a PR branch.
+
+Both squash merge (`squash_merge_commit_message: COMMIT_MESSAGES`) and merge
+commits are enabled on this repo. Under a squash merge, the trailer from *any*
+commit on the branch survives into the squashed commit body that lands on
+`main`; under a merge commit, it has to be in the merge commit's own body.
 
 ## One-time setup (required before the first publish)
 
@@ -71,10 +87,18 @@ and `flake.nix` (the last two via the `# x-release-please-version` annotations).
 
 2. **`release` environment** — GitHub → Settings → Environments → `release`.
    Add a **deployment branch and tag policy**: branch `main` and tag `v*`.
-   That policy is load-bearing, not cosmetic: it is what stops a doctored copy of
+   That policy is load-bearing, not cosmetic: it stops a doctored copy of
    `pypi-publish.yml` on a side branch from ever reaching the OIDC credential,
-   because GitHub matches the run's ref against it before the job starts.
-   (Required reviewers here would add a human approval gate before each upload.)
+   and it's also what confines `release.yml` itself to `main` — a
+   `workflow_dispatch` of that workflow from a side branch is blocked the same
+   way, before the job starts. Keep it.
+
+   Don't add required reviewers here expecting an upload-only gate:
+   `release.yml`'s release job runs under this same environment, so reviewers
+   would block every release-please run on `main`, not just the PyPI upload.
+   An upload-only gate needs a second environment (e.g. `pypi`) that only
+   `pypi-publish.yml`'s publish job references — and the PyPI trusted
+   publisher's registered environment name updated to match.
 
 3. **PyPI Trusted Publisher** — add a *pending publisher* for the project (it
    doesn't exist on PyPI yet). Add it **from inside the
@@ -117,7 +141,10 @@ python -c "import hermes_band_platform; print(hermes_band_platform.__version__)"
 A tagged release whose upload failed is republished without cutting a new
 version: **Actions → pypi-publish → Run workflow**, passing the existing tag
 (e.g. `v1.0.0`). `skip-existing: true` makes that idempotent, so a re-run after a
-partial upload won't fail on files already on PyPI.
+partial upload won't fail on files already on PyPI. `pypi-publish.yml` also holds
+a workflow-level concurrency group, so a recovery dispatch for a version that's
+still uploading queues behind the in-flight run instead of racing it — no need
+to confirm the first run finished before dispatching.
 
 Because the `release` event only fires workflows present **at the released tag**,
 tags cut before `pypi-publish.yml` existed can only be published by dispatch.

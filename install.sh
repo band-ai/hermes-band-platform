@@ -132,11 +132,18 @@ if [ -n "$pip_shadows" ]; then
     uv pip uninstall --python "$HERMES_PY" $pip_shadows \
       || die "could not uninstall the pip copy; remove it manually and re-run"
   else
-    die "pip-installed in the gateway venv and would OVERRIDE this directory
-install (the old code would keep running): $pip_shadows
-Remove it first:
+    # $pip_shadows holds one OR two names, so the wording stays count-neutral:
+    # the names are a labelled field, never the sentence's subject.
+    # Two substrings are load-bearing and must survive any rewording: uppercase
+    # OVERRIDE and the literal `uv pip uninstall` — test_installer_refuses_pip_shadow
+    # asserts both against the installer's combined output, because they are what
+    # proves this refusal (and not some later failure) stopped the run.
+    die "the gateway venv still has the Band plugin pip-installed, and an
+entry-point install would OVERRIDE a directory install; the OLD code would keep
+running. Distribution names: $pip_shadows
+Remove them first:
   uv pip uninstall --python \"$HERMES_PY\" $pip_shadows
-or re-run with BAND_UNINSTALL_PIP=1 to let the installer remove it."
+or re-run with BAND_UNINSTALL_PIP=1 to let the installer remove them."
   fi
 fi
 

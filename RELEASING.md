@@ -50,19 +50,30 @@ and `flake.nix` (the last two via the `# x-release-please-version` annotations).
 `.release-please-manifest.json` tracks the current released version, and
 `release.yml` regenerates the root `plugin.yaml` on the release PR.
 
-### First release: pin `1.0.0`
+### First release: `0.1.0`
 
-`pyproject.toml` and `.release-please-manifest.json` both already read `1.0.0`,
-no tag has ever been cut, and a `feat(packaging)` commit already sits on
-`main` — so left alone, release-please's first release PR computes **1.1.0**,
-not `1.0.0`. To debut on `1.0.0`, a commit landing on `main` must carry a
-`Release-As: 1.0.0` trailer in its commit body; release-please reads the
-trailer from commits on `main`, not from a PR branch.
+`pyproject.toml` and `.release-please-manifest.json` read `1.0.0` from before
+anything was ever published, no tag has ever been cut, and a `feat(packaging)`
+commit already sits on `main` — so left alone, release-please's first release PR
+would compute **1.1.0**. The first published version is deliberately **`0.1.0`**
+instead: nothing has ever shipped under this name, and the plugin tracks a host
+whose own plugin contract is still moving.
 
-Both squash merge (`squash_merge_commit_message: COMMIT_MESSAGES`) and merge
-commits are enabled on this repo. Under a squash merge, the trailer from *any*
-commit on the branch survives into the squashed commit body that lands on
-`main`; under a merge commit, it has to be in the merge commit's own body.
+That is forced by a `Release-As: 0.1.0` trailer, which this branch already
+carries. `Release-As` is a literal override, so it moves the version *down* from
+the manifest's `1.0.0` without complaint, and release-please rewrites every
+version location (`pyproject.toml`, `__init__.py`, `plugin.yaml`, `flake.nix`,
+the manifest) to match in the release PR. The trailer sits in a normal branch
+commit rather than a merge commit, so it reaches `main` under either merge
+strategy this repo allows — a squash carries it into the squashed body
+(`squash_merge_commit_message: COMMIT_MESSAGES`), and a merge commit brings the
+commit itself into history, where release-please parses it.
+
+One consequence of debuting below `1.0.0`: with `bump-minor-pre-major` unset,
+release-please's default sends the first `feat!:`/`BREAKING CHANGE` straight to
+`1.0.0` rather than to `0.2.0`. Set `bump-minor-pre-major: true` in
+[`release-please-config.json`](release-please-config.json) if the intent is to
+stay in `0.x` through breaking changes.
 
 ## One-time setup (required before the first publish)
 

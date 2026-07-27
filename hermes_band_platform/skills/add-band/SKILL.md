@@ -52,7 +52,7 @@ Skill helper paths are relative to this skill directory:
 
 Registration temporarily ships as `scripts/register_agent.py` because the SDK CLI is not published yet. The helper saves `BAND_AGENT_ID` + `BAND_API_KEY` through Hermes's env writer and never prints the user key. It also sends a browser-like request fingerprint to avoid Cloudflare 1010 blocks on `app.band.ai`; the future `band-register-agent` / `band.cli.register_agent` path must keep equivalent headers before the bundled helper is removed. The setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
 
-This skill is **resumable**: run `verify_install.py` first and act *only* on what's missing, so re-running after a partial failure never double-installs or re-registers.
+This skill is **resumable**: run `verify_install.py` first and act *only* on what it reports as `blocking[]`, so re-running after a partial failure never double-installs or re-registers.
 
 ## Quick Reference
 
@@ -136,7 +136,9 @@ re-installs or re-registers what's already in place.
    `blocking[]`. Do **only** the steps it lists; skip the rest. (Read `blocking[]`, not
    `missing[]`: a correct directory-plugin install has no importable package and no entry
    point by design, so those two always appear in `missing[]` there. `blocking[]` is
-   `missing[]` minus what `directory_manifest` already satisfies.)
+   `missing[]` minus what the *installed* tree already satisfies — `installed_plugin_root`
+   in the JSON names it, and is `null` when you are looking at a checkout rather than an
+   install, in which case nothing is excused.)
    ```bash
    "$HERMES_PY" scripts/verify_install.py
    ```

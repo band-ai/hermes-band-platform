@@ -123,6 +123,9 @@ def test_verify_install_does_not_block_on_a_directory_plugin_layout(monkeypatch)
     )
     monkeypatch.setattr(module, "_has_band_entry_point", lambda: False)
     monkeypatch.setattr(module, "_has_directory_manifest", lambda: True)
+    # The exemption turns on the *installed* tree, not on marker files: see
+    # test_verify_install_does_not_treat_a_checkout_as_installed.
+    monkeypatch.setattr(module, "_installed_plugin_root", lambda: Path("/h/plugins/band"))
     monkeypatch.setattr(module, "_plugin_enabled", lambda: True)
     monkeypatch.setattr(module, "_env_value", lambda name: "set")
     monkeypatch.setattr(module, "_access_policy_allowlist", lambda: True)
@@ -1058,14 +1061,85 @@ def _fake_directory_install(tmp_path: Path, *, with_sdk: bool = True) -> Path:
     return home
 
 
-def _load_plugin_env_from(root: Path):
-    """Load the `_plugin_env` copy that ships in a given tree."""
-    path = root / "skills" / "add-band" / "scripts" / "_plugin_env.py"
-    spec = importlib.util.spec_from_file_location(f"_plugin_env_{id(path)}", path)
+def _load_installed_script(root: Path, name: str):
+    """Load a setup script from the copy that shipped in a given plugin tree.
+
+    Loading the *installed* copy is the point: these scripts locate themselves
+    relative to `__file__`, so a test that loads the checkout's copy cannot
+    observe how they behave once staged.
+    """
+    path = root / "skills" / "add-band" / "scripts" / name
+    spec = importlib.util.spec_from_file_location(f"{name}_{id(path)}", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_plugin_env_from(root: Path):
+    """Load the `_plugin_env` copy that ships in a given tree."""
+    return _load_installed_script(root, "_plugin_env.py")
+
+
+def test_verify_install_treats_a_staged_tree_as_installed(monkeypatch, tmp_path):
+    """The real marker-plus-home logic, unmocked: a tree under
+    `$HERMES_HOME/plugins` is the install the gateway loads, so the checks that
+    layout cannot satisfy are excused."""
+    home = _fake_directory_install(tmp_path)
+    root = home / "plugins" / "band"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    module = _load_installed_script(root, "verify_install.py")
+
+    assert module._has_directory_manifest() is True
+    assert module._installed_plugin_root() == root
+
+
+def test_verify_install_does_not_treat_a_checkout_as_installed(monkeypatch, tmp_path):
+    """A clone carries the same manifest markers — this repo ships `plugin.yaml` +
+    `__init__.py` in the package dir *and*, generated, at the repo root — while
+    nothing has been staged. Excusing `package_importable`/`entry_point` on that
+    basis reported an empty-ish `blocking[]` and emitted no install action, so the
+    "take stock" step skipped the install that was actually required."""
+    empty_home = tmp_path / "empty-home"
+    empty_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(empty_home))
+    module = _load_script("verify_install.py")  # the checkout's own copy
+
+    assert module._has_directory_manifest() is True  # markers are there…
+    assert module._installed_plugin_root() is None  # …but this is not an install
+
+
+def test_verify_install_blocks_on_an_unstaged_checkout(monkeypatch, tmp_path):
+    """End to end for the same case: with nothing installed, the missing package
+    and entry point must reach `blocking[]` *and* come with an install action —
+    a blocking check the agent cannot act on would be its own bug."""
+    empty_home = tmp_path / "empty-home"
+    empty_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(empty_home))
+    module = _load_script("verify_install.py")
+    monkeypatch.setattr(
+        module.importlib.util,
+        "find_spec",
+        lambda name: None if name == "hermes_band_platform" else SimpleNamespace(origin="x"),
+    )
+    monkeypatch.setattr(module, "_has_band_entry_point", lambda: False)
+    monkeypatch.setattr(module, "_plugin_enabled", lambda: True)
+    monkeypatch.setattr(module, "_env_value", lambda name: "set")
+    monkeypatch.setattr(module, "_access_policy_allowlist", lambda: True)
+    monkeypatch.setattr(module, "_conversations_skill_present", lambda: True)
+    monkeypatch.setattr(
+        module,
+        "_apply_band_libs_shim",
+        lambda: {"dir": str(empty_home / "band-libs"), "present": True, "on_sys_path": True},
+    )
+
+    result = module.verify_install()
+
+    assert result["installed_plugin_root"] is None
+    assert "package_importable" in result["blocking"]
+    assert "entry_point" in result["blocking"]
+    assert result["success"] is False
+    assert any("Install the plugin" in action for action in result["actions"])
 
 
 def test_plugin_env_resolves_a_directory_install(monkeypatch, tmp_path):

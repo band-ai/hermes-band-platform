@@ -10,7 +10,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Assemble directory-plugin bundle
         run: |
@@ -30,6 +30,12 @@ jobs:
           cp install.sh staging/
 
           tag="${GITHUB_REF_NAME}"
+          # The asset names stay `hermes-band-platform-*` and are outside the
+          # rename of the Python distribution to `hermes-band`. These are named
+          # after the GitHub repo, which keeps its name, and what they contain is
+          # a directory plugin (band/ + install.sh) — not a Python distribution,
+          # so there is nothing here for the dist name to describe. Renaming them
+          # would only break every install doc and link that names an asset.
           ( cd staging && tar -czf "../hermes-band-platform-${tag}.tar.gz" band install.sh )
           ( cd staging && zip -qr "../hermes-band-platform-${tag}.zip" band install.sh )
           ls -l hermes-band-platform-*.tar.gz hermes-band-platform-*.zip

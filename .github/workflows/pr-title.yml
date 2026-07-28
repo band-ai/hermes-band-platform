@@ -15,7 +15,10 @@ jobs:
     if: "!contains(github.actor, '[bot]')"
     steps:
       - name: Validate Conventional Commits format
-        uses: amannn/action-semantic-pull-request@v6
+        # SHA-pinned like every other action in this repo; dependabot.yml moves
+        # the pin and its version comment together. A mutable `@v6` here would be
+        # the one action in the repo that can change under us without a PR.
+        uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50  # v6.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:

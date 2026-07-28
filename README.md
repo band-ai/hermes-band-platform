@@ -107,7 +107,7 @@ end to end.
 > [From this repo](#3-from-this-repo). Once published:_
 
 ```bash
-pip install hermes-band-platform   # into the gateway's Python (must be writable)
+pip install hermes-band   # into the gateway's Python (must be writable)
 hermes plugins enable band
 ```
 
@@ -148,8 +148,9 @@ is safe (idempotent). Env knobs: `HERMES_HOME`, `HERMES_PY` (interpreter overrid
 `BAND_SDK_SPEC`.
 
 > Migrating from a pip install? Entry-point plugins **override** directory plugins in the host
-> loader, so a leftover `hermes-band-platform` in the gateway venv would silently keep the old
-> code running — the installer **refuses to complete** until it's removed, printing the exact
+> loader, so a leftover `hermes-band` (or the pre-rename `hermes-band-platform`) in the gateway
+> venv would silently keep the old code running — the installer **refuses to complete** until
+> both are removed, printing the exact
 > `uv pip uninstall` command (or run with `BAND_UNINSTALL_PIP=1` to let it remove the pip copy
 > itself).
 </details>
@@ -192,7 +193,7 @@ Requires a **writable** gateway venv (self-managed installs) — on hosted runti
 read-only; use the installer instead.
 
 ```bash
-uv pip install --python "$HERMES_PY" "hermes-band-platform @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}"
+uv pip install --python "$HERMES_PY" "hermes-band @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}"
 hermes plugins enable band
 ```
 
@@ -222,8 +223,8 @@ hermes /add-band
   services.hermes-agent = {
     extraPythonPackages = ps: [
       (ps.buildPythonPackage {
-        pname = "hermes-band-platform";
-        version = "1.0.0";
+        pname = "hermes-band";
+        version = "0.0.1";
         format = "pyproject";
         src = ./.; # or fetchFromGitHub { owner = "band-ai"; repo = "hermes-band-platform"; ... }
         nativeBuildInputs = [ ps.setuptools ];

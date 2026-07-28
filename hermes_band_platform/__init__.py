@@ -10,6 +10,6 @@ bootstrap()
 
 from .adapter import register  # noqa: E402
 
-__version__ = "0.0.1"
+__version__ = "0.0.1"  # x-release-please-version
 
 __all__ = ["register", "__version__"]

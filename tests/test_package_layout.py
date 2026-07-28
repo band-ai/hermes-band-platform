@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import textwrap
@@ -51,6 +52,45 @@ def test_root_manifest_is_generated_from_packaged():
     assert "# x-release-please-version" in (
         ROOT / "hermes_band_platform" / "plugin.yaml"
     ).read_text()
+
+
+def test_every_version_location_agrees_and_is_release_please_reachable():
+    """All five version locations hold one version, and release-please can move each.
+
+    ``pyproject.toml`` is bumped by the ``python`` release-type's own updater.
+    Every *other* location is an ``extra-files`` entry handled by the **generic**
+    updater, which edits a line only if that line carries a
+    ``x-release-please-version`` comment — with no annotation the file is silently
+    skipped, and nothing else in the repo notices. That is exactly how
+    ``__init__.py`` sat at 0.0.1 in a release PR that bumped everything else to
+    0.1.0, shipping a wheel whose ``__version__`` disagreed with its own metadata.
+    """
+    version = re.search(
+        r'^version = "([^"]+)"', (ROOT / "pyproject.toml").read_text(), re.M
+    )
+    assert version is not None, "pyproject.toml has no version line"
+    expected = version.group(1)
+
+    annotated = {
+        "hermes_band_platform/__init__.py": rf'^__version__ = "{re.escape(expected)}"',
+        "hermes_band_platform/plugin.yaml": rf"^version: {re.escape(expected)}\b",
+        "plugin.yaml": rf"^version: {re.escape(expected)}\b",
+        "flake.nix": rf'^\s*version = "{re.escape(expected)}";',
+    }
+    for relpath, version_line in annotated.items():
+        text = (ROOT / relpath).read_text()
+        match = re.search(version_line, text, re.M)
+        assert match is not None, f"{relpath} does not carry version {expected}"
+        line = text[match.start() : text.find("\n", match.start())]
+        assert "x-release-please-version" in line, (
+            f"{relpath}'s version line lacks the x-release-please-version marker, "
+            "so release-please's generic updater will skip it and leave the "
+            "version behind on the next release"
+        )
+
+    assert json.loads((ROOT / ".release-please-manifest.json").read_text()) == {
+        ".": expected
+    }
 
 
 def test_root_directory_plugin_shim_registers():

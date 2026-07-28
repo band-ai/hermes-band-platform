@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-band"
-version = "0.0.1"
+version = "0.1.0"
 description = "Band platform adapter for the Hermes Agent gateway."
 readme = "README.md"
 requires-python = ">=3.11"

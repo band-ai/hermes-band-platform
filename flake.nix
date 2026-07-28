@@ -31,7 +31,7 @@
             { buildPythonPackage, setuptools, bandSdk ? defaultBandSdk }:
             buildPythonPackage {
               pname = "hermes-band";
-              version = "1.0.0"; # x-release-please-version
+              version = "0.0.1"; # x-release-please-version
               format = "pyproject";
               src = ./.;
               nativeBuildInputs = [ setuptools ];

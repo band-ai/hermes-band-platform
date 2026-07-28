@@ -224,7 +224,7 @@ hermes /add-band
     extraPythonPackages = ps: [
       (ps.buildPythonPackage {
         pname = "hermes-band";
-        version = "1.0.0";
+        version = "0.0.1";
         format = "pyproject";
         src = ./.; # or fetchFromGitHub { owner = "band-ai"; repo = "hermes-band-platform"; ... }
         nativeBuildInputs = [ ps.setuptools ];

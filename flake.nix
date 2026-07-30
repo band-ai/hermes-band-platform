@@ -30,8 +30,8 @@
           plugin = py.callPackage (
             { buildPythonPackage, setuptools, bandSdk ? defaultBandSdk }:
             buildPythonPackage {
-              pname = "hermes-band-platform";
-              version = "1.0.0"; # x-release-please-version
+              pname = "hermes-band";
+              version = "0.1.0"; # x-release-please-version
               format = "pyproject";
               src = ./.;
               nativeBuildInputs = [ setuptools ];

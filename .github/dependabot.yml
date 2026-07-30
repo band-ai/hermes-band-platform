@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # GitHub Actions. Every workflow in this repo pins full commit SHAs with a
+  # trailing version comment; Dependabot resolves those the same as tag pins and
+  # updates both the hash and the comment in its PRs. Without this, the pins
+  # silently age — the cost of pinning by SHA is that nothing else moves them.
+  #
+  # No `target-branch:` here. It would be redundant — main IS the default branch,
+  # which is where Dependabot opens PRs anyway — and setting it at all disables
+  # security updates for this ecosystem, leaving only version updates.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 5
+    # Both labels must exist on the repo. Dependabot applies a label it can find
+    # and silently drops one it cannot, so deleting either from the repo's label
+    # list turns this block into a no-op with no error anywhere.
+    labels:
+      - "dependencies"
+      - "github-actions"

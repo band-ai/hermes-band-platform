@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import re
+import subprocess
 import sys
+import textwrap
 import types
 from pathlib import Path
 
@@ -50,6 +54,45 @@ def test_root_manifest_is_generated_from_packaged():
     ).read_text()
 
 
+def test_every_version_location_agrees_and_is_release_please_reachable():
+    """All five version locations hold one version, and release-please can move each.
+
+    ``pyproject.toml`` is bumped by the ``python`` release-type's own updater.
+    Every *other* location is an ``extra-files`` entry handled by the **generic**
+    updater, which edits a line only if that line carries a
+    ``x-release-please-version`` comment — with no annotation the file is silently
+    skipped, and nothing else in the repo notices. That is exactly how
+    ``__init__.py`` sat at 0.0.1 in a release PR that bumped everything else to
+    0.1.0, shipping a wheel whose ``__version__`` disagreed with its own metadata.
+    """
+    version = re.search(
+        r'^version = "([^"]+)"', (ROOT / "pyproject.toml").read_text(), re.M
+    )
+    assert version is not None, "pyproject.toml has no version line"
+    expected = version.group(1)
+
+    annotated = {
+        "hermes_band_platform/__init__.py": rf'^__version__ = "{re.escape(expected)}"',
+        "hermes_band_platform/plugin.yaml": rf"^version: {re.escape(expected)}\b",
+        "plugin.yaml": rf"^version: {re.escape(expected)}\b",
+        "flake.nix": rf'^\s*version = "{re.escape(expected)}";',
+    }
+    for relpath, version_line in annotated.items():
+        text = (ROOT / relpath).read_text()
+        match = re.search(version_line, text, re.M)
+        assert match is not None, f"{relpath} does not carry version {expected}"
+        line = text[match.start() : text.find("\n", match.start())]
+        assert "x-release-please-version" in line, (
+            f"{relpath}'s version line lacks the x-release-please-version marker, "
+            "so release-please's generic updater will skip it and leave the "
+            "version behind on the next release"
+        )
+
+    assert json.loads((ROOT / ".release-please-manifest.json").read_text()) == {
+        ".": expected
+    }
+
+
 def test_root_directory_plugin_shim_registers():
     """The repository root loads as a Hermes directory plugin."""
     for key in list(sys.modules):
@@ -90,3 +133,78 @@ def test_root_directory_plugin_shim_registers():
 
     assert captured["platform"] == "band"
     assert "band_create_room" in captured["tools"]
+
+
+def test_missing_sdk_degrades_but_plugin_still_registers(tmp_path):
+    """REGRESSION GUARD: a missing band-sdk must degrade the plugin
+    (``BAND_AVAILABLE = False``), never abort its load.
+
+    An import-time raise aborts ``register()``, which drops Band from the
+    platform registry — and with it from ``hermes gateway setup``'s channel
+    enumeration and every "what channels do I have" surface — leaving only an
+    inert ``plugins.enabled`` flag. The band-libs shim did exactly that in an
+    earlier iteration; this pins the graceful path: plugin loads, platform
+    registers with the read-only-venv-safe install hint, SDK stays unbound.
+
+    Runs in a subprocess (isolated import state) that mirrors the host
+    loader's ``_load_directory_module`` and blocks every ``band`` import.
+    """
+    probe = textwrap.dedent(
+        """
+        import importlib.util, json, sys, types
+
+        pkg = sys.argv[1]
+
+        class _BlockBand:
+            def find_spec(self, name, path=None, target=None):
+                if name == "band" or name.startswith("band."):
+                    raise ImportError("band blocked for degraded-load test")
+                return None
+
+        sys.meta_path.insert(0, _BlockBand())
+        for key in [k for k in sys.modules if k == "band" or k.startswith("band.")]:
+            del sys.modules[key]
+
+        ns = types.ModuleType("hermes_plugins")
+        ns.__path__ = []
+        sys.modules["hermes_plugins"] = ns
+        spec = importlib.util.spec_from_file_location(
+            "hermes_plugins.band", pkg + "/__init__.py",
+            submodule_search_locations=[pkg],
+        )
+        module = importlib.util.module_from_spec(spec)
+        module.__package__ = "hermes_plugins.band"
+        module.__path__ = [pkg]
+        sys.modules["hermes_plugins.band"] = module
+        spec.loader.exec_module(module)  # must NOT raise
+
+        captured = {}
+
+        class Ctx:
+            def register_platform(self, **kw):
+                captured["platform"] = kw.get("name")
+                captured["install_hint"] = kw.get("install_hint")
+            def register_tool(self, **kw):
+                pass
+            def register_skill(self, *a, **kw):
+                pass
+
+        module.register(Ctx())
+        adapter = sys.modules["hermes_plugins.band.adapter"]
+        print(json.dumps({
+            "band_available": adapter.BAND_AVAILABLE,
+            "platform": captured.get("platform"),
+            "install_hint": captured.get("install_hint"),
+        }))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", probe, str(ROOT / "hermes_band_platform")],
+        capture_output=True, text=True, timeout=120,
+        env={"HERMES_HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+    )
+    assert result.returncode == 0, f"plugin load aborted:\n{result.stderr[-2000:]}"
+    info = json.loads(result.stdout.splitlines()[-1])
+    assert info["band_available"] is False
+    assert info["platform"] == "band"
+    assert "--target" in info["install_hint"]  # not the site-packages pip hint

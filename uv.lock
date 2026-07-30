@@ -315,7 +315,7 @@ wheels = [
 ]
 
 [[package]]
-name = "hermes-band-platform"
+name = "hermes-band"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [

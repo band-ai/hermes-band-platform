@@ -111,6 +111,14 @@ def _load_sdk() -> bool:
 
     if ChatRoomRequest is not None:
         return True
+    # Mirror check_band_requirements: re-apply the band-libs shim so an SDK
+    # resolved into $HERMES_HOME/band-libs after module import is found.
+    try:
+        from ._band_libs import prepend_band_libs
+
+        prepend_band_libs()
+    except Exception:
+        pass
     try:
         from band.client.rest import (
             ChatMessageRequest as _ChatMessageRequest,
@@ -168,10 +176,12 @@ async def _rest() -> Any:
         pass
 
     if not _load_sdk():
+        from ._band_libs import sdk_install_command
+
         raise _ToolUnavailable(
-            "Band not available (band-sdk not installed in the gateway Python). "
+            "Band not available (band-sdk not resolvable by the gateway Python). "
             "Directory plugin installs do not install dependencies; run: "
-            "uv pip install --python \"$HERMES_PY\" 'band-sdk>=1.0.0,<2.0.0'"
+            f"{sdk_install_command()}"
         )
     from band.client.rest import AsyncRestClient
 

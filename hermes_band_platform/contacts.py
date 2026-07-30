@@ -10,9 +10,16 @@ reimplement any contact-request logic.
 
 Conventions mirrored from ``tools.py``: lazy SDK import (the module loads
 cleanly when ``band-sdk`` is absent), ``_tool_exc`` for error shaping.
+
+``_contact_tools`` is the module's single SDK guard, and
+``list_approved_contacts`` is the one place the ``list_contacts`` response
+shape is unwrapped -- ``federation.py`` calls it rather than keeping a second
+copy of either.
 """
 
 from __future__ import annotations
+
+from typing import Any, Dict, List
 
 from tools.registry import tool_error, tool_result
 
@@ -20,38 +27,49 @@ from .tools import _authorize_band_action, _rest, _tool_exc, _ToolUnavailable
 
 try:
     from band.runtime.contact_tools import ContactTools
-except ImportError:  # SDK not present yet -- rebind in _load_contact_tools().
+except ImportError:  # SDK not present yet -- rebind in _contact_tools().
     ContactTools = None
 
 
-def _load_contact_tools() -> bool:
-    """(Re)bind ``ContactTools`` so a late ``pip install`` is picked up live.
+def _contact_tools(rest: Any) -> Any:
+    """Return a ``ContactTools`` bound to ``rest``, (re)binding the SDK class first.
 
-    Mirrors ``tools.py``'s own ``_load_sdk()`` rebind idiom.
+    The single SDK guard for the contacts subsystem -- ``federation.py`` reaches
+    it through ``list_approved_contacts`` rather than keeping a second copy.
+    Rebinding on each call mirrors ``tools.py``'s ``_load_sdk()`` idiom, so a
+    late ``pip install`` is picked up without a gateway restart.
     """
     global ContactTools
-    if ContactTools is not None:
-        return True
-    try:
-        from band.runtime.contact_tools import ContactTools as _ContactTools
-    except ImportError:
-        return False
-    ContactTools = _ContactTools
-    return True
+    if ContactTools is None:
+        try:
+            from band.runtime.contact_tools import ContactTools as _ContactTools
+        except ImportError:
+            raise _ToolUnavailable(
+                "Band not available (band-sdk contacts module not installed)"
+            ) from None
+        ContactTools = _ContactTools
+    return ContactTools(rest)
+
+
+async def list_approved_contacts(rest: Any) -> List[Dict[str, Any]]:
+    """Return the approved-contact dicts (``id``/``handle``/``name``/``type``).
+
+    Shared by ``band_list_contacts`` and ``federation.py``'s friend
+    resolution, so the response shape is unwrapped in exactly one place.
+    """
+    return (await _contact_tools(rest).list_contacts())["contacts"]
 
 
 async def _handle_add_contact(args: dict, **kwargs) -> str:
     """band_add_contact: send a Band contact request."""
     try:
         _authorize_band_action()
-        if not _load_contact_tools():
-            raise _ToolUnavailable("Band not available (band-sdk not installed)")
         handle = str(args.get("handle") or "").strip()
         if not handle:
             return tool_error("handle is required")
         message = str(args.get("message") or "").strip() or None
         rest = await _rest()
-        out = await ContactTools(rest).add_contact(handle=handle, message=message)
+        out = await _contact_tools(rest).add_contact(handle=handle, message=message)
         return tool_result({"success": True, **out})
     except Exception as exc:
         return _tool_exc(exc)
@@ -60,11 +78,8 @@ async def _handle_add_contact(args: dict, **kwargs) -> str:
 async def _handle_list_contacts(args: dict, **kwargs) -> str:
     """band_list_contacts: list approved contacts. Read-only."""
     try:
-        if not _load_contact_tools():
-            raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
-        out = await ContactTools(rest).list_contacts()
-        return tool_result({"success": True, "contacts": out["contacts"]})
+        return tool_result({"success": True, "contacts": await list_approved_contacts(rest)})
     except Exception as exc:
         return _tool_exc(exc)
 
@@ -72,10 +87,8 @@ async def _handle_list_contacts(args: dict, **kwargs) -> str:
 async def _handle_list_contact_requests(args: dict, **kwargs) -> str:
     """band_list_contact_requests: list pending received/sent requests. Read-only."""
     try:
-        if not _load_contact_tools():
-            raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
-        out = await ContactTools(rest).list_contact_requests()
+        out = await _contact_tools(rest).list_contact_requests()
         return tool_result(
             {"success": True, "received": out["received"], "sent": out["sent"]}
         )
@@ -87,8 +100,6 @@ async def _handle_respond_contact_request(args: dict, **kwargs) -> str:
     """band_respond_contact_request: approve/reject/cancel a contact request."""
     try:
         _authorize_band_action()
-        if not _load_contact_tools():
-            raise _ToolUnavailable("Band not available (band-sdk not installed)")
         action = str(args.get("action") or "").strip().lower()
         if action not in ("approve", "reject", "cancel"):
             return tool_error("action must be one of: approve, reject, cancel")
@@ -96,7 +107,7 @@ async def _handle_respond_contact_request(args: dict, **kwargs) -> str:
         if not request_id:
             return tool_error("request_id is required")
         rest = await _rest()
-        out = await ContactTools(rest).respond_contact_request(
+        out = await _contact_tools(rest).respond_contact_request(
             action=action, request_id=request_id
         )
         return tool_result({"success": True, **out})

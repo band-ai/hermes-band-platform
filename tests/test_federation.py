@@ -5,8 +5,9 @@ Strategy mirrors ``tests/test_tools.py``: the band-sdk request types
 ``ChatMessageRequestMentionsItem``) bind from the ``sys.modules`` stub
 installed by ``tests/conftest.py``, so real request objects are constructed.
 ``federation._rest`` and ``federation._live_band_adapter`` are patched to
-avoid a live gateway/network, and ``federation.ContactTools`` is patched
-the same way ``tests/test_contacts.py`` patches ``contacts.ContactTools``.
+avoid a live gateway/network, and ``federation.list_approved_contacts`` (the
+shared helper owned by ``contacts.py``) is patched to supply the contact
+directory -- the same ``patch.object`` seam ``tests/test_tools.py`` uses.
 """
 
 from __future__ import annotations
@@ -33,12 +34,6 @@ def _make_rest() -> MagicMock:
         return_value=SimpleNamespace(data=SimpleNamespace(id="msg-001"))
     )
     return rest
-
-
-def _make_contact_tools(contacts):
-    fake = MagicMock()
-    fake.list_contacts = AsyncMock(return_value={"contacts": contacts, "metadata": {}})
-    return fake
 
 
 def _agent_contact(cid, handle, name):
@@ -89,7 +84,7 @@ class TestAskWikisDefaultFanOut:
         adapter = _fake_adapter()
         with patch.object(band_federation, "_rest", AsyncMock(return_value=rest)), \
              patch.object(band_federation, "_live_band_adapter", return_value=adapter), \
-             patch.object(band_federation, "ContactTools", MagicMock(return_value=_make_contact_tools(contacts))):
+             patch.object(band_federation, "list_approved_contacts", AsyncMock(return_value=contacts)):
             out = _parse(await band_federation._handle_ask_wikis({"query": "what is X?"}))
 
         assert out["success"] is True
@@ -111,7 +106,7 @@ class TestAskWikisDefaultFanOut:
         adapter = _fake_adapter()
         with patch.object(band_federation, "_rest", AsyncMock(return_value=_make_rest())), \
              patch.object(band_federation, "_live_band_adapter", return_value=adapter), \
-             patch.object(band_federation, "ContactTools", MagicMock(return_value=_make_contact_tools([]))):
+             patch.object(band_federation, "list_approved_contacts", AsyncMock(return_value=[])):
             out = _parse(await band_federation._handle_ask_wikis({"query": "what is X?"}))
         assert "error" in out
         adapter.register_pending_federation.assert_not_called()
@@ -134,7 +129,7 @@ class TestAskWikisNamedFriends:
         adapter = _fake_adapter()
         with patch.object(band_federation, "_rest", AsyncMock(return_value=rest)), \
              patch.object(band_federation, "_live_band_adapter", return_value=adapter), \
-             patch.object(band_federation, "ContactTools", MagicMock(return_value=_make_contact_tools(contacts))):
+             patch.object(band_federation, "list_approved_contacts", AsyncMock(return_value=contacts)):
             out = _parse(
                 await band_federation._handle_ask_wikis(
                     {"query": "what is X?", "friends": ["alice/hermes"]}
@@ -152,7 +147,7 @@ class TestAskWikisNamedFriends:
         adapter = _fake_adapter()
         with patch.object(band_federation, "_rest", AsyncMock(return_value=rest)), \
              patch.object(band_federation, "_live_band_adapter", return_value=adapter), \
-             patch.object(band_federation, "ContactTools", MagicMock(return_value=_make_contact_tools(contacts))):
+             patch.object(band_federation, "list_approved_contacts", AsyncMock(return_value=contacts)):
             out = _parse(
                 await band_federation._handle_ask_wikis(
                     {"query": "what is X?", "friends": ["alice/hermes", "ghost"]}
@@ -168,7 +163,7 @@ class TestAskWikisNamedFriends:
         adapter = _fake_adapter()
         with patch.object(band_federation, "_rest", AsyncMock(return_value=rest)), \
              patch.object(band_federation, "_live_band_adapter", return_value=adapter), \
-             patch.object(band_federation, "ContactTools", MagicMock(return_value=_make_contact_tools(contacts))):
+             patch.object(band_federation, "list_approved_contacts", AsyncMock(return_value=contacts)):
             out = _parse(
                 await band_federation._handle_ask_wikis(
                     {"query": "what is X?", "friends": ["ghost"]}
@@ -193,7 +188,7 @@ class TestAskWikisRequesterRoom:
         adapter = _fake_adapter()
         with patch.object(band_federation, "_rest", AsyncMock(return_value=rest)), \
              patch.object(band_federation, "_live_band_adapter", return_value=adapter), \
-             patch.object(band_federation, "ContactTools", MagicMock(return_value=_make_contact_tools(contacts))):
+             patch.object(band_federation, "list_approved_contacts", AsyncMock(return_value=contacts)):
             out = _parse(await band_federation._handle_ask_wikis({"query": "what is X?"}))
         assert out["success"] is True
         kwargs = adapter.register_pending_federation.call_args.kwargs
@@ -208,7 +203,7 @@ class TestAskWikisRequesterRoom:
         adapter._hub_room_id = None
         with patch.object(band_federation, "_rest", AsyncMock(return_value=rest)), \
              patch.object(band_federation, "_live_band_adapter", return_value=adapter), \
-             patch.object(band_federation, "ContactTools", MagicMock(return_value=_make_contact_tools(contacts))):
+             patch.object(band_federation, "list_approved_contacts", AsyncMock(return_value=contacts)):
             out = _parse(await band_federation._handle_ask_wikis({"query": "what is X?"}))
         assert "error" in out
         assert "no room to deliver" in out["error"]

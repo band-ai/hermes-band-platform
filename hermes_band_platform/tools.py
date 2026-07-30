@@ -155,6 +155,25 @@ def _check_band_tools_available() -> bool:
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+def _live_band_adapter() -> Optional[Any]:
+    """Return the live :class:`BandAdapter` from the running gateway, or None.
+
+    The single place this module reaches into ``gateway.run`` for adapter
+    state: ``_rest`` / ``_owner_identity`` / ``_home_room`` /
+    ``_agent_id_or_none`` all read their live value off the result (each with
+    an env fallback), and ``federation.py`` uses the adapter itself to call
+    ``register_pending_federation``. Never raises — an out-of-process caller
+    (cron, no live gateway) simply gets None.
+    """
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        return runner.adapters.get(Platform("band")) if runner else None
+    except Exception:
+        return None
+
+
 async def _rest() -> Any:
     """Return an authenticated async REST client.
 
@@ -163,17 +182,9 @@ async def _rest() -> Any:
     (cron / no live gateway). The fallback client is short-lived — created per
     call — so it never leaks a pooled connection across a loop.
     """
-    try:
-        from gateway.run import _gateway_runner_ref
-
-        runner = _gateway_runner_ref()
-        adapter = runner.adapters.get(Platform("band")) if runner else None
-        link = getattr(adapter, "_link", None) if adapter is not None else None
-        if link is not None:
-            return link.rest
-    except Exception:
-        # Fall through to the env-creds fallback.
-        pass
+    rest = getattr(getattr(_live_band_adapter(), "_link", None), "rest", None)
+    if rest is not None:
+        return rest
 
     if not _load_sdk():
         from ._band_libs import sdk_install_command
@@ -190,24 +201,6 @@ async def _rest() -> Any:
         raise _ToolUnavailable("Band not configured (BAND_API_KEY)")
     _, rest_url = _derive_urls(os.getenv("BAND_BASE_URL", "").strip())
     return AsyncRestClient(api_key=api_key, base_url=rest_url)
-
-
-def _live_band_adapter() -> Optional[Any]:
-    """Return the live BandAdapter instance from the running gateway, or None.
-
-    ``_rest()`` only returns the link's REST client; callers that need
-    adapter-level state (e.g. ``federation.py`` calling
-    ``register_pending_federation``) need the adapter object itself. Mirrors
-    the same runner-lookup pattern ``_rest()`` / ``_owner_identity()`` /
-    ``_home_room()`` already use inline.
-    """
-    try:
-        from gateway.run import _gateway_runner_ref
-
-        runner = _gateway_runner_ref()
-        return runner.adapters.get(Platform("band")) if runner else None
-    except Exception:
-        return None
 
 
 def _resolve_room(args: Dict[str, Any]) -> str:
@@ -256,16 +249,7 @@ def _owner_identity() -> Optional[str]:
     state (set on connect from the agent identity); fall back to
     ``BAND_OWNER_ID`` for out-of-process callers. Never raises.
     """
-    owner: Optional[str] = None
-    try:
-        from gateway.run import _gateway_runner_ref
-
-        runner = _gateway_runner_ref()
-        adapter = runner.adapters.get(Platform("band")) if runner else None
-        if adapter is not None:
-            owner = getattr(adapter, "_owner_uuid", None)
-    except Exception:
-        pass
+    owner = getattr(_live_band_adapter(), "_owner_uuid", None)
     return owner or (os.getenv("BAND_OWNER_ID", "").strip() or None)
 
 
@@ -277,16 +261,9 @@ def _home_room() -> Optional[str]:
     ``_hub_room_id``; fall back to ``BAND_HOME_ROOM`` then ``BAND_HUB_ROOM`` for
     out-of-process callers. Never raises.
     """
-    try:
-        from gateway.run import _gateway_runner_ref
-
-        runner = _gateway_runner_ref()
-        adapter = runner.adapters.get(Platform("band")) if runner else None
-        hub = getattr(adapter, "_hub_room_id", None) if adapter is not None else None
-        if hub:
-            return str(hub)
-    except Exception:
-        pass
+    hub = getattr(_live_band_adapter(), "_hub_room_id", None)
+    if hub:
+        return str(hub)
     return (
         os.getenv("BAND_HOME_ROOM", "").strip()
         or os.getenv("BAND_HUB_ROOM", "").strip()
@@ -453,17 +430,8 @@ async def _agent_id_or_none(rest: Any) -> Optional[str]:
     Prefers the live adapter's ``_agent_id``; falls back to ``BAND_AGENT_ID``.
     Never raises.
     """
-    try:
-        from gateway.run import _gateway_runner_ref
-
-        runner = _gateway_runner_ref()
-        adapter = runner.adapters.get(Platform("band")) if runner else None
-        aid = getattr(adapter, "_agent_id", None) if adapter is not None else None
-        if aid:
-            return aid
-    except Exception:
-        pass
-    return os.getenv("BAND_AGENT_ID", "").strip() or None
+    aid = getattr(_live_band_adapter(), "_agent_id", None)
+    return aid or (os.getenv("BAND_AGENT_ID", "").strip() or None)
 
 
 def _tool_exc(exc: Exception) -> str:

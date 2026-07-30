@@ -13,9 +13,10 @@ state machine itself lives in ``adapter.py`` since it needs the adapter's own
 event loop (``_handle_message_created``) to observe replies.
 
 Conventions mirrored from ``tools.py``: an independent lazy SDK import guard
-for the request types this module constructs (see ``tools.py``'s own
-docstring on why these guards are NOT shared across modules), and
-``_tool_exc`` for error shaping.
+for the *request types* this module constructs (see ``tools.py``'s own
+docstring on why those rebindable names are NOT shared across modules), and
+``_tool_exc`` for error shaping. Contact lookups go through
+``contacts.list_approved_contacts``, which owns that subsystem's guard.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ from gateway.session_context import get_session_env
 from tools.registry import tool_error, tool_result
 
 from .adapter import DEFAULT_REQUEST_OPTIONS, FEDERATION_TIMEOUT_SECONDS
+from .contacts import list_approved_contacts
 from .tools import (
     _authorize_band_action,
     _live_band_adapter,
@@ -36,7 +38,7 @@ from .tools import (
 )
 
 # ---------------------------------------------------------------------------
-# Lazy SDK import guards. Independent copies -- see module docstring.
+# Lazy SDK import guard for the request types -- see module docstring.
 # ---------------------------------------------------------------------------
 try:
     from band.client.rest import (  # noqa: F401
@@ -50,11 +52,6 @@ except ImportError:
     ChatMessageRequestMentionsItem = None
     ChatRoomRequest = None
     ParticipantRequest = None
-
-try:
-    from band.runtime.contact_tools import ContactTools
-except ImportError:
-    ContactTools = None
 
 
 def _load_request_types() -> bool:
@@ -75,18 +72,6 @@ def _load_request_types() -> bool:
     ChatMessageRequestMentionsItem = _ChatMessageRequestMentionsItem
     ChatRoomRequest = _ChatRoomRequest
     ParticipantRequest = _ParticipantRequest
-    return True
-
-
-def _load_contact_tools() -> bool:
-    global ContactTools
-    if ContactTools is not None:
-        return True
-    try:
-        from band.runtime.contact_tools import ContactTools as _ContactTools
-    except ImportError:
-        return False
-    ContactTools = _ContactTools
     return True
 
 
@@ -135,10 +120,6 @@ async def _handle_ask_wikis(args: dict, **kwargs) -> str:
         _authorize_band_action()
         if not _load_request_types():
             raise _ToolUnavailable("Band not available (band-sdk not installed)")
-        if not _load_contact_tools():
-            raise _ToolUnavailable(
-                "Band not available (band-sdk contacts module not installed)"
-            )
 
         query = str(args.get("query") or "").strip()
         if not query:
@@ -155,8 +136,11 @@ async def _handle_ask_wikis(args: dict, **kwargs) -> str:
             )
 
         rest = await _rest()
-        contacts = (await ContactTools(rest).list_contacts())["contacts"]
-        agent_contacts = [c for c in contacts if (c.get("type") or "") == "Agent"]
+        agent_contacts = [
+            c
+            for c in await list_approved_contacts(rest)
+            if (c.get("type") or "") == "Agent"
+        ]
 
         warning = None
         if requested:

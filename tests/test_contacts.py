@@ -157,10 +157,13 @@ class TestContactToolsUnavailable:
 
     @pytest.mark.asyncio
     async def test_add_contact_reports_unavailable_when_sdk_missing(self, monkeypatch):
+        """Unbound ``ContactTools`` + no importable SDK module → tool_error, not a raise.
+
+        ``conftest.py`` never stubs ``band.runtime.contact_tools``, so clearing
+        the module-level binding makes ``_contact_tools``'s rebind attempt fail
+        for real — exactly what an older band-sdk without that module does.
+        """
         monkeypatch.setattr(band_contacts, "ContactTools", None)
-        monkeypatch.setattr(
-            band_contacts, "_load_contact_tools", lambda: False
-        )
         out = _parse(await band_contacts._handle_add_contact({"handle": "@x/y"}))
         assert "error" in out
 

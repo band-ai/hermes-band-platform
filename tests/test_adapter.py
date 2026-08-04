@@ -591,6 +591,87 @@ class TestBandAdapterSend:
         assert any(getattr(m, "id", None) == "human-id" for m in mentions)
 
     @pytest.mark.asyncio
+    async def test_handle_less_last_sender_is_hydrated_from_the_roster(self, adapter):
+        """Band rejects ``handle: null``, so a cached sender gets its handle back."""
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(id="msg-h"))
+        )
+        adapter._link = mock_link
+        adapter._agent_id = "agent-id-xxx"
+        adapter._participants_cache["room-h"] = [
+            {"id": "human-id", "type": "User", "name": "Alice", "handle": "alice"},
+        ]
+        adapter._last_human_sender["room-h"] = {
+            "id": "human-id",
+            "handle": None,  # roster had no handle when the message arrived
+            "name": "Alice",
+        }
+
+        result = await adapter.send("room-h", "hi")
+        assert result.success is True
+        mentions = mock_link.rest.agent_api_messages.create_agent_chat_message.call_args[1][
+            "message"
+        ].mentions
+        assert [(m.id, m.handle) for m in mentions] == [("human-id", "alice")]
+
+    @pytest.mark.asyncio
+    async def test_handle_less_owner_sender_falls_back_to_the_agent_handle(self, adapter):
+        """``owner_handle/agent_slug`` → the owner's handle, with no REST call."""
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(id="msg-o"))
+        )
+        adapter._link = mock_link
+        adapter._agent_id = "agent-id-xxx"
+        adapter._owner_uuid = "owner-id"
+        adapter._handle = "nirs/hermes"
+        adapter._participants_cache["room-o"] = []
+        adapter._last_human_sender["room-o"] = {"id": "owner-id", "handle": None}
+
+        result = await adapter.send("room-o", "hi")
+        assert result.success is True
+        mentions = mock_link.rest.agent_api_messages.create_agent_chat_message.call_args[1][
+            "message"
+        ].mentions
+        assert [(m.id, m.handle) for m in mentions] == [("owner-id", "nirs")]
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_last_sender_falls_back_to_room_sweep(self, adapter):
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(id="msg-s"))
+        )
+        adapter._link = mock_link
+        adapter._agent_id = "agent-id-xxx"
+        adapter._participants_cache["room-s"] = [
+            {"id": "other-id", "type": "User", "name": "Bob", "handle": "bob"},
+        ]
+        adapter._last_human_sender["room-s"] = {"id": "ghost-id", "handle": None}
+
+        result = await adapter.send("room-s", "hi")
+        assert result.success is True
+        mentions = mock_link.rest.agent_api_messages.create_agent_chat_message.call_args[1][
+            "message"
+        ].mentions
+        assert [(m.id, m.handle) for m in mentions] == [("other-id", "bob")]
+
+    @pytest.mark.asyncio
+    async def test_send_dropped_when_no_participant_has_a_handle(self, adapter):
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock()
+        adapter._link = mock_link
+        adapter._agent_id = "agent-id-xxx"
+        adapter._participants_cache["room-n"] = [
+            {"id": "human-id", "type": "User", "name": "Alice", "handle": None},
+        ]
+
+        result = await adapter.send("room-n", "hi")
+        assert result.success is False
+        assert "handle" in result.error
+        mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_send_marshals_to_link_loop_when_called_from_another_loop(self, adapter):
         """Cross-loop send is routed back onto the link's loop (INT-899).
 
@@ -2565,6 +2646,36 @@ class TestHubBootstrap:
         assert mkwargs["chat_id"] == "hub-new-1"
         assert mkwargs["message"].content.startswith("Hermes Agent Hub")
         assert mkwargs["message"].mentions[0].id == "owner-1"
+
+    @pytest.mark.asyncio
+    async def test_hub_greeting_mention_carries_the_owner_handle(self, adapter):
+        """The greeting is a real send: Band rejects a mention with no handle."""
+        link = _make_hub_link(rooms=[])
+        adapter._link = link
+        adapter._handle = "nirs/hermes"  # owner_handle/agent_slug
+
+        await adapter._ensure_hub()
+
+        _, mkwargs = link.rest.agent_api_messages.create_agent_chat_message.await_args
+        mention = mkwargs["message"].mentions[0]
+        assert (mention.id, mention.handle) == ("owner-1", "nirs")
+
+    @pytest.mark.asyncio
+    async def test_hub_greeting_handle_falls_back_to_the_room_roster(self, adapter):
+        """No ``owner/slug`` agent handle → resolve the owner from the roster."""
+        link = _make_hub_link(rooms=[])
+        link.rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[SimpleNamespace(id="owner-1", handle="nirs", name="Nir", type="User")]
+            )
+        )
+        adapter._link = link
+        adapter._handle = "hermes"  # not in owner/slug form
+
+        await adapter._ensure_hub()
+
+        _, mkwargs = link.rest.agent_api_messages.create_agent_chat_message.await_args
+        assert mkwargs["message"].mentions[0].handle == "nirs"
         # Greeting echo suppressed via the sent-id backstop.
         assert "greet-msg-1" in adapter._sent_ids
         # Hub recorded + subscribed + persisted + wired as the main channel.

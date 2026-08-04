@@ -72,6 +72,14 @@ def _make_rest() -> MagicMock:
     rest.agent_api_peers.list_agent_peers = AsyncMock(
         return_value=SimpleNamespace(data=[], metadata=SimpleNamespace(total_pages=1))
     )
+
+    # agent_api_identity.get_agent_me -> .data.handle ("owner_handle/agent_slug").
+    # The owner-mention fallback derives the owner's handle from this prefix.
+    rest.agent_api_identity.get_agent_me = AsyncMock(
+        return_value=SimpleNamespace(
+            data=SimpleNamespace(id="agent-self", handle="owner/hermes")
+        )
+    )
     return rest
 
 
@@ -328,6 +336,76 @@ class TestSendMessage:
         assert mentions[0].handle == "y"
 
     @pytest.mark.asyncio
+    async def test_explicit_id_without_handle_hydrates_from_directory(self, owner_session):
+        """The roster may omit ``handle``; the API still requires one."""
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[_peer("u-x", handle=None, name="X")])
+        )
+        rest.agent_api_peers.list_agent_peers = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[_peer("u-x", handle="xavier", name="X")],
+                metadata=SimpleNamespace(total_pages=1),
+            )
+        )
+        with _patch_rest(rest), _patch_agent_id("agent-self"):
+            out = _parse(
+                await band_tools._handle_send_message(
+                    {"content": "hi", "mention_ids": ["u-x"]}
+                )
+            )
+        assert out["success"] is True
+        call = rest.agent_api_messages.create_agent_chat_message.await_args
+        mentions = call.kwargs["message"].mentions
+        assert [(m.id, m.handle) for m in mentions] == [("u-x", "xavier")]
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_explicit_id_errors_without_sending(self, owner_session):
+        """Nothing is sent, and the error names the id — no opaque API 422."""
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[_peer("u-x", handle=None), _peer("u-ok", handle="oksana")]
+            )
+        )
+        with _patch_rest(rest), _patch_agent_id("agent-self"):
+            out = _parse(
+                await band_tools._handle_send_message(
+                    {"content": "hi", "mention_ids": ["u-x", "u-ok"]}
+                )
+            )
+        assert "u-x" in out["error"]
+        assert "handle" in out["error"].lower()
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_auto_mention_skips_handle_less_participants(self, owner_session):
+        """Auto-selected recipients we can't resolve are dropped, not fatal."""
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[_peer("u-ghost", handle=None), _peer("u-human", handle="alice")]
+            )
+        )
+        with _patch_rest(rest), _patch_agent_id("agent-self"):
+            out = _parse(await band_tools._handle_send_message({"content": "hello"}))
+        assert out["success"] is True
+        call = rest.agent_api_messages.create_agent_chat_message.await_args
+        assert [m.id for m in call.kwargs["message"].mentions] == ["u-human"]
+
+    @pytest.mark.asyncio
+    async def test_no_handle_anywhere_errors_without_sending(self, owner_session):
+        """A room whose only recipient has no handle is a local error."""
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[_peer("u-ghost", handle=None)])
+        )
+        with _patch_rest(rest), _patch_agent_id("agent-self"):
+            out = _parse(await band_tools._handle_send_message({"content": "hello"}))
+        assert "handle" in out["error"].lower()
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_no_mentionable_recipient_errors(self, owner_session):
         rest = _make_rest()
         # Only the agent in the room -> nothing to mention after self-exclusion.
@@ -539,6 +617,9 @@ class TestSendToOwnerFallback:
         call = rest.agent_api_messages.create_agent_chat_message.await_args
         mentions = call.kwargs["message"].mentions
         assert [m.id for m in mentions] == ["owner-uuid"]  # owner pinged by default
+        # The hub roster carries no handle here, so the owner's handle comes from
+        # the agent handle prefix (owner/hermes) — Band rejects handle: null.
+        assert [m.handle for m in mentions] == ["owner"]
 
     @pytest.mark.asyncio
     async def test_falls_back_to_hub_room_when_no_home(self, monkeypatch):
@@ -601,6 +682,9 @@ class TestOwnerGate:
         monkeypatch.delenv("BAND_TOOL_OWNERS", raising=False)
         tokens = set_session_vars(platform="band", chat_id="room-1", user_id="u1")
         rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[_peer("p-1", handle="pat")])
+        )
         try:
             with _patch_rest(rest):
                 for handler, args in (
@@ -723,34 +807,60 @@ class TestMentionItems:
         return [i.id for i in items]
 
     def test_explicit_ids_resolve_handle_from_participants(self):
-        from hermes_band_platform.adapter import _mention_items
+        from hermes_band_platform.adapter import _mention_plan
 
         parts = [{"id": "u1", "handle": "alice", "name": "Alice"}]
-        items = _mention_items(parts, agent_id="me", explicit_ids=["u1", "u2"])
-        assert self._ids(items) == ["u1", "u2"]
-        assert items[0].handle == "alice"   # resolved
-        assert items[1].handle is None      # unknown id → bare mention
+        plan = _mention_plan(parts, agent_id="me", explicit_ids=["u1", "u2"])
+        # u1 resolves; u2 has no handle so it is reported, never sent as null.
+        assert self._ids(plan.items) == ["u1"]
+        assert plan.items[0].handle == "alice"
+        assert plan.unresolved == ["u2"]
 
     def test_preferred_wins_over_fallback(self):
-        from hermes_band_platform.adapter import _mention_items
+        from hermes_band_platform.adapter import _mention_plan
 
-        items = _mention_items(
+        plan = _mention_plan(
             [{"id": "x", "handle": "x"}],  # would be the fallback
             agent_id="me",
             preferred={"id": "human", "handle": "bob"},
         )
-        assert self._ids(items) == ["human"]
+        assert self._ids(plan.items) == ["human"]
+        assert plan.unresolved == []
 
     def test_fallback_excludes_agent_and_other_agents(self):
-        from hermes_band_platform.adapter import _mention_items
+        from hermes_band_platform.adapter import _mention_plan
 
         parts = [
             {"id": "me", "handle": "bot", "type": "Agent"},      # self
             {"id": "a2", "handle": "peer", "type": "Agent"},     # other agent
             {"id": "h1", "handle": "alice", "type": "User"},     # human
         ]
-        items = _mention_items(parts, agent_id="me")
-        assert self._ids(items) == ["h1"]
+        plan = _mention_plan(parts, agent_id="me")
+        assert self._ids(plan.items) == ["h1"]
+
+    def test_handle_less_participants_are_reported_not_mentioned(self):
+        """Band rejects ``handle: null``, so a handle-less target never ships."""
+        from hermes_band_platform.adapter import _mention_plan
+
+        parts = [
+            {"id": "h1", "handle": None, "name": "No Handle", "type": "User"},
+            {"id": "h2", "handle": "  ", "name": "Blank", "type": "User"},
+            {"id": "h3", "handle": "carol", "name": "Carol", "type": "User"},
+        ]
+        plan = _mention_plan(parts, agent_id="me")
+        assert self._ids(plan.items) == ["h3"]
+        assert plan.unresolved == ["h1", "h2"]
+
+    def test_preferred_without_handle_is_unresolved(self):
+        from hermes_band_platform.adapter import _mention_plan
+
+        plan = _mention_plan(
+            [{"id": "x", "handle": "x", "type": "User"}],
+            agent_id="me",
+            preferred={"id": "human", "handle": None},
+        )
+        assert plan.items == []
+        assert plan.unresolved == ["human"]
 
 
 class TestBandToolsTuple:

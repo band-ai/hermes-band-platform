@@ -103,10 +103,12 @@ async def _rest_client() -> Any:
 async def _mentions_for(rest: Any, room_id: str) -> list[Any]:
     """Every non-agent participant in the room, as mention items.
 
-    Band requires ≥1 mention per send. This is ``tools._mentions_for(…, None)``'s
-    fallback branch — the only one reachable without explicit ids — inlined:
-    ``_list_participants`` + ``adapter._mention_items``'s no-preferred path, with
-    the agent's own id excluded so it never @mentions itself. Pinned by
+    Band requires ≥1 mention per send, each carrying a non-null handle. This is
+    ``tools._mentions_for(…, None)``'s fallback branch — the only one reachable
+    without explicit ids — inlined: ``_list_participants`` +
+    ``adapter._mention_plan``'s no-preferred path, with the agent's own id
+    excluded so it never @mentions itself, and handle-less participants skipped
+    (the API rejects ``handle: null``). Pinned by
     ``test_verify_roundtrip_mentions_match_the_adapter``.
     """
     from band.client.rest import DEFAULT_REQUEST_OPTIONS, ChatMessageRequestMentionsItem
@@ -120,17 +122,20 @@ async def _mentions_for(rest: Any, room_id: str) -> list[Any]:
         pid = getattr(peer, "id", None)
         if not pid or pid == agent_id or (getattr(peer, "type", None) or "") == "Agent":
             continue
+        handle = str(getattr(peer, "handle", None) or "").strip()
+        if not handle:
+            continue
         items.append(
             ChatMessageRequestMentionsItem(
                 id=pid,
-                handle=getattr(peer, "handle", None),
+                handle=handle,
                 name=getattr(peer, "name", None),
             )
         )
     if not items:
         raise RuntimeError(
-            "Band requires at least one @mention; no mentionable recipient was found "
-            "(pass mention_ids or add a participant to the room first)"
+            "Band requires at least one @mention; no recipient with a Band handle was "
+            "found in this room (add a participant to the room first)"
         )
     return items
 

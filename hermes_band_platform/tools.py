@@ -46,8 +46,9 @@ from tools.registry import tool_error, tool_result
 # adapter module is safe even when the SDK is absent (it guards its own import).
 from .adapter import (
     DEFAULT_REQUEST_OPTIONS,
+    _clean_handle,
     _derive_urls,
-    _mention_items,
+    _mention_plan,
     _short_id,
     check_band_requirements,
 )
@@ -234,9 +235,9 @@ def _resolve_room_for_send(args: Dict[str, Any]) -> tuple[str, bool]:
 def _owner_identity() -> Optional[str]:
     """Resolve the Band owner UUID — live adapter first, env fallback.
 
-    Mirrors ``_agent_id_or_none``: prefer the connected adapter's resolved
-    state (set on connect from the agent identity); fall back to
-    ``BAND_OWNER_ID`` for out-of-process callers. Never raises.
+    Prefer the connected adapter's resolved state (set on connect from the
+    agent identity); fall back to ``BAND_OWNER_ID`` for out-of-process
+    callers. Never raises.
     """
     owner: Optional[str] = None
     try:
@@ -397,27 +398,42 @@ async def _mentions_for(
 ) -> List[Any]:
     """Build the mandatory mention list for a send (Band requires ≥1).
 
-    If ``mention_ids`` is given, build one mention per id (handle resolved from
-    the room participants when cheap). Otherwise mention every non-agent
-    participant in the room. Raises ``_ToolError`` if the result is empty.
+    The agent names its recipients: ``mention_ids`` is required, because the
+    room's other participants are not the agent's audience by default (and a
+    room may not even have any). Each id is resolved to a Band handle from the
+    room roster — the API rejects ``handle: null`` — so an unmentionable
+    recipient is caught locally instead of becoming a 422 on send:
+
+      * no ``mention_ids`` → ``_ToolError``; an un-mentioned send is not a
+        valid send, so the agent gets the requirement back and retries with
+        explicit recipients, and
+      * an id with no resolvable handle → ``_ToolError`` naming the ids,
+        nothing sent (silently dropping a recipient the caller asked for is
+        worse than failing).
+
+    Raises ``_ToolError`` whenever no sendable mention can be built.
     """
     if not _load_sdk():
         raise _ToolUnavailable("Band not available (band-sdk not installed)")
 
-    # Fetch participants once for handle resolution / fallback mentions, then
-    # delegate to the shared builder (same semantics as the adapter's send).
-    participants = await _list_participants(rest, room_id)
-    # Resolve the running agent's id so the fallback never @mentions ourselves
-    # (irrelevant when explicit mention_ids are given).
-    agent_id = None if mention_ids else await _agent_id_or_none(rest)
-    items = _mention_items(participants, agent_id=agent_id, explicit_ids=mention_ids)
-
-    if not items:
+    if not mention_ids:
         raise _ToolError(
-            "Band requires at least one @mention; no mentionable recipient was found "
-            "(pass mention_ids or add a participant to the room first)"
+            "Band requires at least one @mention with a handle and the agent must "
+            "choose the recipient: pass `mention_ids` (participant UUIDs from "
+            "band_get_participants or band_find_contact). Nothing was sent."
         )
-    return items
+
+    participants = await _list_participants(rest, room_id)
+    plan = _mention_plan(participants, agent_id=None, explicit_ids=mention_ids)
+
+    if plan.unresolved:
+        raise _ToolError(
+            "Band requires an @handle for every mention and none could be resolved "
+            f"for: {', '.join(plan.unresolved)}. Nothing was sent — call "
+            "band_get_participants (room roster) or band_find_contact to pick a "
+            "recipient with a handle, or add them to the room first."
+        )
+    return plan.items
 
 
 async def _list_participants(rest: Any, room_id: str) -> List[Dict[str, Any]]:
@@ -427,25 +443,6 @@ async def _list_participants(rest: Any, room_id: str) -> List[Dict[str, Any]]:
         request_options=DEFAULT_REQUEST_OPTIONS,
     )
     return [_peer_to_dict(p) for p in (getattr(resp, "data", None) or [])]
-
-
-async def _agent_id_or_none(rest: Any) -> Optional[str]:
-    """Best-effort: the running adapter's resolved agent id (for self-exclusion).
-
-    Prefers the live adapter's ``_agent_id``; falls back to ``BAND_AGENT_ID``.
-    Never raises.
-    """
-    try:
-        from gateway.run import _gateway_runner_ref
-
-        runner = _gateway_runner_ref()
-        adapter = runner.adapters.get(Platform("band")) if runner else None
-        aid = getattr(adapter, "_agent_id", None) if adapter is not None else None
-        if aid:
-            return aid
-    except Exception:
-        pass
-    return os.getenv("BAND_AGENT_ID", "").strip() or None
 
 
 def _tool_exc(exc: Exception) -> str:
@@ -515,9 +512,20 @@ async def _handle_create_room(args: dict, **kwargs) -> str:
         if message:
             if resolved is None:
                 raise _ToolError("'message' requires 'person' so the message has a recipient to @mention")
+            handle = _clean_handle(resolved)
+            if not handle:
+                # Band rejects a mention without a handle, so there is no send to
+                # make. The room exists and the person was added — report that
+                # rather than losing the room id behind an error.
+                result["warning"] = (
+                    f"Room created and '{person}' added, but no message was sent: Band "
+                    "requires an @handle on every mention and this contact has none. "
+                    "Send with band_send_message once a handle is available."
+                )
+                return tool_result(result)
             mentions = [
                 ChatMessageRequestMentionsItem(
-                    id=resolved["id"], handle=resolved.get("handle"), name=resolved.get("name")
+                    id=resolved["id"], handle=handle, name=resolved.get("name")
                 )
             ]
             chunks = BasePlatformAdapter.truncate_message(message, _MAX_MESSAGE_LENGTH)
@@ -826,8 +834,13 @@ BAND_FIND_CONTACT_SCHEMA = {
 BAND_SEND_MESSAGE_SCHEMA = {
     "name": "band_send_message",
     "description": (
-        "Send a message to a Band room. Band requires at least one @mention per message: pass "
-        "`mention_ids` to choose recipients, otherwise all non-agent participants are mentioned. "
+        "Send a message to a Band room. You must name your recipients: pass the participant UUIDs "
+        "to @mention in `mention_ids` — Band requires at least one @mention per message, each "
+        "carrying the recipient's Band handle, and this tool resolves each id to a handle from "
+        "the room roster. There is no implicit 'mention everyone': omitting `mention_ids`, or "
+        "passing an id whose handle cannot be resolved, sends nothing and returns a "
+        "recipient-resolution error naming the id — re-check the recipient with "
+        "band_get_participants or band_find_contact and retry. "
         "Targets the current Band room by default; pass `room_id` to target another. To message "
         "your owner ('me' / 'the owner') from anywhere — including a non-Band session — omit "
         "`room_id`: with no current Band room the message goes to your owner's hub (home channel) "
@@ -840,7 +853,11 @@ BAND_SEND_MESSAGE_SCHEMA = {
             "mention_ids": {
                 "type": "array",
                 "items": _STRING,
-                "description": "Participant UUIDs to @mention. If omitted, all non-agent participants are mentioned.",
+                "description": (
+                    "Participant UUIDs to @mention, resolved to each recipient's Band handle "
+                    "from the room roster (the API requires one). Required — without it "
+                    "nothing is sent."
+                ),
             },
             "room_id": _ROOM_ID_PROP,
         },

@@ -567,7 +567,8 @@ class TestBandAdapterSend:
         mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_send_builds_mentions_from_participants_when_no_last_sender(self, adapter):
+    async def test_send_without_last_sender_drops(self, adapter):
+        """No last human sender → no mention to build → local drop (no sweep)."""
         mock_link = MagicMock()
         resp = SimpleNamespace(data=SimpleNamespace(id="msg-x"))
         mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
@@ -576,19 +577,93 @@ class TestBandAdapterSend:
         adapter._link = mock_link
         adapter._agent_id = "agent-id-xxx"
 
-        # Seed participants cache directly (skipping REST fetch)
+        # Participants cache seeded, but the room sweep is gone: without a last
+        # sender the send drops rather than mentioning everyone in the room.
         adapter._participants_cache["room-p"] = [
             {"id": "agent-id-xxx", "type": "Agent", "name": "Bot", "handle": "bot"},
             {"id": "human-id", "type": "User", "name": "Alice", "handle": "alice"},
         ]
 
-        result = await adapter.send("room-p", "hello from fallback")
+        result = await adapter.send("room-p", "hello")
+        assert result.success is False
+        mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handle_less_last_sender_is_hydrated_from_the_roster(self, adapter):
+        """Band rejects ``handle: null``, so a cached sender gets its handle back."""
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(id="msg-h"))
+        )
+        adapter._link = mock_link
+        adapter._agent_id = "agent-id-xxx"
+        adapter._participants_cache["room-h"] = [
+            {"id": "human-id", "type": "User", "name": "Alice", "handle": "alice"},
+        ]
+        adapter._last_human_sender["room-h"] = {
+            "id": "human-id",
+            "handle": None,  # roster had no handle when the message arrived
+            "name": "Alice",
+        }
+
+        result = await adapter.send("room-h", "hi")
         assert result.success is True
-        # Ensure the call passed mentions
-        call_kwargs = mock_link.rest.agent_api_messages.create_agent_chat_message.call_args[1]
-        mentions = call_kwargs["message"].mentions
-        assert len(mentions) >= 1
-        assert any(getattr(m, "id", None) == "human-id" for m in mentions)
+        mentions = mock_link.rest.agent_api_messages.create_agent_chat_message.call_args[1][
+            "message"
+        ].mentions
+        assert [(m.id, m.handle) for m in mentions] == [("human-id", "alice")]
+
+    @pytest.mark.asyncio
+    async def test_handle_less_last_sender_drops_when_roster_has_no_handle(self, adapter):
+        """No invented handles: an unresolvable sender fails the send locally."""
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(id="msg-o"))
+        )
+        adapter._link = mock_link
+        adapter._agent_id = "agent-id-xxx"
+        adapter._owner_uuid = "owner-id"
+        adapter._handle = "nirs/hermes"  # must NOT be used to fake the owner's handle
+        adapter._participants_cache["room-o"] = []
+        adapter._last_human_sender["room-o"] = {"id": "owner-id", "handle": None}
+
+        result = await adapter.send("room-o", "hi")
+        assert result.success is False
+        assert "handle" in result.error
+        mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_last_sender_drops_without_room_sweep(self, adapter):
+        """A handle-less ghost sender does not pull in the rest of the room."""
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(id="msg-s"))
+        )
+        adapter._link = mock_link
+        adapter._agent_id = "agent-id-xxx"
+        adapter._participants_cache["room-s"] = [
+            {"id": "other-id", "type": "User", "name": "Bob", "handle": "bob"},
+        ]
+        adapter._last_human_sender["room-s"] = {"id": "ghost-id", "handle": None}
+
+        result = await adapter.send("room-s", "hi")
+        assert result.success is False
+        mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_send_dropped_when_no_participant_has_a_handle(self, adapter):
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock()
+        adapter._link = mock_link
+        adapter._agent_id = "agent-id-xxx"
+        adapter._participants_cache["room-n"] = [
+            {"id": "human-id", "type": "User", "name": "Alice", "handle": None},
+        ]
+
+        result = await adapter.send("room-n", "hi")
+        assert result.success is False
+        assert "handle" in result.error
+        mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_marshals_to_link_loop_when_called_from_another_loop(self, adapter):
@@ -2511,8 +2586,10 @@ class TestGetChatInfo:
 def _make_hub_link(rooms=None, created_room_id="hub-new-1"):
     """Fake link whose REST surface supports every hub-bootstrap call.
 
-    ``rooms`` is a list of room ids returned by list_agent_chats; participant
-    lookups are expected to be pre-seeded into the adapter's cache by tests.
+    ``rooms`` is a list of room ids returned by list_agent_chats. The owner is
+    resolvable from the room roster (with a handle) — the greeting is a real
+    send and Band rejects a mention with ``handle: null``, so the owner's
+    handle must come from somewhere genuine.
     """
     link = MagicMock()
     link.subscribe_room = AsyncMock()
@@ -2526,6 +2603,11 @@ def _make_hub_link(rooms=None, created_room_id="hub-new-1"):
         return_value=SimpleNamespace(data=SimpleNamespace(id=created_room_id))
     )
     link.rest.agent_api_participants.add_agent_chat_participant = AsyncMock()
+    link.rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+        return_value=SimpleNamespace(
+            data=[SimpleNamespace(id="owner-1", handle="nirs", name="Nir", type="User")]
+        )
+    )
     link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
         return_value=SimpleNamespace(data=SimpleNamespace(id="greet-msg-1"))
     )
@@ -2560,11 +2642,31 @@ class TestHubBootstrap:
         args, kwargs = link.rest.agent_api_participants.add_agent_chat_participant.await_args
         assert args[0] == "hub-new-1"
         assert kwargs["participant"].participant_id == "owner-1"
-        # Titling greeting sent, @mentioning the owner.
+        # Titling greeting sent, @mentioning the owner with a roster handle.
         _, mkwargs = link.rest.agent_api_messages.create_agent_chat_message.await_args
         assert mkwargs["chat_id"] == "hub-new-1"
         assert mkwargs["message"].content.startswith("Hermes Agent Hub")
-        assert mkwargs["message"].mentions[0].id == "owner-1"
+        assert (mkwargs["message"].mentions[0].id, mkwargs["message"].mentions[0].handle) == (
+            "owner-1",
+            "nirs",
+        )
+
+    @pytest.mark.asyncio
+    async def test_hub_greeting_owner_handle_from_the_room_roster(self, adapter):
+        """The greeting is a real send: the owner's handle comes from the roster."""
+        link = _make_hub_link(rooms=[])
+        link.rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[SimpleNamespace(id="owner-1", handle="nirs", name="Nir", type="User")]
+            )
+        )
+        adapter._link = link
+        adapter._handle = "hermes"  # not in owner/slug form — irrelevant
+
+        await adapter._ensure_hub()
+
+        _, mkwargs = link.rest.agent_api_messages.create_agent_chat_message.await_args
+        assert mkwargs["message"].mentions[0].handle == "nirs"
         # Greeting echo suppressed via the sent-id backstop.
         assert "greet-msg-1" in adapter._sent_ids
         # Hub recorded + subscribed + persisted + wired as the main channel.
@@ -2577,6 +2679,21 @@ class TestHubBootstrap:
         assert adapter.config.home_channel.name == "Hermes Hub"
         # Home is persisted (not just in-memory) so every config reader sees it.
         assert adapter._test_saved_env.get("BAND_HOME_ROOM") == "hub-new-1"
+
+    @pytest.mark.asyncio
+    async def test_hub_creation_skipped_when_owner_handle_unresolvable(self, adapter):
+        """No roster handle → no null-handle greeting; hub creation fails locally."""
+        link = _make_hub_link(rooms=[])
+        link.rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[])
+        )
+        adapter._link = link
+
+        await adapter._ensure_hub()
+
+        link.rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+        assert adapter._hub_room_id is None
+        assert adapter._test_saved_env.get("BAND_HUB_ROOM") is None
 
     @pytest.mark.asyncio
     async def test_never_adopts_existing_owner_room(self, adapter):
@@ -3255,6 +3372,14 @@ class TestHubFailover:
         adapter._hub_failover_max_per_connect = 2
         # Each created room accepts its greeting but then rejects ordinary
         # sends, so every new hub keeps failing and re-triggering failover.
+        # A send needs a cached last human sender (no room sweep anymore), so
+        # seed one for each hub the failover may create.
+        for rid in ("hub-a", "hub-b", "hub-c", "hub-d"):
+            adapter._last_human_sender[rid] = {
+                "id": "owner-1",
+                "handle": "nir",
+                "name": "Nir",
+            }
         link = self._hub_link(created_ids=["hub-a", "hub-b", "hub-c", "hub-d"])
         adapter._link = link
 

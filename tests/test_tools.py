@@ -72,14 +72,6 @@ def _make_rest() -> MagicMock:
     rest.agent_api_peers.list_agent_peers = AsyncMock(
         return_value=SimpleNamespace(data=[], metadata=SimpleNamespace(total_pages=1))
     )
-
-    # agent_api_identity.get_agent_me -> .data.handle ("owner_handle/agent_slug").
-    # The owner-mention fallback derives the owner's handle from this prefix.
-    rest.agent_api_identity.get_agent_me = AsyncMock(
-        return_value=SimpleNamespace(
-            data=SimpleNamespace(id="agent-self", handle="owner/hermes")
-        )
-    )
     return rest
 
 
@@ -90,11 +82,6 @@ def _peer(pid, handle=None, name=None, ptype="User"):
 def _patch_rest(rest):
     """Patch ``tools._rest`` to return the given fake rest client."""
     return patch.object(band_tools, "_rest", AsyncMock(return_value=rest))
-
-
-def _patch_agent_id(agent_id="agent-self"):
-    """Patch ``tools._agent_id_or_none`` so mention-building self-excludes."""
-    return patch.object(band_tools, "_agent_id_or_none", AsyncMock(return_value=agent_id))
 
 
 @pytest.fixture
@@ -292,26 +279,28 @@ class TestFindContact:
 class TestSendMessage:
 
     @pytest.mark.asyncio
-    async def test_builds_mentions_from_participants(self, owner_session):
+    async def test_builds_mentions_for_explicit_ids(self, owner_session):
+        """Only the named recipients are mentioned — never an implicit 'everyone'."""
         rest = _make_rest()
         rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
             return_value=SimpleNamespace(
                 data=[
-                    _peer("agent-self", handle="bot", ptype="Agent"),
+                    _peer("u-agent", handle="bot", ptype="Agent"),
                     _peer("u-human", handle="alice", name="Alice"),
                 ]
             )
         )
-        with _patch_rest(rest), _patch_agent_id("agent-self"):
+        with _patch_rest(rest):
             out = _parse(
-                await band_tools._handle_send_message({"content": "hello"})
+                await band_tools._handle_send_message(
+                    {"content": "hello", "mention_ids": ["u-human"]}
+                )
             )
         assert out["success"] is True
         assert out["room_id"] == "room-current"  # from band session context
         assert out["message_id"] == "msg-001"
         call = rest.agent_api_messages.create_agent_chat_message.await_args
         mentions = call.kwargs["message"].mentions
-        # The agent is self-excluded; only the human is mentioned.
         assert [m.id for m in mentions] == ["u-human"]
 
     @pytest.mark.asyncio
@@ -322,7 +311,7 @@ class TestSendMessage:
                 data=[_peer("u-x", handle="x"), _peer("u-y", handle="y")]
             )
         )
-        with _patch_rest(rest), _patch_agent_id("agent-self"):
+        with _patch_rest(rest):
             out = _parse(
                 await band_tools._handle_send_message(
                     {"content": "hi", "mention_ids": ["u-y"]}
@@ -336,28 +325,34 @@ class TestSendMessage:
         assert mentions[0].handle == "y"
 
     @pytest.mark.asyncio
-    async def test_explicit_id_without_handle_hydrates_from_directory(self, owner_session):
-        """The roster may omit ``handle``; the API still requires one."""
+    async def test_missing_mention_ids_errors_without_sending(self, owner_session):
+        """An un-mentioned send is not a valid send: the agent gets the
+        requirement back and retries with explicit recipients."""
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[_peer("u-human", handle="alice")])
+        )
+        with _patch_rest(rest):
+            out = _parse(await band_tools._handle_send_message({"content": "hello"}))
+        assert "mention_ids" in out["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_explicit_id_without_handle_errors_without_sending(self, owner_session):
+        """A roster gap is caught locally (API rejects ``handle: null``)."""
         rest = _make_rest()
         rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
             return_value=SimpleNamespace(data=[_peer("u-x", handle=None, name="X")])
         )
-        rest.agent_api_peers.list_agent_peers = AsyncMock(
-            return_value=SimpleNamespace(
-                data=[_peer("u-x", handle="xavier", name="X")],
-                metadata=SimpleNamespace(total_pages=1),
-            )
-        )
-        with _patch_rest(rest), _patch_agent_id("agent-self"):
+        with _patch_rest(rest):
             out = _parse(
                 await band_tools._handle_send_message(
                     {"content": "hi", "mention_ids": ["u-x"]}
                 )
             )
-        assert out["success"] is True
-        call = rest.agent_api_messages.create_agent_chat_message.await_args
-        mentions = call.kwargs["message"].mentions
-        assert [(m.id, m.handle) for m in mentions] == [("u-x", "xavier")]
+        assert "u-x" in out["error"]
+        assert "handle" in out["error"].lower()
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unresolvable_explicit_id_errors_without_sending(self, owner_session):
@@ -368,7 +363,7 @@ class TestSendMessage:
                 data=[_peer("u-x", handle=None), _peer("u-ok", handle="oksana")]
             )
         )
-        with _patch_rest(rest), _patch_agent_id("agent-self"):
+        with _patch_rest(rest):
             out = _parse(
                 await band_tools._handle_send_message(
                     {"content": "hi", "mention_ids": ["u-x", "u-ok"]}
@@ -376,48 +371,6 @@ class TestSendMessage:
             )
         assert "u-x" in out["error"]
         assert "handle" in out["error"].lower()
-        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_auto_mention_skips_handle_less_participants(self, owner_session):
-        """Auto-selected recipients we can't resolve are dropped, not fatal."""
-        rest = _make_rest()
-        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
-            return_value=SimpleNamespace(
-                data=[_peer("u-ghost", handle=None), _peer("u-human", handle="alice")]
-            )
-        )
-        with _patch_rest(rest), _patch_agent_id("agent-self"):
-            out = _parse(await band_tools._handle_send_message({"content": "hello"}))
-        assert out["success"] is True
-        call = rest.agent_api_messages.create_agent_chat_message.await_args
-        assert [m.id for m in call.kwargs["message"].mentions] == ["u-human"]
-
-    @pytest.mark.asyncio
-    async def test_no_handle_anywhere_errors_without_sending(self, owner_session):
-        """A room whose only recipient has no handle is a local error."""
-        rest = _make_rest()
-        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
-            return_value=SimpleNamespace(data=[_peer("u-ghost", handle=None)])
-        )
-        with _patch_rest(rest), _patch_agent_id("agent-self"):
-            out = _parse(await band_tools._handle_send_message({"content": "hello"}))
-        assert "handle" in out["error"].lower()
-        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_no_mentionable_recipient_errors(self, owner_session):
-        rest = _make_rest()
-        # Only the agent in the room -> nothing to mention after self-exclusion.
-        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
-            return_value=SimpleNamespace(
-                data=[_peer("agent-self", handle="bot", ptype="Agent")]
-            )
-        )
-        with _patch_rest(rest), _patch_agent_id("agent-self"):
-            out = _parse(await band_tools._handle_send_message({"content": "hello"}))
-        assert "error" in out
-        assert "mention" in out["error"].lower()
         rest.agent_api_messages.create_agent_chat_message.assert_not_called()
 
     @pytest.mark.asyncio
@@ -434,9 +387,11 @@ class TestSendMessage:
         rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
             return_value=SimpleNamespace(data=[_peer("u-human", handle="alice")])
         )
-        with _patch_rest(rest), _patch_agent_id("agent-self"):
+        with _patch_rest(rest):
             out = _parse(
-                await band_tools._handle_send_message({"content": "x" * 9000})
+                await band_tools._handle_send_message(
+                    {"content": "x" * 9000, "mention_ids": ["u-human"]}
+                )
             )
         assert out["success"] is True
         # >4000 chars -> at least two create_agent_chat_message calls.
@@ -607,8 +562,14 @@ class TestSendToOwnerFallback:
         monkeypatch.setenv("BAND_OWNER_ID", "owner-uuid")
         tokens = set_session_vars(platform="telegram", chat_id="tg-1", user_id="u-owner")
         rest = _make_rest()
+        # The owner's handle comes from the hub roster — the one genuine source.
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[_peer("owner-uuid", handle="nirs", name="Nir")]
+            )
+        )
         try:
-            with _patch_rest(rest), _patch_agent_id("agent-self"):
+            with _patch_rest(rest):
                 out = _parse(await band_tools._handle_send_message({"content": "ping"}))
         finally:
             clear_session_vars(tokens)
@@ -617,9 +578,23 @@ class TestSendToOwnerFallback:
         call = rest.agent_api_messages.create_agent_chat_message.await_args
         mentions = call.kwargs["message"].mentions
         assert [m.id for m in mentions] == ["owner-uuid"]  # owner pinged by default
-        # The hub roster carries no handle here, so the owner's handle comes from
-        # the agent handle prefix (owner/hermes) — Band rejects handle: null.
-        assert [m.handle for m in mentions] == ["owner"]
+        assert [m.handle for m in mentions] == ["nirs"]
+
+    @pytest.mark.asyncio
+    async def test_non_band_session_owner_handle_unresolvable_errors(self, monkeypatch):
+        """No roster handle for the owner → local error, nothing sent."""
+        monkeypatch.setenv("BAND_TOOL_OWNERS", "telegram:u-owner")
+        monkeypatch.setenv("BAND_HOME_ROOM", "hub-home")
+        monkeypatch.setenv("BAND_OWNER_ID", "owner-uuid")
+        tokens = set_session_vars(platform="telegram", chat_id="tg-1", user_id="u-owner")
+        rest = _make_rest()  # empty roster
+        try:
+            with _patch_rest(rest):
+                out = _parse(await band_tools._handle_send_message({"content": "ping"}))
+        finally:
+            clear_session_vars(tokens)
+        assert "owner-uuid" in out["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_falls_back_to_hub_room_when_no_home(self, monkeypatch):
@@ -630,8 +605,13 @@ class TestSendToOwnerFallback:
         monkeypatch.setenv("BAND_OWNER_ID", "owner-uuid")
         tokens = set_session_vars(platform="telegram", chat_id="tg-1", user_id="u-owner")
         rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[_peer("owner-uuid", handle="nirs", name="Nir")]
+            )
+        )
         try:
-            with _patch_rest(rest), _patch_agent_id("agent-self"):
+            with _patch_rest(rest):
                 out = _parse(await band_tools._handle_send_message({"content": "ping"}))
         finally:
             clear_session_vars(tokens)
@@ -646,7 +626,7 @@ class TestSendToOwnerFallback:
         tokens = set_session_vars(platform="telegram", chat_id="tg-1", user_id="u-owner")
         rest = _make_rest()
         try:
-            with _patch_rest(rest), _patch_agent_id("agent-self"):
+            with _patch_rest(rest):
                 out = _parse(await band_tools._handle_send_message({"content": "ping"}))
         finally:
             clear_session_vars(tokens)
@@ -662,8 +642,12 @@ class TestSendToOwnerFallback:
         rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
             return_value=SimpleNamespace(data=[_peer("u-human", handle="alice")])
         )
-        with _patch_rest(rest), _patch_agent_id("agent-self"):
-            out = _parse(await band_tools._handle_send_message({"content": "hi"}))
+        with _patch_rest(rest):
+            out = _parse(
+                await band_tools._handle_send_message(
+                    {"content": "hi", "mention_ids": ["u-human"]}
+                )
+            )
         assert out["success"] is True
         assert out["room_id"] == "room-current"  # not hub-home
 

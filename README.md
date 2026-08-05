@@ -321,11 +321,11 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
   the agent in any room without a mention.
 - **Self-filter**: the adapter skips its own agent messages by sender, with a sent-message-id
   backstop in addition to the SDK's own filtering.
-- **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions the
-  room's last human sender (falling back to all non-agent participants). Every mention must
-  carry the recipient's Band handle — the API rejects a null one — so handles are resolved
-  locally (roster → peers/contacts → owner handle from `owner_handle/agent_slug`) and an
-  unresolvable recipient fails before the send instead of during it.
+- **Outbound**: posts via the REST client, chunking long messages. Programmatic replies @mention
+  the room's last human sender; the `band_send_message` tool requires the agent to name its
+  recipients (`mention_ids`). Every mention must carry the recipient's Band handle — the API
+  rejects a null one — so an unresolvable recipient fails locally (tool error / dropped send)
+  instead of during the send.
 
 ### The Hub (main channel + command surface)
 

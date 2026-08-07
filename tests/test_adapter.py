@@ -3277,3 +3277,96 @@ class TestHubFailover:
         await adapter._record_hub_send("old-hub", ok=False)
 
         link.rest.agent_api_chats.create_agent_chat.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 24. Renderer capability flags (what the host may assume Band can render)
+# ---------------------------------------------------------------------------
+
+class TestRendererCapabilities:
+    """The host reads capability flags off the adapter to pick a rendering.
+
+    Every flag the adapter does not declare falls back to the conservative
+    plain-text default on ``BasePlatformAdapter``, so silence here is not
+    neutral — it downgrades output. These tests pin the two flags Band claims
+    and the host-side names they hook into, so an upstream rename turns our
+    declaration into dead code *here* instead of quietly in production.
+    """
+
+    def test_declares_supports_code_blocks(self, monkeypatch):
+        # Band clients render markdown fences; gateway/run.py's tool-progress
+        # renderer gates the fenced-code-block rendering on this flag.
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.supports_code_blocks is True
+
+    def test_declares_splits_long_messages(self, monkeypatch):
+        # send() chunks via truncate_message(), so the host must not pre-trim.
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.splits_long_messages is True
+
+    def test_flags_are_real_host_capabilities_and_default_off(self):
+        """Both flags exist on the host base and default False there.
+
+        If either name disappears or flips its default upstream, the adapter's
+        declaration stops meaning what its comment says — catch that here.
+        """
+        base = pytest.importorskip("gateway.platforms.base")
+        assert base.BasePlatformAdapter.supports_code_blocks is False
+        assert base.BasePlatformAdapter.splits_long_messages is False
+
+    @pytest.mark.asyncio
+    async def test_host_delivery_router_sends_full_payload_unchunked_by_gateway(
+        self, monkeypatch, tmp_path
+    ):
+        """End-to-end: the real cron delivery router hands Band the whole payload.
+
+        Drives ``gateway.delivery.DeliveryRouter._deliver_to_platform`` — the
+        only host consumer of ``splits_long_messages``. With the flag set, an
+        oversized cron output reaches ``send()`` intact and Band splits it into
+        several messages; without it the host truncates at
+        ``MAX_PLATFORM_OUTPUT`` and appends a "full output saved to <path>"
+        footer pointing at a file on the gateway host that a Band reader cannot
+        open. Skips if the host module isn't importable.
+        """
+        delivery = pytest.importorskip("gateway.delivery")
+
+        adapter = _make_adapter(monkeypatch)
+        adapter._last_human_sender["room-cron"] = {
+            "id": "user-c", "handle": "uc", "name": "User C",
+        }
+        posted: list = []
+
+        async def _create(*args, **kwargs):
+            posted.append(kwargs["message"].content)
+            return SimpleNamespace(data=SimpleNamespace(id=f"cron-{len(posted)}"))
+
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = _create
+        adapter._link = mock_link
+
+        router = delivery.DeliveryRouter(SimpleNamespace(), {adapter.platform: adapter})
+        # The router audit-saves oversized output to the real hermes home; keep
+        # the test off the filesystem while leaving the branch under test intact.
+        router._save_full_output = lambda *_a, **_k: tmp_path / "full-output.txt"
+        target = delivery.DeliveryTarget(
+            platform=adapter.platform, chat_id="room-cron", is_explicit=True,
+        )
+
+        long_output = "band-cron-line\n" * 800  # ~12000 chars, well over the cap
+        assert len(long_output) > delivery.MAX_PLATFORM_OUTPUT
+
+        result = await router._deliver_to_platform(target, long_output, {"job_id": "job-1"})
+
+        assert result.success is True
+        # Chunked by the adapter, not truncated by the host: every line survived
+        # across the chunks and no footer was substituted for the tail.
+        assert len(posted) > 1
+        assert sum(chunk.count("band-cron-line") for chunk in posted) == 800
+        assert not any("full output saved to" in chunk for chunk in posted)
+
+        # Negative control: clear the flag and the same host path truncates.
+        posted.clear()
+        adapter.splits_long_messages = False
+        await router._deliver_to_platform(target, long_output, {"job_id": "job-1"})
+        assert len(posted) == 1
+        assert "full output saved to" in posted[0]

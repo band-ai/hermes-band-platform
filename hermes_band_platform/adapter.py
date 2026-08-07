@@ -477,6 +477,30 @@ class BandAdapter(BasePlatformAdapter):
     # conservative safe default; revisit once Band documents a hard cap.
     MAX_MESSAGE_LENGTH = 4000
 
+    # ── Renderer capabilities ──
+    # Declared on the class; the host reads them via getattr on the live adapter
+    # and every one it doesn't find falls back to the conservative
+    # plain-text default in ``BasePlatformAdapter``.
+
+    # Band clients render full markdown, fenced code blocks included (confirmed
+    # by the product owner), and we inherit the base pass-through
+    # ``format_message`` — so a triple-backtick fence reaches the client
+    # verbatim. The host's tool-progress renderer gates on this flag: with it
+    # True a terminal command shows as a real code block, with it False it
+    # degrades to the compact truncated `terminal: "cmd…"` preview.
+    supports_code_blocks = True
+
+    # ``send`` chunks over-long content itself via ``truncate_message(content,
+    # MAX_MESSAGE_LENGTH)`` and posts every chunk as its own Band message (see
+    # ``_send_on_link``), so the host must not pre-trim on our behalf. Its one
+    # consumer is the cron delivery router, which otherwise cuts output at 4000
+    # chars and appends a "full output saved to <path>" footer — pointing at a
+    # file on the gateway host that a Band user cannot open. True hands us the
+    # whole payload and the reader gets all of it as consecutive "(1/n)"
+    # messages. This is a claim about ``send``'s behaviour, so it must be
+    # revisited if the chunking there ever goes away.
+    splits_long_messages = True
+
     def __init__(self, config: PlatformConfig, **kwargs):
         super().__init__(config, Platform("band"))
 

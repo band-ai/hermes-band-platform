@@ -13,6 +13,7 @@ If the real ``band-sdk`` is installed, we leave it in place.
 from __future__ import annotations
 
 import sys
+from enum import Enum
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -71,6 +72,20 @@ def _install_band_mock() -> MagicMock:
         def __init__(self, task_id=None):
             self.task_id = task_id
 
+    class _FakeChatEventRequest:
+        """Stand-in for the Fern ``ChatEventRequest``.
+
+        Keyword-only in the real SDK and carries NO ``mentions`` field — events
+        are exempt from Band's @mention requirement. Keeping the stub's
+        signature identical is what makes ``test_error_events`` a real check
+        that the adapter never attaches mentions to an event.
+        """
+
+        def __init__(self, content, message_type, metadata=None):
+            self.content = content
+            self.message_type = message_type
+            self.metadata = metadata
+
     # band.runtime.formatters — pure helper the adapter reuses. Faithful
     # stand-in for replace_uuid_mentions so the adapter's independent import
     # binds the stub rather than its passthrough fallback.
@@ -80,6 +95,20 @@ def _install_band_mock() -> MagicMock:
             if pid and handle:
                 content = content.replace(f"@[[{pid}]]", f"@{handle}")
         return content
+
+    # band.core.types.MessageType — the canonical message_type taxonomy. A real
+    # StrEnum, because the SDK's is one and the value is what goes on the wire.
+    class _FakeMessageType(str, Enum):
+        TEXT = "text"
+        TOOL_CALL = "tool_call"
+        TOOL_RESULT = "tool_result"
+        THOUGHT = "thought"
+        ERROR = "error"
+        TASK = "task"
+        USAGE = "usage"
+
+        def __str__(self):
+            return self.value
 
     band_mod = MagicMock()
     band_platform_mod = MagicMock()
@@ -92,7 +121,11 @@ def _install_band_mock() -> MagicMock:
     band_client_rest_mod.ChatMessageRequestMentionsItem = _FakeChatMessageRequestMentionsItem
     band_client_rest_mod.ParticipantRequest = _FakeParticipantRequest
     band_client_rest_mod.ChatRoomRequest = _FakeChatRoomRequest
+    band_client_rest_mod.ChatEventRequest = _FakeChatEventRequest
     band_client_rest_mod.DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
+    band_core_mod = MagicMock()
+    band_core_types_mod = MagicMock()
+    band_core_types_mod.MessageType = _FakeMessageType
     band_runtime_mod = MagicMock()
     band_runtime_formatters_mod = MagicMock()
     band_runtime_formatters_mod.replace_uuid_mentions = _fake_replace_uuid_mentions
@@ -103,6 +136,8 @@ def _install_band_mock() -> MagicMock:
     sys.modules["band.platform.event"] = band_platform_event_mod
     sys.modules["band.client"] = band_client_mod
     sys.modules["band.client.rest"] = band_client_rest_mod
+    sys.modules["band.core"] = band_core_mod
+    sys.modules["band.core.types"] = band_core_types_mod
     sys.modules["band.runtime"] = band_runtime_mod
     sys.modules["band.runtime.formatters"] = band_runtime_formatters_mod
 

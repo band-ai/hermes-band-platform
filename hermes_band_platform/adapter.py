@@ -53,6 +53,7 @@ from gateway.platforms.base import (  # noqa: E402
 from gateway.session import SessionSource, build_session_key  # noqa: E402
 
 from . import _band_libs  # noqa: E402  (stdlib-only shim; safe at module top)
+from .error_events import note_send_failure, report_turn_failure  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -1404,9 +1405,16 @@ class BandAdapter(BasePlatformAdapter):
         turn was superseded by a newer message or an intentional /stop).
         FAILURE → failed, so the server may re-offer it on a later /next drain
         for another attempt. Internal events are skipped.
+
+        A FAILURE is also surfaced *in the room* as a Band ``error`` event —
+        marking the message failed is server-side bookkeeping the user never
+        sees. Runs before the ack because the ack's own guards (no message id,
+        no link) would otherwise skip a failure worth reporting; it is
+        best-effort and cannot raise (see ``error_events``).
         """
         if getattr(event, "internal", False):
             return
+        await report_turn_failure(self, event, outcome)
         msg_id = getattr(event, "message_id", None)
         room_id = getattr(getattr(event, "source", None), "chat_id", None)
         if not msg_id or not room_id or not self._link:
@@ -2140,6 +2148,9 @@ class BandAdapter(BasePlatformAdapter):
                 "[band] No mentionable recipient for room %s — dropping send",
                 _short_id(room_id),
             )
+            note_send_failure(
+                self, room_id, "No mentionable recipient (Band requires >=1 mention)"
+            )
             return SendResult(
                 success=False,
                 error="No mentionable recipient (Band requires >=1 mention)",
@@ -2172,6 +2183,10 @@ class BandAdapter(BasePlatformAdapter):
                     self._record_sent_id(sent_id)
         except Exception as e:
             logger.error("[band] Failed to send to room %s: %s", _short_id(room_id), e)
+            # Remembered as the reason for this turn's error event: an undelivered
+            # reply is the one failure the user cannot see at all, and this is the
+            # only point in-process where its cause exists.
+            note_send_failure(self, room_id, e)
             await self._record_hub_send(room_id, ok=False)
             return SendResult(
                 success=False,
@@ -2179,6 +2194,7 @@ class BandAdapter(BasePlatformAdapter):
                 retryable=self._is_retryable(e),
             )
 
+        note_send_failure(self, room_id, None)  # recovered — drop the stale reason
         await self._record_hub_send(room_id, ok=True)
         return SendResult(
             success=True,

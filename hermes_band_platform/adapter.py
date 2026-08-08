@@ -282,7 +282,7 @@ async def _fetch_participants(rest: Any, room_id: str) -> List[Dict[str, Any]]:
         chat_id=room_id,
         request_options=DEFAULT_REQUEST_OPTIONS,
     )
-    return [
+    participants = [
         {
             "id": getattr(p, "id", None),
             "name": getattr(p, "name", None),
@@ -291,6 +291,14 @@ async def _fetch_participants(rest: Any, room_id: str) -> List[Dict[str, Any]]:
         }
         for p in (getattr(resp, "data", None) or [])
     ]
+    # A count, never the roster: an empty result is why a send later dies on
+    # the mandatory @mention, and that is worth being able to see.
+    logger.debug(
+        "[band] Fetched %d participant(s) for room %s",
+        len(participants),
+        _short_id(room_id),
+    )
+    return participants
 
 
 async def _post_chunks(
@@ -320,16 +328,23 @@ async def _post_chunks(
 
     Returns ``(last_id, continuation_ids, last_response)``. Exceptions propagate:
     each caller owns its own failure-result shape.
+
+    The debug line at the end is the one both send paths were missing: without
+    it a delivered reply and a silently lost one look identical in the log. It
+    reports the message's SIZE and the ids Band assigned — never the reply text,
+    which is the user's own content.
     """
     last_id: Optional[str] = None
     last_resp: Any = None
     continuation: List[str] = []
+    posted = 0
     for chunk in BasePlatformAdapter.truncate_message(content, max_length):
         resp = await rest.agent_api_messages.create_agent_chat_message(
             chat_id=room_id,
             message=ChatMessageRequest(content=chunk, mentions=mention_items),
             request_options=DEFAULT_REQUEST_OPTIONS,
         )
+        posted += 1
         last_resp = resp
         sent_id = getattr(getattr(resp, "data", None), "id", None)
         if sent_id:
@@ -338,6 +353,15 @@ async def _post_chunks(
             last_id = sent_id
             if on_sent is not None:
                 on_sent(sent_id)
+    logger.debug(
+        "[band] Posted %d chunk(s), %d chars, to room %s with %d mention(s) "
+        "(last message id %s)",
+        posted,
+        len(content),
+        _short_id(room_id),
+        len(mention_items),
+        _short_id(last_id),
+    )
     return last_id, continuation, last_resp
 
 
@@ -2223,6 +2247,14 @@ class BandAdapter(BasePlatformAdapter):
         # dropped the link. Return a clean SendResult instead of letting the
         # participants/mentions REST calls AttributeError on a None link.
         if not self._link:
+            # A reply the user will never see. The caller may retry, but nothing
+            # else records that this one was dropped on the floor.
+            logger.warning(
+                "[band] Dropping send to room %s — link went away before the post "
+                "(%d chars)",
+                _short_id(chat_id),
+                len(content or ""),
+            )
             return SendResult(success=False, error="Not connected", retryable=True)
 
         room_id = chat_id
@@ -2268,6 +2300,17 @@ class BandAdapter(BasePlatformAdapter):
             )
 
         note_send_failure(self, room_id, None)  # recovered — drop the stale reason
+
+        if last_id is None:
+            # Band accepted the post but named no message. Everything downstream
+            # (the self-echo backstop, reply correlation) keys off that id, so an
+            # unconfirmed delivery must not read as a clean success in the log.
+            logger.warning(
+                "[band] Send to room %s returned no message id — delivery is "
+                "unconfirmed",
+                _short_id(room_id),
+            )
+
         await self._record_hub_send(room_id, ok=True)
         return SendResult(
             success=True,
@@ -2527,6 +2570,12 @@ async def _standalone_send(
     if not check_band_requirements():
         # Same remediation as the adapter's preflight — the read-only-venv-safe
         # --target form, since a bare install dies on hosted runtimes.
+        #
+        # Every early return below is logged as well as returned: the returned
+        # text reaches the cron job's result, but an operator reading the
+        # gateway log is otherwise looking at a delivery that never happened
+        # and never explained itself.
+        logger.error("[band] Standalone send unavailable — band-sdk not installed")
         return {
             "error": (
                 f"{_STANDALONE_PREFIX}: band-sdk not installed. Directory plugin "
@@ -2546,6 +2595,10 @@ async def _standalone_send(
         if not value
     ]
     if missing:
+        logger.error(
+            "[band] Standalone send has no credentials — %s unset",
+            " and ".join(missing),
+        )
         return {
             "error": (
                 f"{_STANDALONE_PREFIX}: {' and '.join(missing)} must be set — "
@@ -2556,6 +2609,10 @@ async def _standalone_send(
 
     room_id = _standalone_room(chat_id, extra)
     if not room_id:
+        logger.error(
+            "[band] Standalone send has no target room — no chat_id and no "
+            "BAND_HOME_ROOM/BAND_HUB_ROOM"
+        )
         return {
             "error": (
                 f"{_STANDALONE_PREFIX}: no target room — pass a room id or set "
@@ -2569,6 +2626,11 @@ async def _standalone_send(
     try:
         rest = _standalone_rest(api_key, base_url)
     except Exception as e:
+        logger.error(
+            "[band] Standalone send could not build a REST client for room %s: %s",
+            _short_id(room_id),
+            e,
+        )
         return {"error": f"{_STANDALONE_PREFIX}: could not build a REST client: {e}"}
 
     try:
@@ -2591,6 +2653,12 @@ async def _standalone_send(
 
     mention_items = _mention_items(participants, agent_id=agent_id)
     if not mention_items:
+        logger.error(
+            "[band] Standalone send found no mentionable recipient in room %s "
+            "(%d participant(s)) — dropping",
+            _short_id(room_id),
+            len(participants),
+        )
         return {
             "error": (
                 f"{_STANDALONE_PREFIX}: no mentionable recipient in room "
@@ -2612,7 +2680,11 @@ async def _standalone_send(
         )
         return {"error": f"{_STANDALONE_PREFIX}: {e}"}
 
-    logger.info("[band] Standalone send delivered to room %s", _short_id(room_id))
+    logger.info(
+        "[band] Standalone send delivered to room %s (message id %s)",
+        _short_id(room_id),
+        _short_id(last_id),
+    )
     return {
         "success": True,
         "platform": "band",

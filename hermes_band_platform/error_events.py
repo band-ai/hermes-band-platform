@@ -37,6 +37,19 @@ Sizing (``_EVENT_CONTENT_MAX_LENGTH``, head-and-tail truncation, blank-content
 placeholder) mirrors the SDK's private ``band/runtime/tools.py`` helpers: the
 platform rejects content over 16384 chars and blank content with a 422 before
 it ever reaches the room.
+
+Logging
+-------
+A failed turn that also fails to *report* itself is the worst case here — the
+user sees nothing and the operator has nothing to grep — so every way out of
+this module says so. Dropping the event (redaction unavailable, no room, no
+link) is ``warning``; a successful post is ``debug``; expected degradations
+(an older host's classifier, a non-weakref-able adapter in tests) are ``debug``.
+
+The failure *reason* is payload: it is error text, and error text is where a
+credential in a URL or an environment dump shows up. It is never logged — not
+before redaction and not after. Log sites carry the room id, the error code and
+the content **length** only.
 """
 
 from __future__ import annotations
@@ -196,10 +209,19 @@ def redact_event_text(text: Any) -> Optional[str]:
     permanent failure notice in a shared room is a *non-navigation egress
     boundary*, nobody is going to click a URL out of it, and a connection error
     is one of the likeliest places for a credentialed URL to show up.
+
+    Each ``None`` records its cause at ``debug``; the caller, which knows the
+    room, is what logs the resulting drop at ``warning``. Only exception
+    *types* are recorded — this function holds the raw, unredacted failure
+    text, so its exceptions are the one place that text could leak into a log.
     """
     try:
         from agent.redact import redact_sensitive_text
-    except Exception:
+    except Exception as e:
+        logger.debug(
+            "[band] error event: agent.redact is not importable (%s)",
+            type(e).__name__,
+        )
         return None
     try:
         return redact_sensitive_text(
@@ -207,11 +229,19 @@ def redact_event_text(text: Any) -> Optional[str]:
         )
     except TypeError:
         # Older agent.redact without the URL-credential switch — still redact.
+        logger.debug(
+            "[band] error event: agent.redact predates redact_url_credentials; "
+            "redacting without it"
+        )
         try:
             return redact_sensitive_text(str(text or ""), force=True)
-        except Exception:
+        except Exception as e:
+            logger.debug(
+                "[band] error event: redactor raised (%s)", type(e).__name__
+            )
             return None
-    except Exception:
+    except Exception as e:
+        logger.debug("[band] error event: redactor raised (%s)", type(e).__name__)
         return None
 
 
@@ -243,8 +273,14 @@ def describe_reason(text: str) -> Optional[str]:
             reason
         ):
             return _gateway_provider_error_reply(reason)
-    except Exception:
-        pass
+    except Exception as e:
+        # Expected on an older host: fall back to the redacted reason itself.
+        # The reason is never logged — only that classification was skipped.
+        logger.debug(
+            "[band] error event: host provider-error classifier unavailable (%s); "
+            "using the raw reason",
+            type(e).__name__,
+        )
     return _head_and_tail(reason, _REASON_MAX_LENGTH, _REASON_TRUNCATION_MARKER)
 
 
@@ -264,8 +300,13 @@ def note_send_failure(adapter: Any, room_id: str, error: Any) -> None:
         _LAST_SEND_FAILURE[adapter] = (str(room_id), str(error))
     except TypeError:
         # Non-weakref-able stand-in (test doubles); losing the reason only
-        # costs detail in the event, never correctness.
-        pass
+        # costs detail in the event, never correctness. The error text itself
+        # is payload and stays out of the log.
+        logger.debug(
+            "[band] error event: send failure for room %s not recorded — "
+            "adapter is not weak-referenceable",
+            _short(room_id),
+        )
 
 
 def pop_send_failure(adapter: Any, room_id: str) -> Optional[str]:
@@ -273,6 +314,11 @@ def pop_send_failure(adapter: Any, room_id: str) -> Optional[str]:
     try:
         entry = _LAST_SEND_FAILURE.get(adapter)
     except TypeError:
+        logger.debug(
+            "[band] error event: no recorded send failure for room %s — "
+            "adapter is not weak-referenceable",
+            _short(room_id),
+        )
         return None
     if entry is None or entry[0] != str(room_id):
         return None
@@ -290,8 +336,12 @@ def _fatal_error_reason(adapter: Any) -> Optional[str]:
     try:
         if getattr(adapter, "has_fatal_error", False):
             return getattr(adapter, "fatal_error_message", None)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(
+            "[band] error event: could not read the adapter's fatal-error state "
+            "(%s); reporting without a reason",
+            type(e).__name__,
+        )
     return None
 
 
@@ -348,6 +398,13 @@ async def emit_error_event(
     """
     link = getattr(adapter, "_link", None)
     if link is None or ChatEventRequest is None or BandMessageType is None:
+        # The user is left with silence on a failed turn — loud by definition,
+        # and it fires at most once per failure, so warning costs nothing.
+        logger.warning(
+            "[band] Dropping error event for room %s — %s",
+            _short(room_id),
+            "adapter has no live link" if link is None else "band-sdk unavailable",
+        )
         return False
     try:
         await link.rest.agent_api_events.create_agent_chat_event(
@@ -358,6 +415,14 @@ async def emit_error_event(
                 metadata=metadata,
             ),
             request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+        # Length, not text: the content is a redacted failure notice, but it is
+        # still the failure text and has no business in a log line.
+        logger.debug(
+            "[band] Emitted error event to room %s (code %s, %d chars)",
+            _short(room_id),
+            (metadata or {}).get("error_code", "<none>"),
+            len(content),
         )
         return True
     except Exception as e:
@@ -383,10 +448,23 @@ async def report_turn_failure(adapter: Any, event: Any, outcome: Any) -> None:
     the caller's own server-side ack.
     """
     try:
-        if str(getattr(outcome, "value", outcome)) != "failure":
+        outcome_name = str(getattr(outcome, "value", outcome))
+        if outcome_name != "failure":
+            # One line per turn, at debug: this is the log that says a turn
+            # finished cleanly, which is exactly what was missing when a reply
+            # appeared not to arrive.
+            logger.debug(
+                "[band] Turn completed with outcome %s — no error event",
+                outcome_name,
+            )
             return
         room_id = getattr(getattr(event, "source", None), "chat_id", None)
         if not room_id:
+            logger.warning(
+                "[band] Turn failed but carried no room id — no error event "
+                "(message %s)",
+                _short(getattr(event, "message_id", None)),
+            )
             return
 
         send_error = pop_send_failure(adapter, room_id)
@@ -399,10 +477,26 @@ async def report_turn_failure(adapter: Any, event: Any, outcome: Any) -> None:
         )
         if content is None:
             logger.warning(
-                "[band] Dropping error event for room %s — redaction unavailable",
+                "[band] Dropping error event for room %s — redaction unavailable "
+                "(fail-closed: the room is told nothing rather than told too much)",
                 _short(room_id),
             )
             return
+        # The error code already says where the reason came from
+        # (``delivery_failed`` = the send, ``turn_failed`` = adapter state), so
+        # the reason itself never has to appear here.
+        logger.debug(
+            "[band] Turn failed in room %s — emitting error event (code %s)",
+            _short(room_id),
+            (metadata or {}).get("error_code", "<none>"),
+        )
         await emit_error_event(adapter, room_id, content, metadata)
     except Exception as e:
-        logger.debug("[band] Error-event reporting failed: %s", e)
+        # The report of a failure failed. Warning, not debug: nothing else in
+        # the system records that the room was never told. Only the exception
+        # type — this frame has the (unredacted) failure reason in scope.
+        logger.warning(
+            "[band] Error-event reporting failed (%s) — the room was not told "
+            "the turn failed",
+            type(e).__name__,
+        )

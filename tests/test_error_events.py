@@ -7,6 +7,7 @@ against request objects with the real keyword signatures, not auto-attr
 MagicMocks.
 """
 
+import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -476,3 +477,159 @@ class TestNoFeedback:
         )
         assert await adapter._handle_message_created(event) is False
         adapter._message_handler.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 9. Observability
+#
+# A failed turn that also fails to *report* itself is the worst case in this
+# module: the user sees nothing and the operator has nothing to grep. Every
+# outcome is therefore stated — and the failure reason, which is error text and
+# so exactly where a credentialed URL or an environment dump shows up, is
+# stated nowhere.
+# ---------------------------------------------------------------------------
+
+_ERR_LOGGER = "hermes_band_platform.error_events"
+
+# Not a pattern the host redactor masks, so if it survives into a log line the
+# assertion is unambiguous.
+SECRET_REASON = "correct-horse-battery-staple-9d2f"
+
+
+class TestErrorEventLogging:
+
+    @pytest.mark.asyncio
+    async def test_emission_is_traceable_at_debug(self, adapter, caplog):
+        with caplog.at_level(logging.DEBUG, logger=_ERR_LOGGER):
+            await adapter.on_processing_complete(_evt(), ProcessingOutcome.FAILURE)
+
+        emitted = [r for r in caplog.records if "Emitted error event" in r.getMessage()]
+        assert len(emitted) == 1
+        assert emitted[0].levelno == logging.DEBUG
+        message = emitted[0].getMessage()
+        assert _events_mod._short("room-abc") in message
+        assert "turn_failed" in message
+
+    @pytest.mark.asyncio
+    async def test_completed_turn_says_so_at_debug(self, adapter, caplog):
+        """The line that ends a "did my reply go out?" debugging session."""
+        with caplog.at_level(logging.DEBUG, logger=_ERR_LOGGER):
+            await adapter.on_processing_complete(_evt(), ProcessingOutcome.SUCCESS)
+
+        completed = [r for r in caplog.records if "Turn completed" in r.getMessage()]
+        assert len(completed) == 1
+        assert completed[0].levelno == logging.DEBUG
+        assert "success" in completed[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_fail_closed_drop_is_a_warning_naming_the_room(
+        self, adapter, caplog, monkeypatch
+    ):
+        # No agent.redact at all: the event must be dropped, loudly.
+        monkeypatch.setitem(sys.modules, "agent.redact", None)
+        with caplog.at_level(logging.DEBUG, logger=_ERR_LOGGER):
+            await adapter.on_processing_complete(_evt(), ProcessingOutcome.FAILURE)
+
+        assert _posted(adapter) is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "redaction unavailable" in message
+        assert _events_mod._short("room-abc") in message
+
+    @pytest.mark.asyncio
+    async def test_missing_link_warns_that_the_room_was_not_told(self, adapter, caplog):
+        adapter._link = None
+        with caplog.at_level(logging.DEBUG, logger=_ERR_LOGGER):
+            emitted = await _events_mod.emit_error_event(adapter, "room-abc", "boom")
+
+        assert emitted is False
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "no live link" in warnings[0].getMessage()
+        assert _events_mod._short("room-abc") in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_failed_post_warns_with_the_room(self, adapter, caplog):
+        adapter._link.rest.agent_api_events.create_agent_chat_event = AsyncMock(
+            side_effect=RuntimeError("502 Bad Gateway")
+        )
+        with caplog.at_level(logging.DEBUG, logger=_ERR_LOGGER):
+            await adapter.on_processing_complete(_evt(), ProcessingOutcome.FAILURE)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert _events_mod._short("room-abc") in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_failure_without_a_room_is_a_warning(self, adapter, caplog):
+        with caplog.at_level(logging.DEBUG, logger=_ERR_LOGGER):
+            await adapter.on_processing_complete(
+                _evt(room_id=None), ProcessingOutcome.FAILURE
+            )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "no room id" in warnings[0].getMessage()
+
+
+class TestFailureReasonNeverReachesTheLog:
+    """The reason is payload: error text is where credentials turn up."""
+
+    @pytest.mark.asyncio
+    async def test_reported_failure_logs_no_reason(self, adapter, caplog):
+        _events_mod.note_send_failure(
+            adapter, "room-abc", RuntimeError(f"POST failed: {SECRET_REASON}")
+        )
+        with caplog.at_level(logging.DEBUG, logger=_ERR_LOGGER):
+            await adapter.on_processing_complete(_evt(), ProcessingOutcome.FAILURE)
+
+        # It reached the room (redacted) but not the log.
+        assert SECRET_REASON in _posted(adapter).content
+        assert caplog.records
+        assert SECRET_REASON not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_reporting_that_itself_fails_logs_no_reason(self, adapter, caplog):
+        """The except at the top of report_turn_failure holds the raw reason."""
+        _events_mod.note_send_failure(
+            adapter, "room-abc", RuntimeError(f"POST failed: {SECRET_REASON}")
+        )
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError(f"classifier blew up on: {SECRET_REASON}")
+
+        with caplog.at_level(logging.DEBUG, logger=_ERR_LOGGER):
+            import hermes_band_platform.error_events as mod
+
+            original = mod.build_failure_event
+            mod.build_failure_event = _boom
+            try:
+                await adapter.on_processing_complete(_evt(), ProcessingOutcome.FAILURE)
+            finally:
+                mod.build_failure_event = original
+
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        assert SECRET_REASON not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_unredactable_reason_logs_neither_reason_nor_content(
+        self, adapter, caplog, monkeypatch
+    ):
+        """Fail-closed: raw text is in scope here and still never logged."""
+        import agent.redact
+
+        monkeypatch.setattr(
+            agent.redact,
+            "redact_sensitive_text",
+            MagicMock(side_effect=RuntimeError(f"scrubbing {SECRET_REASON}")),
+        )
+        _events_mod.note_send_failure(
+            adapter, "room-abc", RuntimeError(f"POST failed: {SECRET_REASON}")
+        )
+        with caplog.at_level(logging.DEBUG, logger=_ERR_LOGGER):
+            await adapter.on_processing_complete(_evt(), ProcessingOutcome.FAILURE)
+
+        assert _posted(adapter) is None
+        assert caplog.records
+        assert SECRET_REASON not in caplog.text

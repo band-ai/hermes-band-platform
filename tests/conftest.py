@@ -124,6 +124,12 @@ def _install_band_mock() -> MagicMock:
     band_client_rest_mod.ChatEventRequest = _FakeChatEventRequest
     band_client_rest_mod.DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
     band_core_mod = MagicMock()
+    # MERGE NOTE: build each stub module EXACTLY ONCE. More than one slice needs
+    # ``band.core.types``; a keep-both merge that leaves two
+    # ``band_core_types_mod = MagicMock()`` lines silently discards whatever the
+    # first one had attached — and that surfaces far from the cause, as a
+    # MagicMock rendered into event content rather than as an import error.
+    # Attach to the module below; never rebuild it.
     band_core_types_mod = MagicMock()
     band_core_types_mod.MessageType = _FakeMessageType
     band_runtime_mod = MagicMock()

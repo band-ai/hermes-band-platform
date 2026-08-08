@@ -72,8 +72,32 @@ _EVENT_EMPTY_CONTENT_PLACEHOLDER = "(no content)"
 
 # How much of a raw failure reason to show in the room. The event carries a
 # glance-able explanation for a human, not a log line — the full text is in the
-# gateway log.
+# gateway log. Head AND tail are kept, for the same reason the SDK keeps both:
+# the last line of a traceback is usually the one that says what broke.
 _REASON_MAX_LENGTH = 300
+_REASON_TRUNCATION_MARKER = " … "
+
+# Margin kept either side of each cut when bounding a reason *before* redaction
+# (see ``_bound_for_redaction``).
+#
+# WHY BOUND AT ALL: the host's redactor is superlinear in input length once
+# ``redact_url_credentials=True`` is on. Measured in the gateway venv —
+# 16KB 0.23s, 50KB 2.15s, 100KB 8.54s, i.e. O(n²) — and it is entirely
+# ``agent.redact._STRICT_URL_USERINFO_RE`` (redact.py:301). Its optional scheme
+# prefix ``(?:[A-Za-z][A-Za-z0-9+.-]*:)?`` is unanchored, so on any long run of
+# ``[A-Za-z0-9+.-]`` the greedy ``*`` scans to end-of-string and backtracks
+# looking for ``:`` at *every* start offset. A stack dump or a base64 blob is
+# exactly such a run. Eight seconds on the turn-failure path is the last thing
+# a struggling gateway needs, so we cap what the redactor ever sees.
+#
+# WHY THIS SIZE: only text that can still reach the room needs scrubbing, and
+# the margin exists so a credential straddling a cut is still whole enough for
+# the redactor to recognize. It must therefore exceed the longest secret
+# ``agent.redact`` can match — a PEM block via ``_PRIVATE_KEY_RE`` (redact.py:221),
+# ~3.2KB for RSA-4096 and ~6.3KB for RSA-8192. 8192 clears both. That caps the
+# redactor's input at ~16.7KB (one event's worth) and its cost at ~0.23s
+# regardless of how large the original reason was.
+_REDACTION_INPUT_MARGIN = 8192
 
 _FAILURE_HEADLINE = "⚠️ I couldn't finish that turn."
 _NO_DETAIL_LINE = "No details reached this room — check the gateway logs."
@@ -109,19 +133,49 @@ def _short(value: Any) -> str:
     return f"{text[:8]}…"
 
 
-def _truncate_event_content(content: str) -> str:
-    """Cap *content* at the platform limit, keeping its head and tail.
+def _head_and_tail(text: str, limit: int, marker: str) -> str:
+    """Cut *text* to *limit* chars, keeping its head and tail around *marker*.
 
     Both ends are preserved because the tail of a truncated failure dump is
-    often the informative part. A no-op when *content* already fits, so callers
-    can run it unconditionally.
+    often the informative part — the last line of a traceback, a trailing
+    status — which a head-only cut would silently drop. A no-op when *text*
+    already fits, so callers can run it unconditionally.
     """
-    if len(content) <= _EVENT_CONTENT_MAX_LENGTH:
-        return content
-    budget = _EVENT_CONTENT_MAX_LENGTH - len(_EVENT_TRUNCATION_MARKER)
+    if len(text) <= limit:
+        return text
+    budget = limit - len(marker)
+    if budget <= 0:  # pathological limit — fall back to a plain head cut
+        return text[:limit]
     head_len = budget // 2
     tail_len = budget - head_len
-    return content[:head_len] + _EVENT_TRUNCATION_MARKER + content[-tail_len:]
+    return text[:head_len] + marker + text[-tail_len:]
+
+
+def _truncate_event_content(content: str) -> str:
+    """Cap *content* at the platform's 16384-char limit (a 422 above it)."""
+    return _head_and_tail(content, _EVENT_CONTENT_MAX_LENGTH, _EVENT_TRUNCATION_MARKER)
+
+
+def _bound_for_redaction(text: str) -> str:
+    """Cut *text* down to what could still reach the room, plus a safety margin.
+
+    Redaction is the expensive step and its cost grows with the square of the
+    input (see ``_REDACTION_INPUT_MARGIN``), so it must not be handed a 100KB
+    traceback. Everything outside the head and tail this keeps is dropped by
+    ``describe_reason``'s own cap anyway — the discarded middle never reaches
+    Band, so it never needed scrubbing.
+
+    Order matters and is the whole point: bound → redact → cut to the final
+    limit. Cutting *after* redaction is what keeps the guarantee intact — every
+    character emitted came out of the redactor — while the margin here means a
+    credential straddling that final cut was still whole when the redactor saw
+    it, rather than a fragment it could not recognize.
+    """
+    return _head_and_tail(
+        text,
+        _REASON_MAX_LENGTH + 2 * _REDACTION_INPUT_MARGIN,
+        _REASON_TRUNCATION_MARKER,
+    )
 
 
 def redact_event_text(text: Any) -> Optional[str]:
@@ -191,9 +245,7 @@ def describe_reason(text: str) -> Optional[str]:
             return _gateway_provider_error_reply(reason)
     except Exception:
         pass
-    if len(reason) > _REASON_MAX_LENGTH:
-        reason = reason[: _REASON_MAX_LENGTH - 1] + "…"
-    return reason
+    return _head_and_tail(reason, _REASON_MAX_LENGTH, _REASON_TRUNCATION_MARKER)
 
 
 def note_send_failure(adapter: Any, room_id: str, error: Any) -> None:
@@ -256,11 +308,14 @@ def build_failure_event(
     """
     reason: Optional[str] = None
     if raw_reason:
-        safe = redact_event_text(raw_reason)
+        # Bound BEFORE redacting: the redactor is quadratic in input length and
+        # everything outside these regions is dropped by describe_reason anyway.
+        safe = redact_event_text(_bound_for_redaction(str(raw_reason)))
         if safe is None:
             return None, None
-        # Classify only redacted text, so a secret can never reach the host's
-        # regexes or be echoed back inside its reply.
+        # Classify (and cut to the final length) only after redaction, so a
+        # secret can never reach the host's regexes, be echoed back inside its
+        # reply, or survive as an unrecognized fragment of a cut token.
         reason = describe_reason(safe)
 
     content = redact_event_text(f"{_FAILURE_HEADLINE}\n{reason or _NO_DETAIL_LINE}")

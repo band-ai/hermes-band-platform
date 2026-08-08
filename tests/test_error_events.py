@@ -44,6 +44,18 @@ def _event_link():
     return link
 
 
+def _huge_traceback(frames=3000):
+    """A large, realistically shaped failure dump (~150KB).
+
+    Shape matters, not just size: the host redactor's cost explodes on long
+    unbroken runs of ``[A-Za-z0-9+.-]``, and a real traceback is broken up by
+    spaces and newlines. Using one keeps these tests honest AND fast.
+    """
+    return "Traceback (most recent call last):\n" + "\n".join(
+        f'  File "/srv/app/module{i}.py", line {i}, in handler' for i in range(frames)
+    )
+
+
 def _evt(msg_id="m1", room_id="room-abc", internal=False):
     return SimpleNamespace(
         message_id=msg_id,
@@ -299,7 +311,12 @@ class TestReason:
     def test_long_reason_is_capped_for_readability(self):
         line = _events_mod.describe_reason("z" * 5000)
         assert len(line) == _events_mod._REASON_MAX_LENGTH
-        assert line.endswith("…")
+        assert _events_mod._REASON_TRUNCATION_MARKER in line
+
+    def test_long_reason_keeps_its_tail(self):
+        # The last line of a traceback is usually the one that says what broke.
+        line = _events_mod.describe_reason("z" * 5000 + "ConnectionResetError")
+        assert line.endswith("ConnectionResetError")
 
     @pytest.mark.asyncio
     async def test_fatal_adapter_error_is_used_when_no_send_failed(self, adapter):
@@ -335,7 +352,7 @@ class TestContentLimits:
 
     @pytest.mark.asyncio
     async def test_emitted_content_never_exceeds_the_platform_limit(self, adapter):
-        _events_mod.note_send_failure(adapter, "room-abc", "x" * 100000)
+        _events_mod.note_send_failure(adapter, "room-abc", _huge_traceback())
         await adapter.on_processing_complete(_evt(), ProcessingOutcome.FAILURE)
         content = _posted(adapter).content
         assert 0 < len(content) <= _events_mod._EVENT_CONTENT_MAX_LENGTH
@@ -343,6 +360,84 @@ class TestContentLimits:
     def test_content_is_never_blank(self):
         content, _ = _events_mod.build_failure_event()
         assert content.strip()
+
+
+# ---------------------------------------------------------------------------
+# 6. Bounding the redactor's input
+#
+# agent.redact is quadratic in input length with redact_url_credentials=True
+# (~0.2s at 16KB, ~8.5s at 100KB — the backtracking optional scheme prefix in
+# _STRICT_URL_USERINFO_RE). We must never hand it an unbounded reason: this is
+# the turn-failure path. Bounding must not weaken the guarantee, so both halves
+# are pinned — the input is capped, AND a huge payload is still fully scrubbed.
+# ---------------------------------------------------------------------------
+
+class TestRedactionInputBounding:
+
+    def test_redactor_never_sees_an_unbounded_reason(self, monkeypatch):
+        seen = []
+
+        def spy(text):
+            # Deliberately does NOT call through: this asserts what the redactor
+            # is *handed*, and calling the real one on the worst-case input is
+            # precisely the cost being guarded against.
+            seen.append(len(str(text)))
+            return "redacted"
+
+        monkeypatch.setattr(_events_mod, "redact_event_text", spy)
+        _events_mod.build_failure_event("x" * 1_000_000)
+        ceiling = (
+            _events_mod._REASON_MAX_LENGTH
+            + 2 * _events_mod._REDACTION_INPUT_MARGIN
+            + len(_events_mod._REASON_TRUNCATION_MARKER)
+        )
+        assert seen and max(seen) <= ceiling
+
+    def test_bounding_is_flat_in_the_size_of_the_reason(self):
+        # 10x the input, same work — the property that turns 8.5s into 0.2s.
+        assert len(_events_mod._bound_for_redaction("x" * 100_000)) == len(
+            _events_mod._bound_for_redaction("x" * 1_000_000)
+        )
+
+    def test_short_reasons_are_not_bounded_at_all(self):
+        assert _events_mod._bound_for_redaction("socket closed") == "socket closed"
+
+    def test_margin_survives_the_final_cut(self):
+        # The margin is what makes bounding safe: a credential straddling the
+        # final _REASON_MAX_LENGTH cut must still have been whole when the
+        # redactor saw it. Assert the retained head really does extend at least
+        # _REDACTION_INPUT_MARGIN chars past what gets emitted.
+        bounded = _events_mod._bound_for_redaction("x" * 1_000_000)
+        head_kept = bounded.index(_events_mod._REASON_TRUNCATION_MARKER)
+        head_emitted = len(
+            _events_mod.describe_reason("y" * 1000).split(
+                _events_mod._REASON_TRUNCATION_MARKER
+            )[0]
+        )
+        assert head_kept - head_emitted >= _events_mod._REDACTION_INPUT_MARGIN
+
+    def test_huge_payload_is_still_fully_redacted_at_both_ends(self):
+        # Bounding keeps head and tail, so a secret at either end must still be
+        # scrubbed — the middle is discarded and never reaches Band.
+        head_secret = "ghp_" + "A" * 36
+        tail_secret = "xoxb-" + "9" * 24
+        content, metadata = _events_mod.build_failure_event(
+            f"{head_secret}\n{_huge_traceback()}\n{tail_secret}"
+        )
+        assert head_secret not in content
+        assert tail_secret not in content
+        assert head_secret not in str(metadata)
+        assert tail_secret not in str(metadata)
+
+    def test_secret_straddling_the_emitted_cut_is_redacted(self):
+        # The exact case the margin exists for: a credential that begins inside
+        # the emitted window and runs past its end.
+        secret = "ghp_" + "Z" * 400
+        content, _ = _events_mod.build_failure_event(
+            f"boom {secret}\n{_huge_traceback()}"
+        )
+        assert secret not in content
+        assert "Z" * 100 not in content
 
 
 # ---------------------------------------------------------------------------

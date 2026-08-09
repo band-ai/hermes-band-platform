@@ -3344,7 +3344,9 @@ class TestRendererCapabilities:
         mock_link.rest.agent_api_messages.create_agent_chat_message = _create
         adapter._link = mock_link
 
-        router = delivery.DeliveryRouter(SimpleNamespace(), {adapter.platform: adapter})
+        router = delivery.DeliveryRouter(
+            SimpleNamespace(platforms={}), {adapter.platform: adapter}
+        )
         # The router audit-saves oversized output to the real hermes home; keep
         # the test off the filesystem while leaving the branch under test intact.
         router._save_full_output = lambda *_a, **_k: tmp_path / "full-output.txt"

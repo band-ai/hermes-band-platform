@@ -8,6 +8,7 @@ BEFORE this module imports the adapter — so the adapter's top-level
 import asyncio
 import logging
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -303,6 +304,14 @@ class TestBandPluginRegistration:
         hint = self._hint()
         assert "call band_send_message with no room_id" in hint
         assert "owner's hub" in hint
+
+    def test_conversation_skill_agrees_that_final_text_is_auto_delivered(self):
+        skill = Path(_band_mod.__file__).parent / "skills" / "band-conversations" / "SKILL.md"
+        guidance = skill.read_text()
+        assert "final assistant text is delivered" in guidance
+        assert "Plain assistant text is **not** delivered" not in guidance
+        assert "Do **not** call" in guidance
+        assert "`band_send_message` for that routine reply" in guidance
 
 
 # ---------------------------------------------------------------------------

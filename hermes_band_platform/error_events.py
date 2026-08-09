@@ -55,24 +55,52 @@ the content **length** only.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
 from weakref import WeakKeyDictionary
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Lazy SDK import guard — mirrors adapter.py. The gateway discovers plugins
-# before dependencies are guaranteed present, so this module must import
-# cleanly without band-sdk; emission then no-ops (the adapter's own preflight
-# is what actually reports the missing dependency).
+# Lazy SDK bindings. The gateway may discover this module before dependencies
+# are installed, so a failed import must not become permanent process state.
+# ``_load_error_event_sdk`` retries until the imports work, then caches them.
 # ---------------------------------------------------------------------------
-try:
-    from band.client.rest import ChatEventRequest, DEFAULT_REQUEST_OPTIONS
-    from band.core.types import MessageType as BandMessageType
-except ImportError:  # pragma: no cover - exercised only without band-sdk
-    ChatEventRequest = None
-    DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
-    BandMessageType = None
+ChatEventRequest = None
+DEFAULT_REQUEST_OPTIONS = {"max_retries": 3}
+BandMessageType = None
+
+
+def _load_error_event_sdk() -> bool:
+    """Bind the event SDK types on demand, retrying after missing imports."""
+    global ChatEventRequest, DEFAULT_REQUEST_OPTIONS, BandMessageType
+
+    if ChatEventRequest is not None and BandMessageType is not None:
+        return True
+    try:
+        from band.client.rest import (
+            ChatEventRequest as SDKChatEventRequest,
+            DEFAULT_REQUEST_OPTIONS as sdk_request_options,
+        )
+        from band.core.types import MessageType as SDKMessageType
+    except ImportError:
+        return False
+    except Exception as e:
+        # A partially installed/broken SDK is also retryable. Keep emission
+        # best-effort and log only the exception type; import errors can carry
+        # environment paths that do not belong in this failure surface.
+        logger.debug(
+            "[band] error event: band-sdk bindings unavailable (%s)",
+            type(e).__name__,
+        )
+        return False
+
+    # Publish only a complete set of bindings. If discovery caught an
+    # incomplete install, the next emission gets a clean retry.
+    ChatEventRequest = SDKChatEventRequest
+    DEFAULT_REQUEST_OPTIONS = sdk_request_options
+    BandMessageType = SDKMessageType
+    return True
 
 
 # Platform limits for event content (thenvoi-platform ``events_controller.ex``):
@@ -119,17 +147,21 @@ _NO_DETAIL_LINE = "No details reached this room — check the gateway logs."
 _ERROR_CODE_TURN_FAILED = "turn_failed"
 _ERROR_CODE_DELIVERY_FAILED = "delivery_failed"
 
-# Most recent failed send per adapter, as ``(room_id, error_text)``. Populated
-# by ``note_send_failure`` from the adapter's send path and consumed once by
+# Most recent failed send per adapter and room. Populated by
+# ``note_send_failure`` from the adapter's send path and consumed once by
 # ``report_turn_failure`` — a failed delivery is the single most common way a
 # Band turn goes silent, and it is the only failure reason that exists
 # in-process at the time ``on_processing_complete`` fires (the hook itself
 # carries no reason, only an outcome).
 #
-# Weak keys so a discarded adapter is not pinned, and one entry per adapter so
-# it cannot grow: a stale reason is either overwritten by the next failure or
-# cleared by the next success.
-_LAST_SEND_FAILURE: "WeakKeyDictionary[Any, Tuple[str, str]]" = WeakKeyDictionary()
+# Weak keys ensure a discarded adapter is not pinned. Each adapter retains at
+# most this many rooms. New failures are most-recently-used; once full, the
+# least-recently recorded room is evicted. A success or pop touches only its
+# own room, so activity in one room cannot erase another room's failure.
+_SEND_FAILURE_ROOMS_MAX = 256
+_LAST_SEND_FAILURE: "WeakKeyDictionary[Any, OrderedDict[str, str]]" = (
+    WeakKeyDictionary()
+)
 
 
 def _short(value: Any) -> str:
@@ -292,12 +324,22 @@ def note_send_failure(adapter: Any, room_id: str, error: Any) -> None:
     reported as the reason for an unrelated turn failure minutes later.
     """
     try:
+        room_key = str(room_id)
         if error is None:
-            entry = _LAST_SEND_FAILURE.get(adapter)
-            if entry is not None and entry[0] == str(room_id):
+            failures = _LAST_SEND_FAILURE.get(adapter)
+            if failures is not None:
+                failures.pop(room_key, None)
+            if failures is not None and not failures:
                 _LAST_SEND_FAILURE.pop(adapter, None)
             return
-        _LAST_SEND_FAILURE[adapter] = (str(room_id), str(error))
+        failures = _LAST_SEND_FAILURE.get(adapter)
+        if failures is None:
+            failures = OrderedDict()
+            _LAST_SEND_FAILURE[adapter] = failures
+        failures[room_key] = str(error)
+        failures.move_to_end(room_key)
+        while len(failures) > _SEND_FAILURE_ROOMS_MAX:
+            failures.popitem(last=False)
     except TypeError:
         # Non-weakref-able stand-in (test doubles); losing the reason only
         # costs detail in the event, never correctness. The error text itself
@@ -310,9 +352,9 @@ def note_send_failure(adapter: Any, room_id: str, error: Any) -> None:
 
 
 def pop_send_failure(adapter: Any, room_id: str) -> Optional[str]:
-    """Consume the recorded send failure for ``room_id``, if it is that room's."""
+    """Consume only ``room_id``'s recorded send failure, when present."""
     try:
-        entry = _LAST_SEND_FAILURE.get(adapter)
+        failures = _LAST_SEND_FAILURE.get(adapter)
     except TypeError:
         logger.debug(
             "[band] error event: no recorded send failure for room %s — "
@@ -320,10 +362,12 @@ def pop_send_failure(adapter: Any, room_id: str) -> Optional[str]:
             _short(room_id),
         )
         return None
-    if entry is None or entry[0] != str(room_id):
+    if failures is None:
         return None
-    _LAST_SEND_FAILURE.pop(adapter, None)
-    return entry[1]
+    error = failures.pop(str(room_id), None)
+    if not failures:
+        _LAST_SEND_FAILURE.pop(adapter, None)
+    return error
 
 
 def _fatal_error_reason(adapter: Any) -> Optional[str]:
@@ -397,7 +441,8 @@ async def emit_error_event(
     message path is the thing that failed.
     """
     link = getattr(adapter, "_link", None)
-    if link is None or ChatEventRequest is None or BandMessageType is None:
+    sdk_available = _load_error_event_sdk()
+    if link is None or not sdk_available:
         # The user is left with silence on a failed turn — loud by definition,
         # and it fires at most once per failure, so warning costs nothing.
         logger.warning(

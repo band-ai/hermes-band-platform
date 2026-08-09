@@ -1,14 +1,18 @@
 """Tests for Band ``error`` events on failed turns.
 
 The band SDK stub is installed by ``tests/conftest.py`` at collection time,
-BEFORE this module imports the adapter — so ``error_events`` binds the stub's
-``ChatEventRequest`` / ``MessageType`` and the emission path is exercised
+BEFORE this module imports the adapter — so ``error_events`` lazily resolves the
+stub's ``ChatEventRequest`` / ``MessageType`` and the emission path is exercised
 against request objects with the real keyword signatures, not auto-attr
 MagicMocks.
 """
 
+import asyncio
+import builtins
+import gc
 import logging
 import sys
+import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -174,6 +178,27 @@ class TestBestEffort:
         )
         assert await _events_mod.emit_error_event(adapter, "room-abc", "x") is False
 
+    @pytest.mark.asyncio
+    async def test_sdk_import_retries_after_dependency_becomes_available(
+        self, adapter, monkeypatch
+    ):
+        """Early discovery without band-sdk must not poison later emission."""
+        real_import = builtins.__import__
+
+        def missing_band_sdk(name, *args, **kwargs):
+            if name in {"band.client.rest", "band.core.types"}:
+                raise ImportError("band-sdk not installed yet")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(_events_mod, "ChatEventRequest", None)
+        monkeypatch.setattr(_events_mod, "BandMessageType", None)
+        monkeypatch.setattr(builtins, "__import__", missing_band_sdk)
+        assert await _events_mod.emit_error_event(adapter, "room-abc", "first") is False
+
+        monkeypatch.setattr(builtins, "__import__", real_import)
+        assert await _events_mod.emit_error_event(adapter, "room-abc", "second") is True
+        assert _posted(adapter).message_type == "error"
+
 
 # ---------------------------------------------------------------------------
 # 3. Redaction is fail-closed
@@ -253,6 +278,62 @@ class TestReason:
         _events_mod.note_send_failure(adapter, "room-other", "other room's problem")
         await adapter.on_processing_complete(_evt(), ProcessingOutcome.FAILURE)
         assert "other room's problem" not in _posted(adapter).content
+
+    def test_interleaved_room_updates_are_isolated(self, adapter):
+        _events_mod.note_send_failure(adapter, "room-a", "failure a")
+        _events_mod.note_send_failure(adapter, "room-b", "failure b")
+        _events_mod.note_send_failure(adapter, "room-a", None)
+
+        assert _events_mod.pop_send_failure(adapter, "room-a") is None
+        assert _events_mod.pop_send_failure(adapter, "room-b") == "failure b"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_room_reports_keep_both_failures(self, adapter):
+        _events_mod.note_send_failure(adapter, "room-a", "failure a")
+        _events_mod.note_send_failure(adapter, "room-b", "failure b")
+
+        await asyncio.gather(
+            adapter.on_processing_complete(
+                _evt(msg_id="msg-a", room_id="room-a"), ProcessingOutcome.FAILURE
+            ),
+            adapter.on_processing_complete(
+                _evt(msg_id="msg-b", room_id="room-b"), ProcessingOutcome.FAILURE
+            ),
+        )
+
+        calls = adapter._link.rest.agent_api_events.create_agent_chat_event.await_args_list
+        posted = {call.kwargs["chat_id"]: call.kwargs["event"] for call in calls}
+        assert set(posted) == {"room-a", "room-b"}
+        assert "failure a" in posted["room-a"].content
+        assert posted["room-a"].metadata["message_id"] == "msg-a"
+        assert "failure b" in posted["room-b"].content
+        assert posted["room-b"].metadata["message_id"] == "msg-b"
+
+    def test_room_failure_storage_evicts_least_recently_recorded(
+        self, adapter, monkeypatch
+    ):
+        monkeypatch.setattr(_events_mod, "_SEND_FAILURE_ROOMS_MAX", 2)
+        _events_mod.note_send_failure(adapter, "room-a", "old a")
+        _events_mod.note_send_failure(adapter, "room-b", "failure b")
+        _events_mod.note_send_failure(adapter, "room-a", "new a")
+        _events_mod.note_send_failure(adapter, "room-c", "failure c")
+
+        assert _events_mod.pop_send_failure(adapter, "room-b") is None
+        assert _events_mod.pop_send_failure(adapter, "room-a") == "new a"
+        assert _events_mod.pop_send_failure(adapter, "room-c") == "failure c"
+
+    def test_failure_storage_keeps_weak_adapter_keys(self):
+        class WeakAdapter:
+            pass
+
+        transient = WeakAdapter()
+        adapter_ref = weakref.ref(transient)
+        _events_mod.note_send_failure(transient, "room-a", "failure a")
+        assert transient in _events_mod._LAST_SEND_FAILURE
+
+        del transient
+        gc.collect()
+        assert adapter_ref() is None
 
     def test_successful_send_clears_the_reason(self, adapter):
         _events_mod.note_send_failure(adapter, "room-abc", "transient blip")

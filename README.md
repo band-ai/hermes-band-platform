@@ -322,7 +322,10 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
 - **Self-filter**: the adapter skips its own agent messages by sender, with a sent-message-id
   backstop in addition to the SDK's own filtering.
 - **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions the
-  room's last human sender (falling back to all non-agent participants).
+  room's last human sender (falling back to all non-agent participants). Every mention must
+  carry the recipient's Band handle — the API rejects a null one — so handles are resolved
+  locally (roster → peers/contacts → owner handle from `owner_handle/agent_slug`) and an
+  unresolvable recipient fails before the send instead of during it.
 
 ### The Hub (main channel + command surface)
 

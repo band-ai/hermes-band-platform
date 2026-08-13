@@ -40,6 +40,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -186,6 +187,11 @@ _HUB_FAILOVER_MAX_PER_CONNECT_DEFAULT = 5
 # clean. "all" is a deliberate opt-in because every participant of an
 # originating room can then read redacted tool args and results.
 _EXECUTION_SCOPES = frozenset({"off", "hub", "all"})
+# Execution-event REST submissions are created from synchronous Hermes hooks, so
+# nothing on the tool path ever awaits them. Keep a small per-adapter backstop so
+# a slow Band endpoint cannot accumulate unbounded coroutine/future state during
+# a tool-heavy turn.
+_EXECUTION_PENDING_MAX = 64
 
 
 def _int_env(name: str, default: int) -> int:
@@ -752,6 +758,15 @@ class BandAdapter(BasePlatformAdapter):
                 ", ".join(sorted(_EXECUTION_SCOPES)),
             )
             self._execution_scope = "off"
+        # Futures returned by run_coroutine_threadsafe for execution events. The
+        # lock is required because hook callbacks and future callbacks can run on
+        # different threads (the agent's tool thread and the link loop's).
+        # Submissions are refused until connect() finishes and again as soon as
+        # disconnect() starts, so nothing is queued against a dying link.
+        self._execution_pending: set = set()
+        self._execution_pending_lock = threading.Lock()
+        self._execution_pending_max: int = _EXECUTION_PENDING_MAX
+        self._execution_accepting: bool = False
 
         # Scoped-lock identity (best-effort; set in connect()).
         self._lock_identity: Optional[str] = None
@@ -824,6 +839,7 @@ class BandAdapter(BasePlatformAdapter):
             self._consumer_task = asyncio.create_task(self._consume())
             self._mark_connected()
             usage_events.track_adapter(self)
+            self._execution_accepting = True
             logger.info(
                 "[band] Connected as agent %s (handle=%s, owner=%s)",
                 _short_id(self._agent_id),
@@ -961,6 +977,12 @@ class BandAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Cancel the consumer, drop the link, release the scoped lock."""
+        # Close the submission gate before taking down the link. Cancellation is
+        # bounded and yields only to let same-loop cancellations settle, so a slow
+        # event POST can never hold gateway shutdown open.
+        from .execution_events import cancel_pending_emissions
+
+        await cancel_pending_emissions(self)
         usage_events.untrack_adapter(self)
         self._mark_disconnected()
 

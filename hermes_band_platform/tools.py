@@ -33,6 +33,7 @@ and API keys are **never** logged.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any, Dict, List, Optional
@@ -155,13 +156,54 @@ def _check_band_tools_available() -> bool:
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+def _link_rest_usable_here(adapter: Any) -> bool:
+    """True when the live link's REST client can be awaited on *this* loop.
+
+    :class:`BandLink` builds one long-lived ``AsyncRestClient`` in its
+    constructor (``band/platform/link.py``), so its connection pool binds to the
+    loop that issues the first request — the gateway's, at connect. Awaiting it
+    from another running loop, such as the agent's tool executor, raises
+    ``<asyncio.locks.Event ...> is bound to a different event loop``.
+
+    This is the same failure :meth:`BandAdapter.send` already guards against by
+    marshalling onto ``_link_loop`` (INT-899). A tool cannot use that remedy:
+    ``_rest`` hands a client back and the *caller* awaits it, so there is no
+    coroutine here to marshal. The mismatch is resolved instead by declining the
+    shared client, which drops the caller onto the fresh per-call client that
+    ``_rest``'s fallback branch already documents as loop-safe.
+
+    Only a **proven** mismatch declines — both loops known and different. An
+    unknown loop keeps the previous behaviour, since a live adapter always sets
+    ``_link_loop`` alongside ``_link``, so "unknown" means "not connected" and
+    the caller is not in the live-link branch anyway.
+    """
+    link_loop = getattr(adapter, "_link_loop", None)
+    if link_loop is None:
+        return True
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        return True
+    if running is link_loop:
+        return True
+    logger.debug(
+        "[band.tools] live link is bound to another event loop; using a fresh "
+        "per-call REST client instead (link_loop=%#x running=%#x)",
+        id(link_loop),
+        id(running),
+    )
+    return False
+
+
 async def _rest() -> Any:
     """Return an authenticated async REST client.
 
-    Prefers the *live* :class:`BandAdapter`'s link (no second connection); falls
-    back to a fresh ``AsyncRestClient`` from env creds for out-of-process callers
-    (cron / no live gateway). The fallback client is short-lived — created per
-    call — so it never leaks a pooled connection across a loop.
+    Prefers the *live* :class:`BandAdapter`'s link (no second connection) — but
+    only when that link's loop is the one running here, see
+    :func:`_link_rest_usable_here`. Falls back to a fresh ``AsyncRestClient``
+    from env creds for out-of-process callers (cron / no live gateway) and for a
+    cross-loop caller. The fallback client is short-lived — created per call — so
+    it never leaks a pooled connection across a loop.
     """
     try:
         from gateway.run import _gateway_runner_ref
@@ -169,7 +211,7 @@ async def _rest() -> Any:
         runner = _gateway_runner_ref()
         adapter = runner.adapters.get(Platform("band")) if runner else None
         link = getattr(adapter, "_link", None) if adapter is not None else None
-        if link is not None:
+        if link is not None and _link_rest_usable_here(adapter):
             return link.rest
     except Exception:
         # Fall through to the env-creds fallback.
@@ -453,9 +495,17 @@ def _tool_exc(exc: Exception) -> str:
 
     ``_ToolError`` / ``_ToolUnavailable`` carry user-facing messages; anything
     else is wrapped with its type so the model gets a useful (but bounded) hint.
+
+    An unexpected exception also logs its traceback at ``debug``. The bounded
+    string is all the model should see, but it is not enough to debug from: a
+    cross-loop ``RuntimeError`` reached a log as one bare line with no frames,
+    which is why the failing primitive had to be found by reading the source
+    instead of the log. Nothing new is disclosed — ``str(exc)`` is already in the
+    returned message — and frames name code locations, not payloads.
     """
     if isinstance(exc, (_ToolError, _ToolUnavailable)):
         return tool_error(str(exc))
+    logger.debug("[band.tools] tool failed: %s", type(exc).__name__, exc_info=exc)
     status = getattr(exc, "status_code", None)
     if isinstance(status, int):
         return tool_error(f"Band tool failed: {exc}", status_code=status)

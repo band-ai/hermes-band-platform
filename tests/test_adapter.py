@@ -8,6 +8,7 @@ BEFORE this module imports the adapter — so the adapter's top-level
 import asyncio
 import logging
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -270,6 +271,47 @@ class TestBandPluginRegistration:
         register(ctx)
         kwargs = ctx.register_platform.call_args[1]
         assert callable(kwargs["env_enablement_fn"])
+
+    def _hint(self):
+        ctx = MagicMock()
+        register(ctx)
+        return ctx.register_platform.call_args[1]["platform_hint"]
+
+    def test_platform_hint_does_not_claim_plain_text_is_undelivered(self):
+        """Regression guard: the gateway auto-delivers the final assistant text
+        and there is no way to suppress that, so a hint claiming otherwise makes
+        the model call band_send_message and every reply gets posted twice."""
+        hint = self._hint()
+        assert "plain text is not delivered" not in hint
+        assert "not delivered" not in hint
+
+    def test_platform_hint_says_reply_is_delivered_and_mentioned_for_you(self):
+        hint = self._hint()
+        assert "delivered to the room automatically" in hint
+        assert "@mentioned for you" in hint
+
+    def test_platform_hint_forbids_send_message_for_the_current_room(self):
+        hint = self._hint()
+        assert (
+            "Do NOT call band_send_message to reply in the room you are "
+            "already in" in hint
+        )
+        assert "twice" in hint
+
+    def test_platform_hint_keeps_owner_no_room_id_guidance(self):
+        """Still-correct guidance the fix must not drop: reaching the owner from
+        a non-Band session or another room does need an explicit tool call."""
+        hint = self._hint()
+        assert "call band_send_message with no room_id" in hint
+        assert "owner's hub" in hint
+
+    def test_conversation_skill_agrees_that_final_text_is_auto_delivered(self):
+        skill = Path(_band_mod.__file__).parent / "skills" / "band-conversations" / "SKILL.md"
+        guidance = skill.read_text()
+        assert "final assistant text is delivered" in guidance
+        assert "Plain assistant text is **not** delivered" not in guidance
+        assert "Do **not** call" in guidance
+        assert "`band_send_message` for that routine reply" in guidance
 
 
 # ---------------------------------------------------------------------------

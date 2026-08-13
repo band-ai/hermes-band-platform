@@ -110,6 +110,21 @@ def _install_band_mock() -> MagicMock:
             self.message_type = message_type
             self.metadata = metadata
 
+    # band.core.types.ToolEventKey — the canonical payload keys the
+    # execution-event emitter builds its content dict from. Same (str, Enum)
+    # shape as _FakeMessageType above: the SDK relies on members *being* their
+    # string values, so a payload keyed by ToolEventKey json.dumps'es to plain
+    # "name"/"args"/... keys.
+    class _FakeToolEventKey(str, Enum):
+        NAME = "name"
+        ARGS = "args"
+        OUTPUT = "output"
+        TOOL_CALL_ID = "tool_call_id"
+        IS_ERROR = "is_error"
+
+        def __str__(self):
+            return self.value
+
     # band.runtime.formatters — pure helper the adapter reuses. Faithful
     # stand-in for replace_uuid_mentions so the adapter's independent import
     # binds the stub rather than its passthrough fallback.
@@ -156,6 +171,7 @@ def _install_band_mock() -> MagicMock:
     # Attach to the module below; never rebuild it.
     band_core_types_mod = MagicMock()
     band_core_types_mod.MessageType = _FakeMessageType
+    band_core_types_mod.ToolEventKey = _FakeToolEventKey
     band_runtime_mod = MagicMock()
     band_runtime_formatters_mod = MagicMock()
     band_runtime_formatters_mod.replace_uuid_mentions = _fake_replace_uuid_mentions
@@ -237,6 +253,9 @@ def _register_band_platform():
                 pass
 
             def register_skill(self, *args, **kwargs):
+                pass
+
+            def register_hook(self, hook_name, callback):
                 pass
 
         hermes_band_platform.register(_RegistryCtx())

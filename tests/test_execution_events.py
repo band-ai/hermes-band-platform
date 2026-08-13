@@ -12,6 +12,8 @@ import ast
 import inspect
 import json
 import logging
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -147,18 +149,6 @@ class TestNoMentions:
 # ---------------------------------------------------------------------------
 
 class TestSizeAndBlankContent:
-    def test_truncate_is_a_noop_under_the_cap(self):
-        content = "x" * (ee._EVENT_CONTENT_MAX_LENGTH - 1)
-        assert ee._truncate_event_content(content) == content
-
-    def test_truncate_keeps_head_and_tail_around_the_marker(self):
-        content = "H" * 20000 + "TAIL"
-        out = ee._truncate_event_content(content)
-        assert len(out) == ee._EVENT_CONTENT_MAX_LENGTH
-        assert ee._EVENT_TRUNCATION_MARKER in out
-        assert out.startswith("H")
-        assert out.endswith("TAIL")
-
     async def test_oversized_payload_is_truncated_before_emit(self):
         adapter = _make_adapter()
         await ee.emit_event(
@@ -168,8 +158,90 @@ class TestSizeAndBlankContent:
             {ee._K_NAME: "terminal", ee._K_OUTPUT: "y" * 100_000},
         )
         content = _sent_event(adapter).kwargs["event"].content
-        assert len(content) == ee._EVENT_CONTENT_MAX_LENGTH
+        assert len(content) <= ee._EVENT_CONTENT_MAX_LENGTH
         assert ee._EVENT_TRUNCATION_MARKER in content
+        assert json.loads(content)["output"].endswith("y")
+
+    async def test_many_key_args_remain_valid_sdk_tool_call_json(self):
+        adapter = _make_adapter()
+        args = {f"argument_{index:04d}": "v" * 40 for index in range(2_000)}
+        await ee.emit_event(
+            adapter,
+            ee._TOOL_CALL,
+            SESSION,
+            {
+                ee._K_NAME: "structured_tool",
+                ee._K_ARGS: args,
+                ee._K_TOOL_CALL_ID: "call-many-keys",
+            },
+        )
+        content = _sent_event(adapter).kwargs["event"].content
+        decoded = json.loads(content)
+
+        assert len(content) <= ee._EVENT_CONTENT_MAX_LENGTH
+        assert isinstance(decoded["args"], dict)
+        assert any(key.startswith("_band_truncated") for key in decoded["args"])
+
+        # conftest installs a minimal SDK stub when band-sdk is unavailable.
+        # A fresh interpreter has clean module state and therefore exercises the
+        # actual installed band.converters.parsing implementation used in CI and
+        # production, with this test's generated 16k payload passed verbatim.
+        script = """
+import json
+import os
+import sys
+from pathlib import Path
+
+# Directory installs keep the real SDK here. Make that installation
+# authoritative just as the plugin bootstrap does; wheel installs naturally
+# fall through to the interpreter's site-packages.
+hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+band_libs = str(hermes_home / "band-libs")
+if Path(band_libs).is_dir():
+    sys.path = [entry for entry in sys.path if entry != band_libs]
+    sys.path.insert(0, band_libs)
+from band.converters.parsing import parse_tool_call
+
+content = sys.stdin.read()
+decoded = json.loads(content)
+parsed = parse_tool_call(content)
+assert parsed is not None
+assert parsed.name == "structured_tool"
+assert parsed.tool_call_id == "call-many-keys"
+assert parsed.args == decoded["args"]
+assert any(key.startswith("_band_truncated") for key in parsed.args)
+"""
+        subprocess.run(
+            [sys.executable, "-c", script],
+            input=content,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+    async def test_metadata_uses_bounded_correlation_fields(self):
+        adapter = _make_adapter()
+        await ee.emit_event(
+            adapter,
+            ee._TOOL_CALL,
+            SESSION,
+            {
+                ee._K_NAME: "name-" + "n" * 20_000,
+                ee._K_ARGS: {"argument": "value"},
+                ee._K_TOOL_CALL_ID: "call-" + "c" * 20_000,
+            },
+        )
+
+        event = _sent_event(adapter).kwargs["event"]
+        bounded = json.loads(event.content)
+        assert len(event.content) <= ee._EVENT_CONTENT_MAX_LENGTH
+        assert event.metadata[ee._K_NAME] == bounded[ee._K_NAME]
+        assert event.metadata[ee._K_TOOL_CALL_ID] == bounded[ee._K_TOOL_CALL_ID]
+        assert len(event.metadata[ee._K_NAME]) <= ee._EVENT_REQUIRED_FIELD_MAX_LENGTH
+        assert (
+            len(event.metadata[ee._K_TOOL_CALL_ID])
+            <= ee._EVENT_REQUIRED_FIELD_MAX_LENGTH
+        )
 
     def test_blank_tool_output_becomes_the_placeholder(self):
         assert ee._output_text("") == ee._EVENT_EMPTY_CONTENT_PLACEHOLDER
@@ -297,6 +369,51 @@ class TestRedaction:
         # Fail closed: a Band event cannot be deleted once written.
         assert ok is False
         adapter._link.rest.agent_api_events.create_agent_chat_event.assert_not_called()
+
+    async def test_mapping_keys_and_nested_mapping_keys_are_scrubbed(
+        self, monkeypatch
+    ):
+        import agent.redact
+
+        monkeypatch.setattr(
+            agent.redact,
+            "redact_sensitive_text",
+            lambda text, force=False: text.replace("hunter2", "[REDACTED]"),
+        )
+        adapter = _make_adapter()
+        await ee.emit_event(
+            adapter,
+            ee._TOOL_CALL,
+            SESSION,
+            {
+                ee._K_NAME: "t",
+                ee._K_TOOL_CALL_ID: "c1",
+                ee._K_ARGS: {"token-hunter2": {"nested-hunter2": "safe"}},
+            },
+        )
+        content = _sent_event(adapter).kwargs["event"].content
+        payload = json.loads(content)
+        assert "hunter2" not in content
+        assert payload["args"] == {
+            "token-[REDACTED]": {"nested-[REDACTED]": "safe"}
+        }
+
+    def test_redacted_key_collisions_are_deterministic(self):
+        def scrub(text):
+            return "masked" if text.startswith("secret") else text
+
+        value = {
+            "secret-one": 1,
+            "secret-two": {"secret-a": 2, "secret-b": 3},
+            "masked#2": 4,
+            "secret-three": 5,
+        }
+        assert ee._redact_tree(value, scrub) == {
+            "masked": 1,
+            "masked#2": {"masked": 2, "masked#2": 3},
+            "masked#2#2": 4,
+            "masked#3": 5,
+        }
 
 
 # ---------------------------------------------------------------------------

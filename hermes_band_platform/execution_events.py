@@ -43,9 +43,14 @@ Tool args and output can carry credentials and can be enormous, and a Band
 event cannot be deleted once written.  Every payload is run through the host's
 own ``agent.redact.redact_sensitive_text`` (``force=True`` — the same
 Tirith-grade redactor the gateway applies before chat text leaves it) and is
-*dropped* rather than emitted if that redactor is unavailable, then capped with
-the SDK's own head-and-tail truncation.  Emission is best-effort throughout: a
-failing REST call must never break the tool or the reply.
+*dropped* rather than emitted if that redactor is unavailable. Oversized data is
+trimmed inside payload fields before final serialization, so the SDK's history
+parser always receives valid JSON. Emission is best-effort throughout: a failing
+REST call must never break the tool or the reply.
+
+Execution-event publication is globally disabled by default. The explicit
+``BAND_EMIT_EXECUTION`` gate accepts ``off``, ``hub`` (only turns originating in
+the private owner hub), or ``all`` (all originating Band rooms).
 
 Events carry no mentions (the API exempts them from the >=1 mention rule that
 messages are held to), so however many are emitted, nobody is pinged.
@@ -127,6 +132,8 @@ except ImportError:  # pragma: no cover - exercised only on an older SDK
 _EVENT_CONTENT_MAX_LENGTH = 16384
 _EVENT_TRUNCATION_MARKER = "... [truncated] ..."
 _EVENT_EMPTY_CONTENT_PLACEHOLDER = "(no content)"
+_EVENT_REQUIRED_FIELD_MAX_LENGTH = 1024
+_ARGS_TRUNCATION_KEY = "_band_truncated"
 
 # session_id → room_id memo. A Hermes session id is stable for the life of the
 # session, so this resolves once per room instead of walking the session store
@@ -158,24 +165,117 @@ def _load_sdk() -> bool:
     return True
 
 
-def _truncate_event_content(content: str) -> str:
-    """Cap *content*, keeping its head and tail around a marker.
-
-    Byte-for-byte the band SDK's ``_truncate_event_content``: both ends are
-    preserved because the tail of a truncated payload is often the informative
-    part (the last lines of an error dump), which a head-only cut would drop.
-    No-op when *content* already fits, so callers run it unconditionally.
-    """
-    if len(content) <= _EVENT_CONTENT_MAX_LENGTH:
-        return content
-    budget = _EVENT_CONTENT_MAX_LENGTH - len(_EVENT_TRUNCATION_MARKER)
+def _truncate_text(text: str, limit: int) -> str:
+    """Head/tail truncate one JSON field to *limit* characters."""
+    if len(text) <= limit:
+        return text
+    if limit <= len(_EVENT_TRUNCATION_MARKER):
+        return _EVENT_TRUNCATION_MARKER[:limit]
+    budget = limit - len(_EVENT_TRUNCATION_MARKER)
     head_len = budget // 2
     tail_len = budget - head_len
-    return content[:head_len] + _EVENT_TRUNCATION_MARKER + content[-tail_len:]
+    return text[:head_len] + _EVENT_TRUNCATION_MARKER + text[-tail_len:]
+
+
+def _serialize(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _unique_truncation_key(mapping: Dict[str, Any]) -> str:
+    """Return a deterministic marker key that cannot overwrite user args."""
+    key = _ARGS_TRUNCATION_KEY
+    suffix = 2
+    while key in mapping:
+        key = f"{_ARGS_TRUNCATION_KEY}_{suffix}"
+        suffix += 1
+    return key
+
+
+def _fit_string_field(payload: Dict[str, Any], key: str) -> None:
+    """Shrink one string field just enough for the serialized payload to fit."""
+    value = payload.get(key)
+    if not isinstance(value, str) or len(_serialize(payload)) <= _EVENT_CONTENT_MAX_LENGTH:
+        return
+    low, high = 0, len(value)
+    best = ""
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = _truncate_text(value, mid)
+        payload[key] = candidate
+        if len(_serialize(payload)) <= _EVENT_CONTENT_MAX_LENGTH:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    payload[key] = best
+
+
+def _bounded_event_payload(payload: Dict[str, Any]) -> str:
+    """Serialize a tool payload without ever cutting the resulting JSON.
+
+    Payloads that already fit are byte-for-byte unchanged. For oversized tool
+    results, ``output`` is head/tail truncated to the largest value that fits.
+    For oversized tool calls, correlation strings are first bounded, then args
+    are retained in insertion order while reserving a deterministic omission
+    marker; the first entry that cannot fit and every following entry are
+    omitted. This keeps ``args`` an object accepted by Band's history parsers.
+    """
+    content = _serialize(payload)
+    if len(content) <= _EVENT_CONTENT_MAX_LENGTH:
+        return content
+
+    bounded = dict(payload)
+    for key in (_K_NAME, _K_TOOL_CALL_ID):
+        value = bounded.get(key)
+        if isinstance(value, str):
+            bounded[key] = _truncate_text(value, _EVENT_REQUIRED_FIELD_MAX_LENGTH)
+
+    if isinstance(bounded.get(_K_ARGS), dict):
+        original_args = bounded[_K_ARGS]
+        kept: Dict[str, Any] = {}
+        marker_key = _unique_truncation_key(original_args)
+        items = list(original_args.items())
+        bounded[_K_ARGS] = kept
+        for index, (key, value) in enumerate(items):
+            remaining = len(items) - index - 1
+            kept[key] = value
+            if remaining:
+                kept[marker_key] = f"{remaining} argument(s) omitted"
+            if len(_serialize(bounded)) <= _EVENT_CONTENT_MAX_LENGTH:
+                if not remaining:
+                    kept.pop(marker_key, None)
+                continue
+            kept.pop(key, None)
+            kept[marker_key] = f"{remaining + 1} argument(s) omitted"
+            break
+    elif _K_OUTPUT in bounded:
+        if not isinstance(bounded[_K_OUTPUT], str):
+            bounded[_K_OUTPUT] = str(bounded[_K_OUTPUT])
+        _fit_string_field(bounded, _K_OUTPUT)
+
+    content = _serialize(bounded)
+    if len(content) <= _EVENT_CONTENT_MAX_LENGTH:
+        return content
+
+    # Pathological required fields or a marker key can still consume the cap.
+    # Shrink correlation fields against the real serialized size, then drop the
+    # optional args marker as the final fail-safe. Required parser fields remain.
+    for key in (_K_NAME, _K_TOOL_CALL_ID):
+        _fit_string_field(bounded, key)
+    content = _serialize(bounded)
+    if len(content) > _EVENT_CONTENT_MAX_LENGTH and isinstance(
+        bounded.get(_K_ARGS), dict
+    ):
+        bounded[_K_ARGS] = {}
+        content = _serialize(bounded)
+        for key in (_K_NAME, _K_TOOL_CALL_ID):
+            _fit_string_field(bounded, key)
+        content = _serialize(bounded)
+    return content
 
 
 def _redact_tree(value: Any, scrub) -> Any:
-    """Apply *scrub* to every string reachable in *value*.
+    """Apply *scrub* to every string and mapping key reachable in *value*.
 
     Redaction runs over the payload's values, NOT over the serialized JSON:
     the redactor masks a matched token and whatever trails it, so a credential
@@ -190,7 +290,16 @@ def _redact_tree(value: Any, scrub) -> Any:
     if isinstance(value, str):
         return scrub(value)
     if isinstance(value, dict):
-        return {str(k): _redact_tree(v, scrub) for k, v in value.items()}
+        redacted: Dict[str, Any] = {}
+        for original_key, item in value.items():
+            base = str(scrub(str(original_key)))
+            key = base
+            suffix = 2
+            while key in redacted:
+                key = f"{base}#{suffix}"
+                suffix += 1
+            redacted[key] = _redact_tree(item, scrub)
+        return redacted
     if isinstance(value, (list, tuple)):
         return [_redact_tree(v, scrub) for v in value]
     if value is None or isinstance(value, (bool, int, float)):
@@ -242,9 +351,9 @@ def _redact_payload(
 def _event_content(
     payload: Dict[str, Any], *, message_type: str, room_id: str
 ) -> Optional[str]:
-    """Serialize an already-redacted payload, placeholder it, and truncate."""
+    """Serialize an already-redacted payload under the cap as valid JSON."""
     try:
-        content = json.dumps(payload, ensure_ascii=False, default=str)
+        content = _bounded_event_payload(payload)
     except Exception as e:
         # ``default=str`` makes this near-unreachable, so reaching it means the
         # payload shape is wrong, not that a value was awkward — hence warning.
@@ -259,7 +368,7 @@ def _event_content(
         return None
     if not content:
         content = _EVENT_EMPTY_CONTENT_PLACEHOLDER
-    return _truncate_event_content(content)
+    return content
 
 
 def _output_text(result: Any) -> str:
@@ -414,13 +523,15 @@ async def emit_event(
             )
             return False
 
-        # Built from the redacted payload, so metadata can never carry a value
-        # that content wouldn't.
-        metadata = {_K_NAME: safe.get(_K_NAME, "")}
-        if safe.get(_K_TOOL_CALL_ID):
-            metadata[_K_TOOL_CALL_ID] = safe[_K_TOOL_CALL_ID]
-        if _K_IS_ERROR in safe:
-            metadata[_K_IS_ERROR] = safe[_K_IS_ERROR]
+        # Derive metadata from the exact bounded representation sent as content.
+        # Correlation fields may themselves be pathological, so taking them from
+        # ``safe`` would let them bypass the event-size cap applied above.
+        bounded = json.loads(content)
+        metadata = {_K_NAME: bounded.get(_K_NAME, "")}
+        if bounded.get(_K_TOOL_CALL_ID):
+            metadata[_K_TOOL_CALL_ID] = bounded[_K_TOOL_CALL_ID]
+        if _K_IS_ERROR in bounded:
+            metadata[_K_IS_ERROR] = bounded[_K_IS_ERROR]
 
         # No mentions: the events endpoint is exempt from the >=1 mention rule
         # that create_agent_chat_message enforces, so emitting these can never
@@ -555,7 +666,9 @@ def register_hooks(ctx) -> None:
     try:
         ctx.register_hook("pre_tool_call", on_pre_tool_call)
         ctx.register_hook("post_tool_call", on_post_tool_call)
-        logger.debug("[band] execution events on (pre_tool_call/post_tool_call)")
+        logger.debug(
+            "[band] execution-event hooks registered; emission scope is per adapter"
+        )
     except AttributeError:
         # Older host without ctx.register_hook — no execution events, but the
         # platform still registers and works. Expected, so debug.

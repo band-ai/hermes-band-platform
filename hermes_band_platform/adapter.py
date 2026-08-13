@@ -2874,7 +2874,7 @@ def check_band_requirements() -> bool:
     specific names inside the function, binds them to module globals, and
     returns True; on ImportError it returns False.
 
-    To enable Hermes auto-install, a ``'platform.band': ('band-sdk>=1.1.0,<2.0.0',)``
+    To enable Hermes auto-install, a ``'platform.band': ('band-sdk>=1.3.0,<2.0.0',)``
     entry could be added to tools/lazy_deps.py and this could use
     ``tools.lazy_deps.ensure_and_bind``; deferred to keep zero core edits.
     """

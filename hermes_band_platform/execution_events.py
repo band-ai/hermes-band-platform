@@ -480,6 +480,29 @@ def _room_for_session(adapter: Any, session_id: str) -> Optional[str]:
     return None
 
 
+def _scope_allows(adapter: Any, room_id: Optional[str] = None) -> bool:
+    """Whether ``BAND_EMIT_EXECUTION`` permits emitting into *room_id*.
+
+    The scope is captured on the adapter at construction, so this is a pure
+    read: one process-wide privacy decision, applied per room.
+
+      ``off``   emit nothing (the default).
+      ``hub``   only turns whose room IS the owner's private hub. Compared by
+                room id rather than by "is this room private", because the hub
+                is the one room the owner alone can read.
+      ``all``   every Band room the agent participates in.
+
+    Unknown scopes cannot reach here — the adapter normalises them to ``off`` —
+    but the final ``return False`` keeps this fail-closed if that ever changes.
+    """
+    scope = str(getattr(adapter, "_execution_scope", "off") or "off").lower()
+    if scope == "all":
+        return True
+    if scope == "hub":
+        return bool(room_id and room_id == getattr(adapter, "_hub_room_id", None))
+    return False
+
+
 async def emit_event(
     adapter: Any, message_type: str, session_id: str, payload: Dict[str, Any]
 ) -> bool:
@@ -500,6 +523,14 @@ async def emit_event(
         room_id = _room_for_session(adapter, session_id)
         if room_id is None:
             # _room_for_session has already logged which case this was.
+            return False
+        if not _scope_allows(adapter, room_id):
+            logger.debug(
+                "[band] %s event for room %s not emitted — BAND_EMIT_EXECUTION "
+                "scope does not allow this room",
+                message_type,
+                _short_id(room_id),
+            )
             return False
         safe = _redact_payload(payload, message_type=message_type, room_id=room_id)
         if safe is None:

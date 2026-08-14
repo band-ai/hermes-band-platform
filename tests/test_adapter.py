@@ -62,6 +62,24 @@ class TestBandAdapterInit:
         assert adapter._cfg_agent_id == "env-agent-id"
         assert adapter._api_key == "env-api-key"
 
+    def test_execution_emission_defaults_off(self, monkeypatch):
+        monkeypatch.delenv("BAND_EMIT_EXECUTION", raising=False)
+        assert _make_adapter(monkeypatch)._execution_scope == "off"
+
+    def test_blank_execution_emission_scope_is_off(self, monkeypatch):
+        monkeypatch.setenv("BAND_EMIT_EXECUTION", "")
+        assert _make_adapter(monkeypatch)._execution_scope == "off"
+
+    @pytest.mark.parametrize("scope", ["off", "all", "hub"])
+    def test_execution_emission_accepts_documented_scopes(self, monkeypatch, scope):
+        monkeypatch.setenv("BAND_EMIT_EXECUTION", scope)
+        assert _make_adapter(monkeypatch)._execution_scope == scope
+
+    def test_invalid_execution_emission_scope_fails_closed(self, monkeypatch):
+        """A typo must not publish tool args — anything unknown means off."""
+        monkeypatch.setenv("BAND_EMIT_EXECUTION", "yes")
+        assert _make_adapter(monkeypatch)._execution_scope == "off"
+
     def test_init_reads_credentials_from_config_extra(self, monkeypatch):
         for key in ("BAND_AGENT_ID", "BAND_API_KEY", "BAND_BASE_URL", "BAND_OWNER_ID"):
             monkeypatch.delenv(key, raising=False)

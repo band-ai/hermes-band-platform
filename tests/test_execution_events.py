@@ -55,6 +55,10 @@ def _make_adapter(*, rooms=(ROOM,), session_id=SESSION):
         _known_rooms=set(rooms),
         _hub_room_id=None,
         _session_key_for=lambda room_id: "agent:main:band:group:" + room_id,
+        # Emission is off by default in production, so any test asserting that an
+        # event was posted has to opt in. TestExecutionScope overrides this to
+        # exercise the gate itself.
+        _execution_scope="all",
     )
     return adapter
 
@@ -864,3 +868,57 @@ class TestLogsNeverCarryPayload:
         ``len(content)`` is explicitly fine — but never passed as a value.
         """
         assert _payload_names_in_log_args(ee) == []
+
+
+# ---------------------------------------------------------------------------
+# BAND_EMIT_EXECUTION — the privacy gate
+# ---------------------------------------------------------------------------
+
+class TestExecutionScope:
+    async def test_off_is_the_default_and_emits_nothing(self):
+        adapter = _make_adapter()
+        del adapter._execution_scope
+        assert await ee.emit_event(
+            adapter,
+            ee._TOOL_CALL,
+            SESSION,
+            {ee._K_NAME: "terminal", ee._K_TOOL_CALL_ID: "c1"},
+        ) is False
+        adapter._link.rest.agent_api_events.create_agent_chat_event.assert_not_called()
+
+    async def test_all_requires_explicit_opt_in_and_preserves_payload(self):
+        adapter = _make_adapter()
+        adapter._execution_scope = "all"
+        payload = {
+            ee._K_NAME: "terminal",
+            ee._K_ARGS: {"command": "ls"},
+            ee._K_TOOL_CALL_ID: "c1",
+        }
+        assert await ee.emit_event(
+            adapter, ee._TOOL_CALL, SESSION, payload
+        ) is True
+        assert json.loads(_sent_event(adapter).kwargs["event"].content) == payload
+
+    async def test_hub_only_allows_turns_originating_in_owner_hub(self):
+        adapter = _make_adapter()
+        adapter._execution_scope = "hub"
+        adapter._hub_room_id = "different-room"
+        assert await ee.emit_event(
+            adapter,
+            ee._TOOL_CALL,
+            SESSION,
+            {ee._K_NAME: "terminal", ee._K_TOOL_CALL_ID: "c1"},
+        ) is False
+
+        adapter._hub_room_id = ROOM
+        assert await ee.emit_event(
+            adapter,
+            ee._TOOL_CALL,
+            SESSION,
+            {ee._K_NAME: "terminal", ee._K_TOOL_CALL_ID: "c1"},
+        ) is True
+
+
+# ---------------------------------------------------------------------------
+# Hook payload mapping
+# ---------------------------------------------------------------------------

@@ -307,6 +307,7 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
 | `BAND_HUB_FAILOVER_THRESHOLD` | Consecutive failed hub sends before failing over to a fresh hub room (default `3`). A successful hub send resets the count. See [Hub failover](#hub-failover). |
 | `BAND_HUB_FAILOVER_MAX_PER_CONNECT` | Backstop cap on hub failovers per gateway connection (default `5`). |
 | `BAND_EMIT_USAGE` | Startup-only usage-event scope: `off` (default), `all`, or `hub`. `true`/`1`/`yes`/`on` alias `all`; `false`/`0`/`no` alias `off`; invalid values fail closed to `off`. Restart the gateway after changing it. |
+| `BAND_EMIT_EXECUTION` | Publish redacted tool-call and tool-result events: `off` (default), `hub` (only turns originating in the private owner hub), or `all` (every Band room). `all` is an explicit opt-in because room participants can see tool args/results. Invalid values fail closed to `off`. |
 
 Usage emission defaults to `off` while the SDK carries usage in task events and
 Band has no consumer for their structured metadata. `all` posts the aggregate in
@@ -314,6 +315,11 @@ the room where that turn originated. `hub` posts only when the turn itself
 originated in the owner's hub; it never reroutes usage from another room into the
 hub. Because `off` avoids registering Hermes's per-API-call hook, changes to
 `BAND_EMIT_USAGE` take effect only after a gateway restart.
+
+Execution events are **off by default**. `hub` shows redacted tool calls and results only
+for turns started in the private owner hub; `all` publishes them in every originating Band
+room, where each participant can read them. A Band event cannot be deleted once written, so
+the default is the private one and widening it is a deliberate act.
 
 ---
 

@@ -181,6 +181,12 @@ _OWNER_COMMAND_NOTICE = (
 _HUB_FAILOVER_THRESHOLD_DEFAULT = 3
 _HUB_FAILOVER_MAX_PER_CONNECT_DEFAULT = 5
 
+# Accepted values for BAND_EMIT_EXECUTION. "hub" is the useful middle ground:
+# the owner sees tool activity in their own private room while shared rooms stay
+# clean. "all" is a deliberate opt-in because every participant of an
+# originating room can then read redacted tool args and results.
+_EXECUTION_SCOPES = frozenset({"off", "hub", "all"})
+
 
 def _int_env(name: str, default: int) -> int:
     """Read a positive int from env, falling back to ``default``.
@@ -729,6 +735,23 @@ class BandAdapter(BasePlatformAdapter):
         self._hub_send_failures: int = 0
         self._failover_in_progress: bool = False
         self._hub_failovers_done: int = 0
+
+        # Execution-event visibility. Read once here rather than per emission:
+        # this is a privacy decision for the whole process, and a value that
+        # could change mid-run would make it impossible to say afterwards what a
+        # room had been shown. Anything unrecognised fails closed to "off" — a
+        # typo must never publish tool arguments into a room.
+        self._execution_scope: str = (
+            (os.getenv("BAND_EMIT_EXECUTION") or "off").strip().lower()
+        )
+        if self._execution_scope not in _EXECUTION_SCOPES:
+            logger.warning(
+                "[band] Invalid BAND_EMIT_EXECUTION=%r; execution events are off "
+                "(expected one of: %s)",
+                self._execution_scope,
+                ", ".join(sorted(_EXECUTION_SCOPES)),
+            )
+            self._execution_scope = "off"
 
         # Scoped-lock identity (best-effort; set in connect()).
         self._lock_identity: Optional[str] = None

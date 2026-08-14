@@ -5,6 +5,7 @@ BEFORE this module imports the adapter — so the adapter's top-level
 ``try: from band ...`` binds the stub and ``BAND_AVAILABLE`` stays True.
 """
 
+import time
 import asyncio
 import logging
 import sys
@@ -906,6 +907,16 @@ class TestHandleEvent:
         await adapter._handle_event(event)
         adapter._link.subscribe_room.assert_not_called()
         adapter._link.unsubscribe_room.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event_type", ["room_removed", "room_deleted"])
+    async def test_room_departure_forgets_working_state(self, adapter, event_type):
+        adapter._working_reported["gone-room"] = time.monotonic()
+        event = SimpleNamespace(type=event_type, room_id="gone-room")
+
+        await adapter._handle_event(event)
+
+        assert "gone-room" not in adapter._working_reported
 
 
 # ---------------------------------------------------------------------------
@@ -2473,6 +2484,22 @@ class TestConnectDisconnect:
 
         assert task.cancelled() or task.done()
         assert adapter._room_catch_up_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_forgets_working_state_for_reconnect(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        old_link = MagicMock()
+        old_link.disconnect = AsyncMock()
+        adapter._link = old_link
+        adapter._working_reported["room-1"] = time.monotonic()
+
+        await adapter.disconnect()
+
+        assert adapter._working_reported == {}
+        new_link = TestWorkingIndicator._link()
+        adapter._link = new_link
+        await adapter.send_typing("room-1")
+        assert new_link.calls == [("room-1", True)]
 
 
 # ---------------------------------------------------------------------------

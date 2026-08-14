@@ -982,6 +982,14 @@ class BandAdapter(BasePlatformAdapter):
         self._link = None
         self._link_loop = None
 
+        # Activity is ephemeral server-side state with a short TTL. Forget it
+        # locally once the link is gone, so a reconnect's first working=True is
+        # never suppressed by a timestamp from the old connection. Deliberately
+        # not cleared remotely room-by-room: the map is capped at 2,000 rooms and
+        # even bounded best-effort calls would make shutdown latency scale with
+        # its size. The platform TTL clears them safely.
+        self._working_reported.clear()
+
         self._release_lock()
         # _running is already cleared by _mark_disconnected() at the top.
         logger.info("[band] Disconnected")
@@ -1307,6 +1315,9 @@ class BandAdapter(BasePlatformAdapter):
         if etype in ("room_removed", "room_deleted"):
             room_id = getattr(event, "room_id", None)
             if room_id:
+                # The room is no longer addressable, so its ephemeral activity
+                # state cannot be retried and must not survive a later re-join.
+                self._working_reported.pop(room_id, None)
                 await self._link.unsubscribe_room(room_id)
                 self._participants_cache.pop(room_id, None)
                 self._last_human_sender.pop(room_id, None)

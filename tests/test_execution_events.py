@@ -8,12 +8,15 @@ they never re-enter the agent's own context.
 
 from __future__ import annotations
 
+import asyncio
 import ast
+import concurrent.futures
 import inspect
 import json
 import logging
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -59,8 +62,19 @@ def _make_adapter(*, rooms=(ROOM,), session_id=SESSION):
         # event was posted has to opt in. TestExecutionScope overrides this to
         # exercise the gate itself.
         _execution_scope="all",
+        _execution_pending=set(),
+        _execution_pending_lock=threading.Lock(),
+        _execution_pending_max=64,
+        _execution_accepting=True,
     )
     return adapter
+
+
+def _done_future():
+    """An already-completed future, so the done-callback fires synchronously."""
+    fut = concurrent.futures.Future()
+    fut.set_result(True)
+    return fut
 
 
 def _sent_event(adapter):
@@ -466,6 +480,113 @@ class TestFailuresAreSwallowed:
         monkeypatch.setattr(ee, "_live_adapter", lambda: adapter)
         ee._schedule(ee._TOOL_CALL, SESSION, {ee._K_NAME: "terminal"})
         adapter._link.rest.agent_api_events.create_agent_chat_event.assert_not_called()
+
+    def test_scheduler_retains_future_until_done(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._link_loop = SimpleNamespace(is_running=lambda: True)
+        future = concurrent.futures.Future()
+        monkeypatch.setattr(ee, "_live_adapter", lambda: adapter)
+
+        def _submit(coroutine, loop):
+            coroutine.close()
+            return future
+
+        monkeypatch.setattr(
+            ee.asyncio, "run_coroutine_threadsafe", _submit
+        )
+
+        ee._schedule(ee._TOOL_CALL, SESSION, {ee._K_NAME: "terminal"})
+        assert adapter._execution_pending == {future}
+        future.set_result(True)
+        assert adapter._execution_pending == set()
+
+    def test_scheduler_drops_at_the_pending_cap(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._link_loop = SimpleNamespace(is_running=lambda: True)
+        adapter._execution_pending_max = 1
+        adapter._execution_pending.add(concurrent.futures.Future())
+        submit = MagicMock()
+        monkeypatch.setattr(ee, "_live_adapter", lambda: adapter)
+        monkeypatch.setattr(ee.asyncio, "run_coroutine_threadsafe", submit)
+
+        ee._schedule(ee._TOOL_CALL, SESSION, {ee._K_NAME: "terminal"})
+        submit.assert_not_called()
+
+    def test_submission_failure_closes_the_coroutine(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._link_loop = SimpleNamespace(is_running=lambda: True)
+        created = []
+
+        async def _pending():
+            await asyncio.sleep(0)
+
+        def _fake_emit(*args, **kwargs):
+            coroutine = _pending()
+            created.append(coroutine)
+            return coroutine
+
+        monkeypatch.setattr(ee, "_live_adapter", lambda: adapter)
+        monkeypatch.setattr(ee, "emit_event", _fake_emit)
+        monkeypatch.setattr(
+            ee.asyncio,
+            "run_coroutine_threadsafe",
+            MagicMock(side_effect=RuntimeError("loop closed")),
+        )
+
+        ee._schedule(ee._TOOL_CALL, SESSION, {ee._K_NAME: "terminal"})
+        assert created[0].cr_frame is None
+
+    async def test_pending_emissions_are_cancelled_and_drained(self):
+        adapter = _make_adapter()
+        first = concurrent.futures.Future()
+        second = concurrent.futures.Future()
+        adapter._execution_pending.update({first, second})
+
+        await ee.cancel_pending_emissions(adapter)
+
+        assert adapter._execution_accepting is False
+        assert first.cancelled() and second.cancelled()
+        assert adapter._execution_pending == set()
+
+    def test_scheduler_off_scope_returns_before_building_anything(self, monkeypatch):
+        """The default path must cost nothing, and must not swallow "hub"."""
+        adapter = _make_adapter()
+        adapter._execution_scope = "off"
+        monkeypatch.setattr(ee, "_live_adapter", lambda: adapter)
+        submitted = []
+        monkeypatch.setattr(
+            asyncio, "run_coroutine_threadsafe",
+            lambda *a, **k: submitted.append(a) or MagicMock(),
+        )
+        ee._schedule(ee._TOOL_CALL, SESSION, {ee._K_NAME: "terminal"})
+        assert submitted == []
+        assert adapter._execution_pending == set()
+
+    def test_scheduler_hub_scope_is_not_rejected_before_the_room_is_known(
+        self, monkeypatch
+    ):
+        """The early-out keys on scope == "off" only.
+
+        ``_scope_allows`` needs a room id, and the room is not resolved until
+        ``emit_event`` runs, so consulting it in ``_schedule`` would reject every
+        "hub" event outright — the scope would silently behave as "off".
+        """
+        adapter = _make_adapter()
+        adapter._execution_scope = "hub"
+        monkeypatch.setattr(ee, "_live_adapter", lambda: adapter)
+        submitted = []
+        monkeypatch.setattr(
+            asyncio, "run_coroutine_threadsafe",
+            lambda coro, loop: submitted.append(coro) or _done_future(),
+        )
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        adapter._link_loop = loop
+
+        ee._schedule(ee._TOOL_CALL, SESSION, {ee._K_NAME: "terminal"})
+
+        assert len(submitted) == 1, "hub-scoped event never reached submission"
+        submitted[0].close()
 
 
 # ---------------------------------------------------------------------------

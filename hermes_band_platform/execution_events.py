@@ -73,6 +73,7 @@ redactor is the one thing holding raw payload at the moment it raises.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 from typing import Any, Dict, Optional
@@ -605,13 +606,21 @@ def _schedule(message_type: str, session_id: str, payload: Dict[str, Any]) -> No
 
     The plugin hooks are synchronous and fire on the agent's tool-execution
     thread, while the REST client is bound to the loop ``connect()`` ran on —
-    the same cross-loop problem ``BandAdapter.send`` solves. Fire-and-forget: we
-    never wait on the future, so a slow or failing event cannot stall the tool.
+    the same cross-loop problem ``BandAdapter.send`` solves. Submissions are
+    retained in the adapter's bounded pending set and never waited on here.
     """
+    coroutine = None
     try:
         adapter = _live_adapter()
         if adapter is None:
             # _live_adapter has already logged why.
+            return
+        if str(getattr(adapter, "_execution_scope", "off") or "off").lower() == "off":
+            # "off" is the default, so this is the common path: refuse here rather
+            # than build a coroutine and a future for every tool call only for
+            # emit_event to decline it. Deliberately NOT _scope_allows() — that
+            # takes a room id, and the room is not known until emit_event has
+            # resolved the session, so asking it here would reject "hub" outright.
             return
         loop = getattr(adapter, "_link_loop", None)
         if loop is None or not loop.is_running():
@@ -620,21 +629,32 @@ def _schedule(message_type: str, session_id: str, payload: Dict[str, Any]) -> No
                 message_type,
             )
             return
-        asyncio.run_coroutine_threadsafe(
-            emit_event(adapter, message_type, session_id, payload), loop
+        pending = adapter._execution_pending
+        lock = adapter._execution_pending_lock
+        with lock:
+            if not adapter._execution_accepting:
+                return
+            if len(pending) >= adapter._execution_pending_max:
+                logger.warning(
+                    "[band] Dropping %s event — pending emission cap (%d) reached",
+                    message_type,
+                    adapter._execution_pending_max,
+                )
+                return
+            coroutine = emit_event(adapter, message_type, session_id, payload)
+            try:
+                future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+            except Exception:
+                coroutine.close()
+                coroutine = None
+                raise
+            pending.add(future)
+        future.add_done_callback(
+            lambda done: _emission_done(adapter, done, message_type)
         )
     except Exception as e:
         logger.debug("[band] execution event (%s) not scheduled: %s", message_type, e)
 
-
-# ---------------------------------------------------------------------------
-# Plugin hook callbacks
-#
-# ``invoke_hook`` calls these with keyword arguments only, and always adds
-# ``telemetry_schema_version`` — hence ``**_kw``. Both are pure observers: they
-# return None, so ``_get_pre_tool_call_directive_details`` never reads a
-# block/approve directive out of them.
-# ---------------------------------------------------------------------------
 
 def on_pre_tool_call(
     *,
@@ -713,7 +733,55 @@ def register_hooks(ctx) -> None:
         )
 
 
+def _emission_done(adapter: Any, future: Any, message_type: str) -> None:
+    """Release one retained submission and consume any unexpected exception."""
+    try:
+        with adapter._execution_pending_lock:
+            adapter._execution_pending.discard(future)
+        future.result()
+    except concurrent.futures.CancelledError:
+        logger.debug("[band] Pending %s event cancelled", message_type)
+    except Exception as e:
+        # emit_event is itself best-effort, but consume/log a future exception
+        # if a later regression lets one escape. Type-only keeps this callback
+        # fail-closed even if that future failed before payload redaction.
+        logger.warning(
+            "[band] Pending %s event failed (%s)", message_type, type(e).__name__
+        )
+
+
+async def cancel_pending_emissions(adapter: Any) -> None:
+    """Stop submissions and cancel/drain retained futures without waiting on I/O."""
+    adapter._execution_accepting = False
+    lock = getattr(adapter, "_execution_pending_lock", None)
+    pending = getattr(adapter, "_execution_pending", None)
+    if lock is None or pending is None:
+        return
+    with lock:
+        futures = list(pending)
+    for future in futures:
+        future.cancel()
+    if futures:
+        # Cancellation is queued onto the link loop. Yield once when disconnect
+        # runs there so coroutine finally blocks can execute; never wait for a
+        # slow REST operation or make shutdown depend on network progress.
+        await asyncio.sleep(0)
+    with lock:
+        pending.difference_update(futures)
+
+
+# ---------------------------------------------------------------------------
+# Plugin hook callbacks
+#
+# ``invoke_hook`` calls these with keyword arguments only, and always adds
+# ``telemetry_schema_version`` — hence ``**_kw``. Both are pure observers: they
+# return None, so ``_get_pre_tool_call_directive_details`` never reads a
+# block/approve directive out of them.
+# ---------------------------------------------------------------------------
+
+
 __all__ = [
+    "cancel_pending_emissions",
     "emit_event",
     "on_post_tool_call",
     "on_pre_tool_call",

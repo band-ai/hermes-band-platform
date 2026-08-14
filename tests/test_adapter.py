@@ -6,6 +6,7 @@ BEFORE this module imports the adapter — so the adapter's top-level
 """
 
 import time
+import concurrent.futures
 import asyncio
 import logging
 import sys
@@ -2638,6 +2639,21 @@ class TestConnectDisconnect:
         adapter._link = new_link
         await adapter.send_typing("room-1")
         assert new_link.calls == [("room-1", True)]
+    async def test_disconnect_cancels_pending_execution_emissions(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        pending = concurrent.futures.Future()
+        adapter._execution_pending.add(pending)
+        adapter._execution_accepting = True
+
+        fake_link = MagicMock()
+        fake_link.disconnect = AsyncMock()
+        adapter._link = fake_link
+
+        await adapter.disconnect()
+
+        assert pending.cancelled()
+        assert adapter._execution_pending == set()
+        assert adapter._execution_accepting is False
 
 
 # ---------------------------------------------------------------------------

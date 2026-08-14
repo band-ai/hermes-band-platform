@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.2.0](https://github.com/band-ai/hermes-band-platform/compare/v0.1.0...v0.2.0) (2026-08-14)
+
+
+### Features
+
+* **adapter:** declare code-block and native-chunking capabilities ([fcc4708](https://github.com/band-ai/hermes-band-platform/commit/fcc470849a6ebde8aa70420950b3d9e27503ea8f))
+* **adapter:** declare code-block and native-chunking capabilities ([ac16d93](https://github.com/band-ai/hermes-band-platform/commit/ac16d931ed3186e328f354d1227ae564a6437174))
+* **adapter:** emit error events when a turn fails ([1c1ede7](https://github.com/band-ai/hermes-band-platform/commit/1c1ede7e96b7bbba2b526b92d984e2c98b10c9b0))
+* **adapter:** emit error events when a turn fails ([45674bc](https://github.com/band-ai/hermes-band-platform/commit/45674bc5f54e3b6925c037fe3b68ab88d531a96f))
+* **adapter:** emit per-turn usage events ([1edecd4](https://github.com/band-ai/hermes-band-platform/commit/1edecd4af3fb564283b83ad35d722ef625204e15))
+* **adapter:** emit per-turn usage events ([f063c8c](https://github.com/band-ai/hermes-band-platform/commit/f063c8c0771faa4bba15b0da5340a2ca8149a181))
+* **adapter:** emit tool-call and tool-result execution events ([d5189ba](https://github.com/band-ai/hermes-band-platform/commit/d5189baecbe344adb2a29861427776f31c1bba6a))
+* **adapter:** emit tool-call and tool-result execution events ([a509164](https://github.com/band-ai/hermes-band-platform/commit/a509164799f38719ffa0beb0ad927012f77a9bb6))
+* **adapter:** gate execution events behind BAND_EMIT_EXECUTION ([8ad389b](https://github.com/band-ai/hermes-band-platform/commit/8ad389b9c5db55867ba7c8074bb9f55e97e42343))
+* **adapter:** log send-path outcomes and failures ([ff831b3](https://github.com/band-ai/hermes-band-platform/commit/ff831b3574c4bc8d5bf6a5256ee39e5fe3c9d19f))
+* **adapter:** log working-indicator outcomes ([f6b5966](https://github.com/band-ai/hermes-band-platform/commit/f6b59665ee44854e1cbce56350ebd9907d28bd00))
+* **adapter:** register a standalone_sender_fn for out-of-process delivery ([f68b9e3](https://github.com/band-ai/hermes-band-platform/commit/f68b9e388822ec95599eca8a3a91601274425d31))
+* **adapter:** register a standalone_sender_fn for out-of-process delivery ([c35c56a](https://github.com/band-ai/hermes-band-platform/commit/c35c56a618809f3091f71b81fff1cac1ddc52261))
+* **adapter:** report working state to Band via the activity API ([391f35c](https://github.com/band-ai/hermes-band-platform/commit/391f35cf1eb7dfc0243d50417aaa7356ac31ba93))
+* **adapter:** report working state to Band via the activity API ([77fa886](https://github.com/band-ai/hermes-band-platform/commit/77fa8863a95825a3b849e93b4fe6718d5e2ba7a1))
+* **error_events:** log emission outcomes and failures ([e08b460](https://github.com/band-ai/hermes-band-platform/commit/e08b4603094e43b6c98fb00c3a39234c3bd959ed))
+* **events:** gate execution events behind BAND_EMIT_EXECUTION ([0d6645d](https://github.com/band-ai/hermes-band-platform/commit/0d6645de83028f10a3c97ad9821270af2e002d9f))
+* **execution_events:** log emission outcomes and failures ([ce1bfe5](https://github.com/band-ai/hermes-band-platform/commit/ce1bfe5d175e424f28749a8208a385a2298eebe0))
+* **usage_events:** log emission outcomes and failures ([30334a8](https://github.com/band-ai/hermes-band-platform/commit/30334a8fef3a48fd5419338947dde8aa32d1f6c8))
+
+
+### Bug Fixes
+
+* **adapter:** bound and drain in-flight execution-event submissions ([d78c3d9](https://github.com/band-ai/hermes-band-platform/commit/d78c3d98a8ff812d2f96c327be34d443ef853edd))
+* **adapter:** bound and drain in-flight execution-event submissions ([d970e18](https://github.com/band-ai/hermes-band-platform/commit/d970e1850dd2ff52cf08c3939c0c24ea6d9c75f3))
+* **adapter:** bound execution-event payloads instead of cutting their JSON ([34b5fe4](https://github.com/band-ai/hermes-band-platform/commit/34b5fe4ec9de0b64e725e1bb81df566035f0340a))
+* **adapter:** close the standalone sender's HTTP client ([1ceea76](https://github.com/band-ai/hermes-band-platform/commit/1ceea76fec05f3081611540c567bc2b19e0ceba9))
+* **adapter:** close the standalone sender's HTTP client ([e1bf6b6](https://github.com/band-ai/hermes-band-platform/commit/e1bf6b65a407e84665a45d12e7508602b63dca19))
+* **adapter:** default usage emission to off until a reader exists ([4b024d2](https://github.com/band-ai/hermes-band-platform/commit/4b024d24f8011963ef2f8b6582a3b9ac31e8fc6f))
+* **adapter:** emit usage for turns that never complete ([80ab7c2](https://github.com/band-ai/hermes-band-platform/commit/80ab7c26dbb92b0b3ae30f6b41639d41d5d0f57d))
+* **adapter:** forget working-indicator state when the link or room goes away ([333f28a](https://github.com/band-ai/hermes-band-platform/commit/333f28aceae3d871466087d4d7a5508c01a3d91b))
+* **adapter:** forget working-indicator state when the link or room goes away ([89b0c14](https://github.com/band-ai/hermes-band-platform/commit/89b0c14eabd73ed3c12f1fcfb37a64ea997244cf))
+* **adapter:** stop double-posting by correcting the platform_hint ([b6e4749](https://github.com/band-ai/hermes-band-platform/commit/b6e47497016b102d677646f1bc7eeb5305fb9f1a))
+* **adapter:** stop double-posting by correcting the platform_hint ([a3bdffa](https://github.com/band-ai/hermes-band-platform/commit/a3bdffa349755bea1a0dbc2206abc4d5e60d6bd5))
+* **events:** bound execution-event payloads field-by-field, not by cutting JSON ([14ccebb](https://github.com/band-ai/hermes-band-platform/commit/14ccebb738acefb497e88cd0303510ecfaaf2035))
+* **events:** isolate delivery failures by room ([a1a5669](https://github.com/band-ai/hermes-band-platform/commit/a1a56696c2b36268824db05ca05e829b1cb55e5a))
+* **skill:** align Band reply guidance ([611a31b](https://github.com/band-ai/hermes-band-platform/commit/611a31bf7cdd7ee0b2f09b288bb1314287e45ce7))
+* **tools:** decline the live link's REST client on a cross-loop call ([a97177d](https://github.com/band-ai/hermes-band-platform/commit/a97177dd44b9f3952586d021a7a13b2dfedd4779))
+* **tools:** decline the live link's REST client on a cross-loop call ([314dc70](https://github.com/band-ai/hermes-band-platform/commit/314dc7046d142f07200071b0e6fd2af5813535b3))
+* **usage:** emit usage for turns that never complete ([8a97ee9](https://github.com/band-ai/hermes-band-platform/commit/8a97ee982abbefea0a0e4e35f4b614e894c95276))
+
+
+### Performance Improvements
+
+* **adapter:** bound the failure reason before redacting it ([3b95695](https://github.com/band-ai/hermes-band-platform/commit/3b95695cc3765a8e624398517fd2b8209ed647f4))
+
 ## [0.1.0](https://github.com/band-ai/hermes-band-platform/compare/v0.0.1...v0.1.0) (2026-07-28)
 
 

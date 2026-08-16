@@ -1295,4 +1295,4 @@ async def test_verify_roundtrip_mentions_match_the_adapter(monkeypatch):
     assert [(m.id, m.handle, m.name) for m in inlined] == [
         (m.id, m.handle, m.name) for m in expected
     ]
-    assert [m.id for m in inlined] == ["u1"]  # not the agent, not self, not id-less
+    assert [m.id for m in inlined] == ["u1", "bot"]  # excludes only self and id-less peers

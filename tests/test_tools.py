@@ -771,7 +771,7 @@ class TestMentionItems:
         )
         assert self._ids(items) == ["human"]
 
-    def test_fallback_excludes_agent_and_other_agents(self):
+    def test_fallback_excludes_only_self(self):
         from hermes_band_platform.adapter import _mention_items
 
         parts = [
@@ -780,7 +780,7 @@ class TestMentionItems:
             {"id": "h1", "handle": "alice", "type": "User"},     # human
         ]
         items = _mention_items(parts, agent_id="me")
-        assert self._ids(items) == ["h1"]
+        assert self._ids(items) == ["a2", "h1"]
 
 
 class TestBandToolsTuple:

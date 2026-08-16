@@ -101,9 +101,10 @@ async def _rest_client() -> Any:
 
 
 async def _mentions_for(rest: Any, room_id: str) -> list[Any]:
-    """Every non-agent participant in the room, as mention items.
+    """Every participant except this agent, as mention items.
 
-    Band requires ≥1 mention per send. This is ``tools._mentions_for(…, None)``'s
+    Band requires ≥1 mention per send. Peer agents are valid recipients; loop
+    prevention is a separate turn policy.
     fallback branch — the only one reachable without explicit ids — inlined:
     ``_list_participants`` + ``adapter._mention_items``'s no-preferred path, with
     the agent's own id excluded so it never @mentions itself. Pinned by
@@ -118,7 +119,7 @@ async def _mentions_for(rest: Any, room_id: str) -> list[Any]:
     items: list[Any] = []
     for peer in getattr(resp, "data", None) or []:
         pid = getattr(peer, "id", None)
-        if not pid or pid == agent_id or (getattr(peer, "type", None) or "") == "Agent":
+        if not pid or pid == agent_id:
             continue
         items.append(
             ChatMessageRequestMentionsItem(

@@ -24,6 +24,13 @@ def _simulate_server(content, mention_items):
 
     Deliberately as blunt as the original: ``in`` and ``str.replace``, no
     boundaries, applied per mention in order.
+
+    One clause of the original is omitted: a mention of kind ``reference`` skips
+    the final prepend (references are narrative-only, so the server will not
+    inject a token the author did not write). It still takes the in-place
+    substitution branches above it, which is the part these tests exercise, and
+    the adapter never sets ``kind`` — every mention it builds is a delivery
+    mention. Model it here if that ever changes.
     """
     for item in mention_items:
         marker = f"@[[{item.id}]]"

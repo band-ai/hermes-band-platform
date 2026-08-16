@@ -726,7 +726,13 @@ class BandAdapter(BasePlatformAdapter):
 
         # ── Per-room caches ──
         self._participants_cache: Dict[str, List[Dict[str, Any]]] = {}  # id/name/handle/type
-        self._last_human_sender: Dict[str, Dict[str, Any]] = {}  # for reply @mentions
+        self._last_human_sender: Dict[str, Dict[str, Any]] = {}  # reply fallback
+        # Whoever last addressed the agent in a room, human or agent. This is
+        # the reply recipient; _last_human_sender is only the fallback. Kept
+        # separate rather than merged because the two answer different
+        # questions and the human one still drives the standalone sender's
+        # documented behaviour.
+        self._last_sender: Dict[str, Dict[str, Any]] = {}
 
         # ── Dedup backstops ──
         # _sent_ids: our own posts, to drop the platform's echo. _seen_inbound_ids:
@@ -1379,6 +1385,7 @@ class BandAdapter(BasePlatformAdapter):
                 await self._link.unsubscribe_room(room_id)
                 self._participants_cache.pop(room_id, None)
                 self._last_human_sender.pop(room_id, None)
+                self._last_sender.pop(room_id, None)
                 self._reset_room_session(room_id)
                 # Drop from the active set (so _known_rooms and the catch-up
                 # drain don't grow/iterate without bound) but remember the room
@@ -1492,10 +1499,20 @@ class BandAdapter(BasePlatformAdapter):
             )
             return False
 
-        # Participants drive @mention resolution + last-human-sender. chat_type is
-        # the constant _SESSION_CHAT_TYPE, so a roster change can never re-key the
-        # room's single shared session.
+        # Participants drive @mention resolution + last-sender tracking. chat_type
+        # is the constant _SESSION_CHAT_TYPE, so a roster change can never re-key
+        # the room's single shared session.
         participants = await self._get_participants(inb.room_id)
+        if inb.sender_id:
+            # The reply recipient, whoever it was. Self-sent messages never reach
+            # here (filtered at the top), so this cannot make the agent its own
+            # preferred recipient.
+            self._last_sender[inb.room_id] = {
+                "id": inb.sender_id,
+                "handle": self._handle_for_participant(participants, inb.sender_id),
+                "name": inb.sender_name,
+            }
+            self._cap_cache(self._last_sender, _ROOM_CACHE_MAX)
         if inb.sender_id and inb.sender_type != "Agent":
             self._last_human_sender[inb.room_id] = {
                 "id": inb.sender_id,
@@ -2569,11 +2586,20 @@ class BandAdapter(BasePlatformAdapter):
     async def _build_mentions(self, room_id: str) -> List[Any]:
         """Build the mandatory mention list for a send.
 
-        Prefer the cached last-human-sender; otherwise mention every non-agent
-        participant in the room. Shares mention semantics with the
-        ``band_send_message`` tool via :func:`_mention_items`.
+        Prefer whoever last addressed the agent in this room, human or agent —
+        a reply belongs to the participant who asked for it. Fall back to the
+        last *human* sender (a reconnect can leave that cache populated when
+        the newer one is not), then to every participant except this agent.
+        Shares mention semantics with the ``band_send_message`` tool via
+        :func:`_mention_items`.
+
+        Preferring only the last human is what made peer-to-peer replies
+        undeliverable: Band is mention-gated, so a reply that mentions a
+        bystander instead of the asker is not merely mislabelled — the agent
+        that asked never receives it, and nothing reports a failure, because
+        from Band's point of view the send succeeded.
         """
-        last = self._last_human_sender.get(room_id)
+        last = self._last_sender.get(room_id) or self._last_human_sender.get(room_id)
         if last and last.get("id"):
             return _mention_items([], agent_id=self._agent_id, preferred=last)
         participants = await self._get_participants(room_id)

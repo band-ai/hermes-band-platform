@@ -248,6 +248,28 @@ def _derive_urls(base_url: str) -> tuple[str, str]:
     return ws_url, rest_url
 
 
+def _is_delivery_mention(mention: Any) -> bool:
+    """Mirror of the platform's ``delivery_mention?/1``.
+
+    ``chat.ex`` defines ``@valid_mention_kinds ~w(mention reference)`` and
+    ``mention_kind/1`` as ``Map.get(m, "kind") || "mention"`` — so an entry with
+    no ``kind`` (legacy rows are stored as bare ids) is a delivery mention, and
+    only an explicit ``reference`` is not. Defaulting the same way is what keeps
+    this from silently muting older messages.
+
+    Accepts the dict shape (caught-up ``PlatformMessage`` metadata) and the
+    object shape (live SDK payload) alike.
+    """
+    if isinstance(mention, dict):
+        kind = mention.get("kind")
+    else:
+        kind = getattr(mention, "kind", None)
+    if kind is None:
+        return True
+    normalized = str(kind).strip().lower()
+    return normalized in ("", "mention")
+
+
 def _substitutes_safely(content: str, token: str) -> bool:
     """Would the platform's ``@token`` substitution stay inside its own word?
 
@@ -2229,11 +2251,24 @@ class BandAdapter(BasePlatformAdapter):
     # ── Inbound helpers ───────────────────────────────────────────────────
 
     def _is_agent_mentioned(self, payload: Any) -> bool:
-        """Return True if the agent id/handle is in payload.metadata.mentions.
+        """Return True if a *delivery* mention of this agent is in the metadata.
 
         Handles both the live SDK payload (metadata + mentions as objects) and a
         caught-up ``PlatformMessage`` whose ``metadata`` is a plain dict with
         ``mentions`` as a list of dicts.
+
+        Only delivery-kind mentions count. The platform distinguishes
+        ``mention`` from ``reference`` (``chat.ex`` ``@valid_mention_kinds``),
+        and every path that decides whether an agent should *act* — the
+        ``/messages/next`` pull, live delivery, and the internal agent flow —
+        gates on ``delivery_mention?/1``, i.e. ``kind == "mention"``. A
+        reference is narrative: "as @other-agent noted earlier" names someone
+        without asking anything of them.
+
+        Judging that here matters because this is also what the gateway uses
+        when it re-derives addressedness for itself rather than being handed it
+        — backlog enumeration and rehydration — where a kind-blind check would
+        wake a turn the server deliberately never offered.
         """
         metadata = getattr(payload, "metadata", None)
         if isinstance(metadata, dict):
@@ -2247,6 +2282,8 @@ class BandAdapter(BasePlatformAdapter):
             else:
                 mid = getattr(m, "id", None)
                 mhandle = getattr(m, "handle", None)
+            if not _is_delivery_mention(m):
+                continue
             if mid and mid == self._agent_id:
                 return True
             if mhandle and self._handle and mhandle == self._handle:

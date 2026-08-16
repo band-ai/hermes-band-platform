@@ -333,6 +333,13 @@ the default is the private one and widening it is a deliberate act.
   stream deliver only mention text), so the adapter mirrors that contract — no hub bypass, no
   active-session stickiness. The one exception is a validated owner slash command, which reaches
   the agent in any room without a mention.
+- **Mention kinds**: only a *delivery* mention wakes the agent. The platform distinguishes
+  `mention` from `reference` (`chat.ex` `@valid_mention_kinds`), and every server path that
+  decides whether an agent should act gates on `delivery_mention?/1`. A reference is narrative —
+  "as @other-agent noted earlier" names someone without asking anything of them. A mention with
+  no `kind` is a delivery mention, matching the platform's own default, so older messages are
+  never silently muted. This matters most where the adapter re-derives addressedness itself
+  (backlog enumeration, rehydration) rather than being handed it by `/next`.
 - **Self-filter**: the adapter skips its own agent messages by sender, with a sent-message-id
   backstop in addition to the SDK's own filtering.
 - **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions

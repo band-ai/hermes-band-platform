@@ -308,6 +308,7 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
 | `BAND_HUB_FAILOVER_MAX_PER_CONNECT` | Backstop cap on hub failovers per gateway connection (default `5`). |
 | `BAND_EMIT_USAGE` | Startup-only usage-event scope: `off` (default), `all`, or `hub`. `true`/`1`/`yes`/`on` alias `all`; `false`/`0`/`no` alias `off`; invalid values fail closed to `off`. Restart the gateway after changing it. |
 | `BAND_EMIT_EXECUTION` | Publish redacted tool-call and tool-result events: `off` (default), `hub` (only turns originating in the private owner hub), or `all` (every Band room). `all` is an explicit opt-in because room participants can see tool args/results. Invalid values fail closed to `off`. |
+| `BAND_AGENT_CHAIN_MAX` | Consecutive peer-agent turns allowed in one room before the chain is cut (default `6`). `0` refuses peer-agent turns outright; a negative value is explicitly unbounded. Read once at startup. See [Agent-to-agent chains](#agent-to-agent-chains). |
 
 Usage emission defaults to `off` while the SDK carries usage in task events and
 Band has no consumer for their structured metadata. `all` posts the aggregate in
@@ -320,6 +321,26 @@ Execution events are **off by default**. `hub` shows redacted tool calls and res
 for turns started in the private owner hub; `all` publishes them in every originating Band
 room, where each participant can read them. A Band event cannot be deleted once written, so
 the default is the private one and widening it is a deliberate act.
+
+### Agent-to-agent chains
+
+An automatic reply must @mention someone — Band rejects a mention-less message — and the
+fallback recipient list is every participant except this agent, peer agents included. Two
+agents alone in a room will therefore answer each other indefinitely, each reply costing a
+full model turn. `BAND_AGENT_CHAIN_MAX` bounds that.
+
+The budget counts **consecutive peer-agent turns per room**, and is charged only for messages
+that would actually run a turn. Any message from a human resets it, because the hazard is
+specifically an exchange nobody is watching. At the cap the adapter stops forwarding agent
+turns in that room and posts one `error` event saying so — an event rather than a message,
+since events are exempt from the mention requirement and an agent-only room at the cap is
+exactly where a mention-less message would be rejected.
+
+Counting per room rather than per pair of agents is deliberate: a three-agent cycle
+A → B → C → A never repeats a pair, so a per-pair budget would not bound it.
+
+`0` refuses peer-agent turns outright. A negative value opts out of the bound entirely — the
+room is then limited only by Band and by your model budget.
 
 ---
 
@@ -336,7 +357,8 @@ the default is the private one and widening it is a deliberate act.
 - **Self-filter**: the adapter skips its own agent messages by sender, with a sent-message-id
   backstop in addition to the SDK's own filtering.
 - **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions the
-  room's last human sender (falling back to all non-agent participants).
+  room's last human sender, falling back to every participant except this agent — peer agents
+  included, bounded by [`BAND_AGENT_CHAIN_MAX`](#agent-to-agent-chains).
 - **Outbound without a gateway**: the plugin also registers a `standalone_sender_fn`, so a
   `deliver: band` cron job delivers even when it fires in a process that holds no gateway runner —
   a forced `hermes cron run <id>` is the everyday case. That path has no link and no caches, so it

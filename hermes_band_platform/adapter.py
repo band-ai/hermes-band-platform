@@ -60,7 +60,11 @@ from gateway.session import SessionSource, build_session_key  # noqa: E402
 
 from . import _band_libs  # noqa: E402  (stdlib-only shim; safe at module top)
 from . import usage_events  # noqa: E402  (carries its own SDK guard)
-from .error_events import note_send_failure, report_turn_failure  # noqa: E402
+from .error_events import (  # noqa: E402
+    emit_error_event,
+    note_send_failure,
+    report_turn_failure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +192,24 @@ _HUB_FAILOVER_MAX_PER_CONNECT_DEFAULT = 5
 # clean. "all" is a deliberate opt-in because every participant of an
 # originating room can then read redacted tool args and results.
 _EXECUTION_SCOPES = frozenset({"off", "hub", "all"})
+# Consecutive peer-agent turns allowed in one room before the chain is cut. The
+# automatic reply @mentions peer agents (``_mention_items``' fallback), so two
+# agents left alone will answer each other indefinitely: the bound is what makes
+# that fallback safe. Six is enough for a real hand-off (ask, answer, follow-up,
+# confirm) and short enough that a runaway costs a handful of turns, not a
+# budget. The counter resets whenever a human speaks, so this only ever bounds
+# exchanges nobody is watching.
+_AGENT_CHAIN_MAX_DEFAULT = 6
+# Text of the one notice a capped room receives. It rides an ``error`` event
+# rather than a message because events carry no mentions, and an agent-only room
+# at the cap is precisely where a mention-less message would be rejected.
+_AGENT_CHAIN_CAPPED_HEADLINE = "⚠️ Agent-to-agent exchange stopped."
+_AGENT_CHAIN_CAPPED_DETAIL = (
+    "This room reached {cap} consecutive replies between agents with no human "
+    "message. Further agent turns here are ignored until a person writes in the "
+    "room. Raise BAND_AGENT_CHAIN_MAX to allow longer chains."
+)
+_ERROR_CODE_AGENT_CHAIN_CAPPED = "agent_chain_capped"
 # Execution-event REST submissions are created from synchronous Hermes hooks, so
 # nothing on the tool path ever awaits them. Keep a small per-adapter backstop so
 # a slow Band endpoint cannot accumulate unbounded coroutine/future state during
@@ -246,6 +268,32 @@ def _derive_urls(base_url: str) -> tuple[str, str]:
     ws_url = f"wss://{host}/api/v1/socket/websocket"
     rest_url = f"https://{host}"
     return ws_url, rest_url
+
+
+def _read_agent_chain_max() -> int:
+    """Parse ``BAND_AGENT_CHAIN_MAX`` — a budget of turns, not of mentions.
+
+    Greater than zero caps consecutive peer-agent turns per room; ``0`` refuses
+    peer-agent turns outright; a negative value opts out of the bound entirely.
+
+    Unlike ``BAND_EMIT_EXECUTION`` an unparseable value falls back to the
+    default rather than failing closed: both extremes here are legitimate
+    policies, so inferring either one from a typo would be worse than the
+    documented middle.
+    """
+    raw = (os.getenv("BAND_AGENT_CHAIN_MAX") or "").strip()
+    if not raw:
+        return _AGENT_CHAIN_MAX_DEFAULT
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(
+            "[band] Invalid BAND_AGENT_CHAIN_MAX=%r; using the default of %d "
+            "consecutive peer-agent turns per room",
+            raw,
+            _AGENT_CHAIN_MAX_DEFAULT,
+        )
+        return _AGENT_CHAIN_MAX_DEFAULT
 
 
 def strip_attached_handles(content: str, mention_items: List[Any]) -> str:
@@ -728,6 +776,14 @@ class BandAdapter(BasePlatformAdapter):
         self._participants_cache: Dict[str, List[Dict[str, Any]]] = {}  # id/name/handle/type
         self._last_human_sender: Dict[str, Dict[str, Any]] = {}  # for reply @mentions
 
+        # ── Agent-to-agent chain bound ──
+        # room id → consecutive peer-agent turns since the last human message,
+        # plus the rooms already told they are capped, so the notice is emitted
+        # once per trip rather than once per suppressed message. Both are reset
+        # when a human speaks. See _allow_agent_chain_turn.
+        self._agent_chain: Dict[str, int] = {}
+        self._agent_chain_tripped: set = set()
+
         # ── Dedup backstops ──
         # _sent_ids: our own posts, to drop the platform's echo. _seen_inbound_ids:
         # ids dispatched this lifetime, guarding the live-vs-catch-up race and
@@ -773,6 +829,10 @@ class BandAdapter(BasePlatformAdapter):
                 ", ".join(sorted(_EXECUTION_SCOPES)),
             )
             self._execution_scope = "off"
+        # Read once for the same reason as the execution scope: a bound that
+        # changed mid-run would make a room's transcript impossible to account
+        # for afterwards.
+        self._agent_chain_max: int = _read_agent_chain_max()
         # Futures returned by run_coroutine_threadsafe for execution events. The
         # lock is required because hook callbacks and future callbacks can run on
         # different threads (the agent's tool thread and the link loop's).
@@ -1047,6 +1107,13 @@ class BandAdapter(BasePlatformAdapter):
         # even bounded best-effort calls would make shutdown latency scale with
         # its size. The platform TTL clears them safely.
         self._working_reported.clear()
+
+        # The chain bound counts turns within one conversation. A reconnect is a
+        # discontinuity — rooms may have been rekeyed and backlog is re-offered —
+        # so carrying a count across it would cap a room on the strength of an
+        # exchange from the previous link.
+        self._agent_chain.clear()
+        self._agent_chain_tripped.clear()
 
         self._release_lock()
         # _running is already cleared by _mark_disconnected() at the top.
@@ -1459,6 +1526,59 @@ class BandAdapter(BasePlatformAdapter):
             )
         )
 
+    async def _allow_agent_chain_turn(self, room_id: str) -> bool:
+        """Charge one peer-agent turn against *room_id*'s budget.
+
+        Returns ``True`` while the room is under ``BAND_AGENT_CHAIN_MAX``
+        consecutive peer-agent turns, ``False`` once it is capped. At the moment
+        of capping it posts one ``error`` event: events are exempt from Band's
+        mention requirement, so the notice lands in exactly the agent-only room
+        where a mention-less *message* would be rejected with a 422.
+
+        The room then stays closed until a human writes — that reset lives with
+        the ``_last_human_sender`` update in :meth:`_handle_message_created`,
+        because the same signal drives both.
+
+        Counting per room rather than per ``(room, sender)`` pair is deliberate:
+        a three-agent cycle never repeats a pair, so a per-pair budget would not
+        bound it.
+        """
+        cap = self._agent_chain_max
+        if cap < 0:  # explicitly unbounded
+            return True
+        seen = self._agent_chain.get(room_id, 0)
+        if seen >= cap:
+            if room_id in self._agent_chain_tripped:
+                logger.debug(
+                    "[band] Suppressing peer-agent turn in capped room %s",
+                    _short_id(room_id),
+                )
+            else:
+                self._agent_chain_tripped.add(room_id)
+                logger.warning(
+                    "[band] Agent chain capped in room %s after %d consecutive "
+                    "peer-agent turns; ignoring further agent turns until a human "
+                    "writes (BAND_AGENT_CHAIN_MAX=%d)",
+                    _short_id(room_id),
+                    seen,
+                    cap,
+                )
+                await emit_error_event(
+                    self,
+                    room_id,
+                    _AGENT_CHAIN_CAPPED_HEADLINE
+                    + "\n"
+                    + _AGENT_CHAIN_CAPPED_DETAIL.format(cap=cap),
+                    {
+                        "error_code": _ERROR_CODE_AGENT_CHAIN_CAPPED,
+                        "chain_max": cap,
+                    },
+                )
+            return False
+        self._agent_chain[room_id] = seen + 1
+        self._cap_cache(self._agent_chain, _ROOM_CACHE_MAX)
+        return True
+
     async def _handle_message_created(self, event: Any) -> bool:
         """Normalize an inbound Band message and forward it to the gateway.
 
@@ -1503,6 +1623,11 @@ class BandAdapter(BasePlatformAdapter):
                 "name": inb.sender_name,
             }
             self._cap_cache(self._last_human_sender, _ROOM_CACHE_MAX)
+            # A human in the room is the whole point of the chain bound: their
+            # message is the evidence someone is watching, so the budget refills
+            # and a capped room reopens.
+            self._agent_chain.pop(inb.room_id, None)
+            self._agent_chain_tripped.discard(inb.room_id)
 
         # Owner-command gate: slash commands are owner-only, in any room. Others'
         # command-shaped text is dropped here (one-time notice for humans, silent
@@ -1523,6 +1648,15 @@ class BandAdapter(BasePlatformAdapter):
             logger.debug(
                 "[band] Ignoring un-addressed message in room %s", _short_id(inb.room_id)
             )
+            return False
+
+        # Agent-to-agent chain bound. Charged only here, after every other
+        # filter has passed, so it counts turns the model would actually run —
+        # not messages that were going to be dropped anyway.
+        if inb.sender_type == "Agent" and not await self._allow_agent_chain_turn(
+            inb.room_id
+        ):
+            await self._ack_consumed(inb.room_id, inb.msg_id)
             return False
 
         source = self.build_source(

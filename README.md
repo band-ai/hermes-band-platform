@@ -335,8 +335,15 @@ the default is the private one and widening it is a deliberate act.
   the agent in any room without a mention.
 - **Self-filter**: the adapter skips its own agent messages by sender, with a sent-message-id
   backstop in addition to the SDK's own filtering.
-- **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions the
-  room's last human sender (falling back to all non-agent participants).
+- **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions
+  whoever last addressed the agent in that room, human or agent, falling back to the last
+  human sender and then to every participant except this agent — peer agents included.
+- **Mention rendering**: the server rewrites `@<handle>` in the content into a `@[[uuid]]`
+  marker, or prepends the marker when it finds no matching token. That match is a plain
+  substring with no word boundary, so the adapter withholds a mention's `handle`/`name`
+  whenever leaving it would rewrite the middle of a longer `@token` — mentioning `@ted` must
+  not turn `@tedx` into `@[[uuid]]x`. Withholding costs only placement, since the marker is
+  prepended instead. The content itself is never edited.
 - **Outbound without a gateway**: the plugin also registers a `standalone_sender_fn`, so a
   `deliver: band` cron job delivers even when it fires in a process that holds no gateway runner —
   a forced `hermes cron run <id>` is the everyday case. That path has no link and no caches, so it

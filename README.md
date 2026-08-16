@@ -57,7 +57,7 @@ gateway runs** and paste the key when prompted:
 curl -fsSL https://app.band.ai/add/hermes.sh | bash
 ```
 
-**One run → one @mention → a connected agent.** The snippet registers a Band agent from your
+**One run → one connected agent.** The snippet registers a Band agent from your
 key (**the key never reaches the LLM** — a script reads it, then drops it), installs the `band`
 plugin into the gateway's Python, and hands off to the `add-band` setup skill, which enables the
 plugin, restarts the gateway, bootstraps the hub, and sends you the agent's first message. Then
@@ -279,9 +279,10 @@ grep -E '\[band\] Connected as agent|\[band\] Hub ready: room|✓ band connected
 grep BAND_HUB_ROOM ~/.hermes/.env   # a non-empty UUID = hub created
 ```
 
-Then open the auto-created **"Hermes Agent Hub"** room in Band and **@mention the agent** — Band
-has no DMs, so an un-mentioned message is ignored by design. A reply means you're live. If you see
-`[band] Owner unresolved — hub disabled`, set `BAND_OWNER_ID=<your-uuid>` and restart.
+Then open the auto-created **"Hermes Agent Hub"** room in Band and send a message — Band has no
+DMs, so any message delivered to a room the agent is in reaches it, no @mention needed. A reply
+means you're live. If you see `[band] Owner unresolved — hub disabled`, set
+`BAND_OWNER_ID=<your-uuid>` and restart.
 
 ## Configuration
 
@@ -327,12 +328,11 @@ the default is the private one and widening it is a deliberate act.
 
 ### Behavior
 
-- **Inbound**: subscribes to the agent's rooms and consumes `message_created` events. Band has
-  no DMs — every room, including the hub, is a mention-gated group room, so a message reaches the
-  agent only when it **@mentions** the agent. Band routes by mention (both `/next` and the live
-  stream deliver only mention text), so the adapter mirrors that contract — no hub bypass, no
-  active-session stickiness. The one exception is a validated owner slash command, which reaches
-  the agent in any room without a mention.
+- **Inbound**: subscribes to the agent's rooms (including new `room_added` rooms) and consumes
+  `message_created` events. Band has no DMs — every room, including the hub, is a group room.
+  Delivery is the addressing signal: a message Band routes to the agent is answered, with no
+  second mention-metadata check, so a room the agent was just added to is live immediately.
+  Slash commands stay owner-only; command-shaped text from anyone else is declined.
 - **Self-filter**: the adapter skips its own agent messages by sender, with a sent-message-id
   backstop in addition to the SDK's own filtering.
 - **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions the
@@ -471,9 +471,9 @@ whatever the agent didn't mark `processed` is still owed to it, across any outag
   drains each known room's backlog via `/next` (`get_agent_next_message`), re-picking anything
   stuck `processing` from a prior crash (`get_stale_processing_messages`) first. Each drained
   message flows through the **same** gate/normalize path as a live one.
-- **Dedup.** `/next` and the live WS stream both deliver only @mention text, so they cover the same
-  set. An in-memory `_seen_inbound_ids` guards the narrow window where a message is both
-  live-delivered and in the backlog at reconnect; it is intentionally not persisted.
+- **Dedup.** `/next` and the live WS stream can overlap around reconnect; an in-memory
+  `_seen_inbound_ids` guards the narrow window where a message is both live-delivered and in
+  the backlog. It is intentionally not persisted.
 - **Known edge — coalesced bursts.** The gateway's busy-text debounce merges rapid same-sender
   messages into one turn, keeping only the latest id. Earlier ids in the burst aren't individually
   acked, so a reconnect can re-offer them via `/next`; they re-process and self-heal once the room

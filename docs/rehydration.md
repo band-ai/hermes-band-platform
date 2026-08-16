@@ -34,7 +34,7 @@ Everything lives in `hermes_band_platform/adapter.py`. Inbound flow:
 ```
 message_created ─► _handle_message_created
                      _normalize_inbound        → _Inbound (strip self-mention)
-                     self-filter / dedup / non-text / owner-command / mention gates
+                     self-filter / dedup / non-text / owner-command gate
                      _forward_inbound
                        ├─ command?  → handle_message  (skip seed; may inline-await)
                        └─ cold room (flagged in _rehydrate_rooms)?
@@ -82,10 +82,9 @@ dropping own replies leaves the LLM facing unanswered user turns.)
 **3. History / backlog boundary — seed context, don't re-answer.** Band's
 `get_agent_chat_context` returns *everything*, including messages the agent still owes
 an answer. Seeding those *and* answering them = double-answer. So the seed **excludes**
-the trigger and the unprocessed **mention** backlog (the messages the live + `/next`
-path will answer), while **keeping** un-addressed chatter as context. The exclude-set
-comes from `_actionable_answer_ids` — `list_agent_messages(chat_id)` with no status
-filter returns everything not yet `processed`; we keep the mentions.
+the trigger and the unprocessed backlog (the messages the live + `/next` path will
+answer). The exclude-set comes from `_actionable_answer_ids` — `list_agent_messages(chat_id)`
+with no status filter returns everything not yet `processed`.
 
 **4. Atomic "seed-if-empty", not a lock.** The gateway runs each turn in an **executor
 thread** and persists the transcript *from that thread*, so a concurrent turn-append
@@ -121,9 +120,8 @@ mirror the canonical insert (FTS is trigger-based).
 store can't do an atomic write (no native primitive *and* no usable `_db`); seeding
 errors are swallowed. Either way the caller falls back to the `channel_context` blob
 (`_rehydration_context_blob`) so the message is still delivered with *some* recovered
-context — never blocked.
-
-## Hermes integration & constraints
+context — never blocked. The blob applies the same trigger/backlog exclusion as the
+durable seed, so fallback does not duplicate the active turn.
 
 - **Plugin contract.** Hermes loads the *package* via the `hermes_agent.plugins` entry
   point and calls `register(ctx)`, which hands it `adapter_factory=lambda cfg:

@@ -726,8 +726,8 @@ class TestInboundSelfFilter:
 
     def _make_event(self, sender_id, sender_type, msg_id="msg-001", content="hello",
                     message_type="text", room_id="room-abc", mentioned=True):
-        # Default to mentioning the agent: every Band room is mention-gated, so
-        # the dispatch-mechanics tests need an addressed message to get through.
+        # Default to preserving mention metadata for dispatch-mechanics tests
+        # that do not care whether Band included it.
         mentions = (
             [SimpleNamespace(id="agent-self-id", handle=None)] if mentioned else []
         )
@@ -809,8 +809,10 @@ class TestInboundSelfFilter:
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_group_message_without_mention_is_ignored(self, adapter):
-        # Multi-party room, no mention → ignored (mention is the only gate).
+    async def test_group_message_without_mention_is_dispatched(self, adapter):
+        # Band only delivers room messages the agent should see. The adapter must
+        # not require mention metadata again, because the delivery itself is the
+        # address signal.
         adapter._participants_cache["group-room"] = [
             {"id": "agent-self-id", "type": "Agent", "name": "Bot", "handle": "bot"},
             {"id": "user1", "type": "User", "name": "Alice", "handle": "alice"},
@@ -824,7 +826,7 @@ class TestInboundSelfFilter:
             sender_type="User",
             sender_name="Alice",
             chat_room_id="group-room",
-            metadata=SimpleNamespace(mentions=[]),  # No agent mention
+            metadata=SimpleNamespace(mentions=[]),  # No agent mention metadata
         )
         event = SimpleNamespace(
             type="message_created",
@@ -832,20 +834,17 @@ class TestInboundSelfFilter:
             payload=payload,
         )
         await adapter._handle_message_created(event)
-        adapter.handle_message.assert_not_called()
+        adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_two_participant_room_without_mention_is_ignored(self, adapter):
-        # room-abc is a 2-participant room. Band has no DMs, so it is
-        # mention-gated like any other room — no mention → ignored. Locks the
-        # over-respond bug fix.
+    async def test_two_participant_room_without_mention_is_dispatched(self, adapter):
         event = self._make_event(
             sender_id="human-sender",
             sender_type="User",
             mentioned=False,
         )
         await adapter._handle_message_created(event)
-        adapter.handle_message.assert_not_called()
+        adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_dispatched_source_chat_type_is_constant(self, adapter):
@@ -857,9 +856,7 @@ class TestInboundSelfFilter:
         assert evt.source.chat_type == "group"
 
     @pytest.mark.asyncio
-    async def test_active_session_without_mention_is_ignored(self, adapter):
-        # An active session does NOT bypass the mention gate: the platform routes
-        # by mention, so Hermes mirrors that — no active-session stickiness.
+    async def test_active_session_without_mention_is_dispatched(self, adapter):
         active_key = "agent:main:band:group:room-abc"
         adapter._session_store = _FakeSessionStore(active_keys=[active_key])
         event = self._make_event(
@@ -868,7 +865,7 @@ class TestInboundSelfFilter:
             mentioned=False,
         )
         await adapter._handle_message_created(event)
-        adapter.handle_message.assert_not_called()
+        adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_owner_command_dispatches_without_mention(self, adapter):
@@ -903,6 +900,34 @@ class TestHandleEvent:
         event = SimpleNamespace(type="room_added", room_id="new-room-id")
         await adapter._handle_event(event)
         adapter._link.subscribe_room.assert_called_once_with("new-room-id")
+
+    @pytest.mark.asyncio
+    async def test_added_room_message_without_mention_is_dispatched(self, adapter):
+        event = SimpleNamespace(type="room_added", room_id="new-room-id")
+        await adapter._handle_event(event)
+
+        adapter.handle_message = AsyncMock()
+        adapter._agent_id = "agent-self-id"
+        adapter._participants_cache["new-room-id"] = [
+            {"id": "agent-self-id", "type": "Agent", "name": "Bot", "handle": "bot"},
+            {"id": "human-1", "type": "User", "name": "Alice", "handle": "alice"},
+        ]
+        payload = SimpleNamespace(
+            id="msg-new-room",
+            content="hello in the new room",
+            message_type="text",
+            sender_id="human-1",
+            sender_type="User",
+            sender_name="Alice",
+            chat_room_id="new-room-id",
+            metadata=SimpleNamespace(mentions=[]),
+        )
+
+        await adapter._handle_message_created(
+            SimpleNamespace(type="message_created", room_id="new-room-id", payload=payload)
+        )
+
+        adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_room_removed_unsubscribes(self, adapter):
@@ -1253,8 +1278,8 @@ class TestRehydrationOnNextMessage:
             sender_type="User",
             sender_name="Alice",
             chat_room_id=room_id,
-            # Agent is @mentioned so the message clears the gate (every Band
-            # room is mention-gated) and reaches the rehydration path.
+            # Mention metadata may be present, but delivery — not this metadata —
+            # is what routes the turn to Hermes.
             metadata=SimpleNamespace(
                 mentions=[SimpleNamespace(id="agent-self-id", handle=None)]
             ),
@@ -1549,6 +1574,39 @@ class TestDurableSeedRehydration:
         assert "earlier note" in evt.channel_context
 
     @pytest.mark.asyncio
+    async def test_no_seed_api_fallback_excludes_unprocessed_backlog(self, adapter):
+        # Older gateways without durable seed support still must not present an
+        # actionable backlog message both as channel_context and as the live turn.
+        adapter._session_store = _FakeSessionStore()
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[SimpleNamespace(id="backlog-1", metadata={"mentions": []})],
+                metadata=SimpleNamespace(next_cursor=None, has_more=False),
+            )
+        )
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text", content="earlier note",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+                SimpleNamespace(id="backlog-1", message_type="text",
+                                content="please answer this", sender_id="human-1",
+                                sender_type="User", sender_name="Alice", inserted_at=None),
+                SimpleNamespace(id="msg-r1", message_type="text", content="active turn",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        evt = adapter.handle_message.call_args[0][0]
+        assert "earlier note" in evt.channel_context
+        assert "please answer this" not in evt.channel_context
+        assert "active turn" not in evt.channel_context
+
+    @pytest.mark.asyncio
     async def test_context_fetch_failure_still_delivers_message(self, adapter):
         adapter._session_store = _SeedingSessionStore()
         adapter._rehydrate_rooms.add("rejoined-room")
@@ -1660,10 +1718,10 @@ class TestDurableSeedRehydration:
         ]
 
     @pytest.mark.asyncio
-    async def test_unaddressed_actionable_message_is_kept_in_seed(self, adapter):
-        # Only *mentions* are excluded from the seed (they get answered). An
-        # unprocessed message that does NOT mention the agent is context, not an
-        # answer — it must stay in the seeded history, not be over-excluded.
+    async def test_unmentioned_unprocessed_message_is_excluded_from_seed(self, adapter):
+        # Delivery, not mention metadata, decides what Hermes answers. Every
+        # unprocessed message returned by the backlog endpoint is actionable and
+        # must be excluded from the seed to avoid double-answering it.
         store = _SeedingSessionStore()
         adapter._session_store = store
         adapter._rehydrate_rooms.add("rejoined-room")
@@ -1690,8 +1748,11 @@ class TestDurableSeedRehydration:
 
         await adapter._handle_message_created(self._event())
 
-        # The mention is excluded (it'll be answered); the un-addressed chatter is kept.
-        assert [r["content"] for r in store.atomic_seeded] == ["[Bob] background chatter"]
+        # Both backlog rows are excluded; with no seedable context left, no
+        # durable write or blob fallback is needed.
+        assert adapter._session_store.atomic_seeded is None
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is None
 
     @pytest.mark.asyncio
     async def test_fetch_room_context_follows_pagination(self, adapter):
@@ -2235,14 +2296,13 @@ class TestCatchUpDrain:
         adapter._link.mark_processed.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_drain_dropped_message_is_made_terminal(self, adapter):
-        # A non-mention message is dropped by gating; /next would re-offer it,
-        # so the drain marks it processed itself.
-        dropped = _platform_msg("d1", mentions_agent=False)
-        adapter._link.get_next_message = AsyncMock(side_effect=[dropped, None])
+    async def test_drain_unmentioned_message_is_forwarded(self, adapter):
+        # Delivery is the gate; lack of mention metadata is not a drop reason.
+        msg = _platform_msg("d1", mentions_agent=False)
+        adapter._link.get_next_message = AsyncMock(side_effect=[msg, None])
         await adapter._drain_room("room-abc")
-        adapter.handle_message.assert_not_called()
-        adapter._link.mark_processed.assert_awaited_with("room-abc", "d1")
+        adapter.handle_message.assert_called_once()
+        adapter._link.mark_processed.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_drain_reoffered_id_is_force_acked_not_respun(self, adapter):
@@ -2431,26 +2491,6 @@ class TestInboundDedup:
         assert adapter.handle_message.await_count == 1
 
 
-class TestMentionParsingDictMetadata:
-    """_is_agent_mentioned must read caught-up dict metadata, not just objects."""
-
-    def test_dict_metadata_mention_by_id(self, monkeypatch):
-        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
-        a._agent_id = "agent-self-id"
-        payload = SimpleNamespace(metadata={"mentions": [{"id": "agent-self-id"}]})
-        assert a._is_agent_mentioned(payload) is True
-
-    def test_dict_metadata_mention_by_handle(self, monkeypatch):
-        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
-        a._handle = "bot"
-        payload = SimpleNamespace(metadata={"mentions": [{"handle": "bot"}]})
-        assert a._is_agent_mentioned(payload) is True
-
-    def test_dict_metadata_no_mention(self, monkeypatch):
-        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
-        a._agent_id = "agent-self-id"
-        payload = SimpleNamespace(metadata={"mentions": [{"id": "someone-else"}]})
-        assert a._is_agent_mentioned(payload) is False
 
 
 # ---------------------------------------------------------------------------
@@ -3135,9 +3175,8 @@ class TestOwnerCommandGate:
 
     @pytest.mark.asyncio
     async def test_path_like_text_relayed_as_chat(self, adapter):
-        # Path-like text isn't a command, so it's never dropped by the command
-        # gate. @mentioned here so it also clears the normal mention gate and
-        # reaches the agent as plain chat.
+        # Path-like text isn't a command, so the command gate relays it as plain
+        # chat. Mention metadata is irrelevant to inbound routing.
         await adapter._handle_message_created(
             self._event("chat-room", "human-2", "/usr/bin/ls is missing", mentioned=True)
         )
@@ -3152,16 +3191,15 @@ class TestOwnerCommandGate:
         adapter.send.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_plain_chat_in_hub_requires_mention(self, adapter):
-        # The hub is no longer a gating exception: un-mentioned plain chat is
-        # ignored there like in any other room (the owner must @mention to talk).
+    async def test_plain_chat_in_hub_relayed_without_mention_metadata(self, adapter):
+        # Delivery is the address signal in the hub just like every joined room.
         await adapter._handle_message_created(self._event("hub-room", "owner-1", "hello"))
-        adapter.handle_message.assert_not_called()
+        adapter.handle_message.assert_called_once()
         adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_mentioned_chat_in_hub_relayed(self, adapter):
-        # With an @mention, plain chat in the hub reaches the agent.
+        # Direct mention metadata does not change normal inbound routing.
         await adapter._handle_message_created(
             self._event("hub-room", "owner-1", "hello", mentioned=True)
         )

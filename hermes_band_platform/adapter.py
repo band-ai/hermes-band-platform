@@ -40,6 +40,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -247,6 +248,18 @@ def _derive_urls(base_url: str) -> tuple[str, str]:
     return ws_url, rest_url
 
 
+def strip_attached_handles(content: str, mention_items: List[Any]) -> str:
+    """Remove only literal @handles already represented by structured mentions."""
+    text = content or ""
+    for item in mention_items or []:
+        handle = str(getattr(item, "handle", None) or "").strip()
+        if not handle:
+            continue
+        pattern = rf"(?<![\w@/])@{re.escape(handle)}(?![\w/@.-])"
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
 def _mention_items(
     participants: List[Dict[str, Any]],
     *,
@@ -263,7 +276,8 @@ def _mention_items(
          *participants* when present).
       2. ``preferred`` — a single recipient (the reply auto-mention, e.g. the
          last human sender).
-      3. otherwise — every non-agent participant in the room.
+      3. otherwise — every participant except this agent. Peer agents are valid
+         recipients; loop prevention is a separate turn policy.
 
     Returns a possibly-empty list; the caller decides whether empty is an error
     (the tool raises; the adapter lets Band reject the send).
@@ -290,7 +304,7 @@ def _mention_items(
     items: List[Any] = []
     for p in participants:
         pid = p.get("id")
-        if not pid or pid == agent_id or (p.get("type") or "") == "Agent":
+        if not pid or pid == agent_id:
             continue
         items.append(
             ChatMessageRequestMentionsItem(
@@ -368,6 +382,7 @@ async def _post_chunks(
     last_resp: Any = None
     continuation: List[str] = []
     posted = 0
+    content = strip_attached_handles(content, mention_items)
     for chunk in BasePlatformAdapter.truncate_message(content, max_length):
         resp = await rest.agent_api_messages.create_agent_chat_message(
             chat_id=room_id,

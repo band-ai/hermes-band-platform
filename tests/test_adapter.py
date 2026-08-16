@@ -775,6 +775,30 @@ class TestInboundSelfFilter:
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_reference_mention_does_not_wake_agent(self, adapter):
+        event = self._make_event(
+            sender_id="human-sender", sender_type="User", msg_id="reference-msg-id"
+        )
+        event.payload.metadata = SimpleNamespace(
+            mentions=[{"id": "agent-self-id", "kind": "reference"}]
+        )
+
+        await adapter._handle_message_created(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_kindless_mention_metadata_remains_actionable(self, adapter):
+        event = self._make_event(
+            sender_id="human-sender", sender_type="User", msg_id="legacy-msg-id"
+        )
+        event.payload.metadata = {"mentions": [{"id": "agent-self-id"}]}
+
+        await adapter._handle_message_created(event)
+
+        adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_two_participant_room_without_mention_is_dispatched(self, adapter):
         event = self._make_event(
             sender_id="human-sender",
@@ -1481,6 +1505,44 @@ class TestDurableSeedRehydration:
 
         seeded = [r["content"] for r in adapter._session_store.atomic_seeded]
         assert seeded == ["[Alice] older context"]
+
+    @pytest.mark.asyncio
+    async def test_reference_backlog_remains_context_not_rederived(self, adapter):
+        adapter._session_store = _SeedingSessionStore()
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[
+                    SimpleNamespace(
+                        id="reference-backlog",
+                        metadata={"mentions": [{"id": "agent-self-id", "kind": "reference"}]},
+                    ),
+                    SimpleNamespace(
+                        id="legacy-backlog",
+                        metadata={"mentions": [{"id": "agent-self-id"}]},
+                    ),
+                ],
+                metadata=SimpleNamespace(next_cursor=None, has_more=False),
+            )
+        )
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="reference-backlog", message_type="text",
+                                content="reference prose", sender_id="human-1",
+                                sender_type="User", sender_name="Alice", inserted_at=None),
+                SimpleNamespace(id="legacy-backlog", message_type="text",
+                                content="legacy question", sender_id="human-1",
+                                sender_type="User", sender_name="Alice", inserted_at=None),
+                SimpleNamespace(id="h1", message_type="text", content="older context",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        seeded = [r["content"] for r in adapter._session_store.atomic_seeded]
+        assert seeded == ["[Alice] reference prose", "[Alice] older context"]
 
     @pytest.mark.asyncio
     async def test_no_seed_api_falls_back_to_channel_context(self, adapter):

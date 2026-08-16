@@ -1271,9 +1271,16 @@ class BandAdapter(BasePlatformAdapter):
             await self._ack_consumed(inb.room_id, inb.msg_id)
             return False
 
-        # No mention gate: Band decides delivery, so a message that reaches us is
-        # already addressed to the agent — and some delivered room events carry no
-        # mention metadata even when the agent is the target.
+        # Band delivery is normally the address signal. An explicit structured
+        # self-reference is prose/context, not delivery, and must not wake the
+        # agent or be treated as an addressed backlog turn.
+        if not is_command and self._is_agent_reference(inb.payload):
+            logger.debug(
+                "[band] Ignoring reference-only message in room %s",
+                _short_id(inb.room_id),
+            )
+            return False
+
         source = self.build_source(
             chat_id=inb.room_id,
             chat_name=self._room_name_for(inb.room_id) or inb.room_id,
@@ -1283,6 +1290,34 @@ class BandAdapter(BasePlatformAdapter):
             thread_id=None,  # Band uses rooms, not threads.
         )
         return await self._forward_inbound(inb, source, is_command)
+
+    def _is_agent_reference(self, payload: Any) -> bool:
+        """Return whether payload explicitly references this agent as prose.
+
+        ``kind=mention`` is delivery metadata. ``kind=reference`` is not. Older
+        payloads omitted ``kind``; those remain actionable for compatibility.
+        """
+        metadata = getattr(payload, "metadata", None)
+        if isinstance(metadata, dict):
+            mentions = metadata.get("mentions") or []
+        else:
+            mentions = getattr(metadata, "mentions", None) or []
+        for mention in mentions:
+            if isinstance(mention, dict):
+                mention_id = mention.get("id")
+                handle = mention.get("handle")
+                kind = mention.get("kind")
+            else:
+                mention_id = getattr(mention, "id", None)
+                handle = getattr(mention, "handle", None)
+                kind = getattr(mention, "kind", None)
+            matches_agent = (
+                (mention_id and mention_id == self._agent_id)
+                or (handle and self._handle and handle == self._handle)
+            )
+            if matches_agent and str(kind or "mention").lower() == "reference":
+                return True
+        return False
 
     def _normalize_inbound(self, event: Any) -> Optional[_Inbound]:
         """Extract a normalized inbound message, or None if it lacks payload/room.
@@ -1776,7 +1811,7 @@ class BandAdapter(BasePlatformAdapter):
         def collect(page: List[Any]) -> None:
             for msg in page:
                 mid = getattr(msg, "id", None)
-                if mid:
+                if mid and not self._is_agent_reference(msg):
                     ids.add(mid)
 
         await self._paginate(

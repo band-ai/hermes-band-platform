@@ -144,6 +144,55 @@ class TestAlignment:
 
         assert rendered == "@[[u]] ask @other/person about it"
 
+    @pytest.mark.parametrize(
+        "content,handle,description",
+        [
+            ("mail alice@example.com about it", "example.com", "e-mail domain"),
+            ("write to @alice@example.com", "alice", "handle-shaped e-mail local part"),
+            ("see https://git.io/@alice/repo", "alice", "URL path segment"),
+            ("run `curl -H '@bob: x'` first", "alice", "unrelated handle in code"),
+            ('he said "@bob will do it"', "alice", "unrelated quoted handle"),
+            ("the @alice-bot service is down", "alice", "hyphenated service name"),
+        ],
+    )
+    def test_controls_content_survives_untouched(self, content, handle, description):
+        """Nothing but a real, whole-token mention may be rewritten."""
+        mentions = _mentions({"id": "u", "type": "User", "handle": handle})
+
+        rendered = _simulate_server(
+            content, align_mentions_to_content(content, mentions)
+        )
+
+        assert rendered == f"@[[u]] {content}", description
+
+    @pytest.mark.parametrize(
+        "content",
+        ["run `curl -H '@alice: x'` first", 'he said "@alice will do it"'],
+    )
+    def test_known_limit_a_real_mention_inside_code_or_quotes_is_substituted(
+        self, content
+    ):
+        """Documented limitation, not an oversight.
+
+        When the mentioned participant's own handle appears inside a code span
+        or a quotation, the server substitutes it there like anywhere else. The
+        adapter does not parse markdown, and guessing at code spans would be
+        both fragile and unable to help — the server would still rewrite what it
+        found. The cost is cosmetic (a resolved name inside a code span), not
+        corruption, which is what this module exists to prevent.
+
+        Unrelated handles in the same positions are untouched; that is the case
+        that matters and it is covered above.
+        """
+        mentions = _mentions({"id": "u", "type": "User", "handle": "alice"})
+
+        rendered = _simulate_server(
+            content, align_mentions_to_content(content, mentions)
+        )
+
+        assert "@[[u]]" in rendered
+        assert "@alice" not in rendered
+
     def test_an_unsafe_name_is_withheld_too(self):
         """The server falls through to @name when the handle does not match."""
         content = "@Ed Lepeduson wrote this"

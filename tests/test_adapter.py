@@ -2952,9 +2952,8 @@ class TestOwnerCommandGate:
 
     @pytest.mark.asyncio
     async def test_path_like_text_relayed_as_chat(self, adapter):
-        # Path-like text isn't a command, so it's never dropped by the command
-        # gate. @mentioned here so it also clears the normal mention gate and
-        # reaches the agent as plain chat.
+        # Path-like text isn't a command, so the command gate relays it as plain
+        # chat. Mention metadata is irrelevant to inbound routing.
         await adapter._handle_message_created(
             self._event("chat-room", "human-2", "/usr/bin/ls is missing", mentioned=True)
         )
@@ -2969,16 +2968,15 @@ class TestOwnerCommandGate:
         adapter.send.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_plain_chat_in_hub_requires_mention(self, adapter):
-        # The hub is no longer a gating exception: un-mentioned plain chat is
-        # ignored there like in any other room (the owner must @mention to talk).
+    async def test_plain_chat_in_hub_relayed_without_mention_metadata(self, adapter):
+        # Delivery is the address signal in the hub just like every joined room.
         await adapter._handle_message_created(self._event("hub-room", "owner-1", "hello"))
-        adapter.handle_message.assert_not_called()
+        adapter.handle_message.assert_called_once()
         adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_mentioned_chat_in_hub_relayed(self, adapter):
-        # With an @mention, plain chat in the hub reaches the agent.
+        # Direct mention metadata does not change normal inbound routing.
         await adapter._handle_message_created(
             self._event("hub-room", "owner-1", "hello", mentioned=True)
         )

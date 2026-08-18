@@ -247,6 +247,23 @@ def _derive_urls(base_url: str) -> tuple[str, str]:
     return ws_url, rest_url
 
 
+def _is_delivery_mention(mention: Any) -> bool:
+    """Return whether a mention asks this agent to act.
+
+    Explicit ``reference`` mentions are narrative context, not delivery. Missing
+    or empty kinds remain actionable for compatibility with older messages.
+    Accept both dictionary metadata from catch-up and live SDK objects.
+    """
+    if isinstance(mention, dict):
+        kind = mention.get("kind")
+    else:
+        kind = getattr(mention, "kind", None)
+    if kind is None:
+        return True
+    normalized = str(kind).strip().lower()
+    return normalized in ("", "mention")
+
+
 def _mention_items(
     participants: List[Dict[str, Any]],
     *,
@@ -2134,11 +2151,13 @@ class BandAdapter(BasePlatformAdapter):
     # ── Inbound helpers ───────────────────────────────────────────────────
 
     def _is_agent_mentioned(self, payload: Any) -> bool:
-        """Return True if the agent id/handle is in payload.metadata.mentions.
+        """Return True if an actionable mention of this agent is in metadata.
 
-        Handles both the live SDK payload (metadata + mentions as objects) and a
-        caught-up ``PlatformMessage`` whose ``metadata`` is a plain dict with
-        ``mentions`` as a list of dicts.
+        Handles both live SDK objects and caught-up messages represented as
+        dictionaries. References are narrative context, not requests; missing
+        or empty kinds remain actionable for compatibility with older messages.
+        This check is also used when the gateway re-evaluates backlog and
+        restored context.
         """
         metadata = getattr(payload, "metadata", None)
         if isinstance(metadata, dict):
@@ -2152,6 +2171,8 @@ class BandAdapter(BasePlatformAdapter):
             else:
                 mid = getattr(m, "id", None)
                 mhandle = getattr(m, "handle", None)
+            if not _is_delivery_mention(m):
+                continue
             if mid and mid == self._agent_id:
                 return True
             if mhandle and self._handle and mhandle == self._handle:

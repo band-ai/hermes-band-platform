@@ -1,17 +1,9 @@
-"""Inbound addressing honours the platform's mention kinds.
+"""Inbound addressing honours delivery versus reference mentions.
 
-The platform distinguishes two kinds (``chat.ex`` ``@valid_mention_kinds
-~w(mention reference)``). Every server path that decides whether an agent should
-*act* gates on ``delivery_mention?/1`` — ``kind == "mention"``. A ``reference``
-names someone narratively without asking anything of them.
-
-The gateway has to make the same judgement wherever it re-derives addressedness
-for itself rather than being handed it — backlog enumeration and rehydration —
-or it wakes turns the server deliberately never offered.
-
-``mention_kind/1`` defaults to ``"mention"`` when the key is absent, so a
-kindless entry is a delivery mention. Getting that default wrong in the other
-direction would silently mute legacy messages, which is why it is pinned here.
+A delivery mention asks the agent to act; a reference names it as context. The
+gateway must apply that distinction when it re-derives addressedness during
+backlog enumeration and context restoration. Missing or empty kinds remain
+actionable so older messages are not silently muted.
 """
 
 from types import SimpleNamespace

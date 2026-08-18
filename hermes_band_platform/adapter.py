@@ -248,16 +248,11 @@ def _derive_urls(base_url: str) -> tuple[str, str]:
 
 
 def _is_delivery_mention(mention: Any) -> bool:
-    """Mirror of the platform's ``delivery_mention?/1``.
+    """Return whether a mention asks this agent to act.
 
-    ``chat.ex`` defines ``@valid_mention_kinds ~w(mention reference)`` and
-    ``mention_kind/1`` as ``Map.get(m, "kind") || "mention"`` — so an entry with
-    no ``kind`` (legacy rows are stored as bare ids) is a delivery mention, and
-    only an explicit ``reference`` is not. Defaulting the same way is what keeps
-    this from silently muting older messages.
-
-    Accepts the dict shape (caught-up ``PlatformMessage`` metadata) and the
-    object shape (live SDK payload) alike.
+    Explicit ``reference`` mentions are narrative context, not delivery. Missing
+    or empty kinds remain actionable for compatibility with older messages.
+    Accept both dictionary metadata from catch-up and live SDK objects.
     """
     if isinstance(mention, dict):
         kind = mention.get("kind")
@@ -2156,24 +2151,13 @@ class BandAdapter(BasePlatformAdapter):
     # ── Inbound helpers ───────────────────────────────────────────────────
 
     def _is_agent_mentioned(self, payload: Any) -> bool:
-        """Return True if a *delivery* mention of this agent is in the metadata.
+        """Return True if an actionable mention of this agent is in metadata.
 
-        Handles both the live SDK payload (metadata + mentions as objects) and a
-        caught-up ``PlatformMessage`` whose ``metadata`` is a plain dict with
-        ``mentions`` as a list of dicts.
-
-        Only delivery-kind mentions count. The platform distinguishes
-        ``mention`` from ``reference`` (``chat.ex`` ``@valid_mention_kinds``),
-        and every path that decides whether an agent should *act* — the
-        ``/messages/next`` pull, live delivery, and the internal agent flow —
-        gates on ``delivery_mention?/1``, i.e. ``kind == "mention"``. A
-        reference is narrative: "as @other-agent noted earlier" names someone
-        without asking anything of them.
-
-        Judging that here matters because this is also what the gateway uses
-        when it re-derives addressedness for itself rather than being handed it
-        — backlog enumeration and rehydration — where a kind-blind check would
-        wake a turn the server deliberately never offered.
+        Handles both live SDK objects and caught-up messages represented as
+        dictionaries. References are narrative context, not requests; missing
+        or empty kinds remain actionable for compatibility with older messages.
+        This check is also used when the gateway re-evaluates backlog and
+        restored context.
         """
         metadata = getattr(payload, "metadata", None)
         if isinstance(metadata, dict):

@@ -1,3 +1,4 @@
+
 """Shared test fixtures for the Band platform plugin.
 
 The band SDK is NOT assumed installed in the test environment. A minimal but
@@ -336,3 +337,62 @@ def _register_band_platform():
         hermes_band_platform.register(_RegistryCtx())
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def _clean_turn_state():
+    """Turn state is module-level, so it must not leak between tests.
+
+    Whether a send is a model reply or out-of-turn traffic depends on whether a
+    turn is open for that room. One test opening a turn would otherwise change
+    what the next test's send does — which is exactly how this fixture came to
+    exist.
+    """
+    from hermes_band_platform.adapter import reset_turn_state
+
+    reset_turn_state()
+    yield
+    reset_turn_state()
+
+
+@pytest.fixture(autouse=True)
+def _never_write_a_real_env(monkeypatch):
+    """No test may persist to the gateway's real ``.env``.
+
+    ``connect()`` persists the resolved owner and hub room by calling
+    ``hermes_cli.config.save_env_value``. A test that fakes an identity and does
+    not stub that call writes its fixture values into whatever ``HERMES_HOME``
+    happens to point at — so running this suite inside a live agent profile
+    rewrites that agent's identity.
+
+    That is not hypothetical: it overwrote both dogfooding twins'
+    ``BAND_OWNER_ID`` with the literal ``owner-uuid-abc`` from a fixture in this
+    file, leaving them pointed at a participant that does not exist. Default to a
+    no-op; tests that assert persistence patch the same attribute themselves and
+    keep working.
+    """
+    try:
+        import hermes_cli.config as _hermes_cfg
+    except Exception:  # pragma: no cover - host not installed
+        return
+    monkeypatch.setattr(_hermes_cfg, "save_env_value", lambda *_a, **_k: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_band_env_leak(monkeypatch):
+    """Every test starts with no ambient Band credentials.
+
+    Tests that need them set them. Without this, a test that forgets one can
+    still pass by inheriting another test's value through os.environ, and then
+    fails in isolation or on CI in a different order — which is exactly how
+    TestStandaloneSendLogging passed locally at 686 and failed on CI.
+    """
+    for var in (
+        "BAND_AGENT_ID",
+        "BAND_API_KEY",
+        "BAND_OWNER_ID",
+        "BAND_BASE_URL",
+        "BAND_HUB_ROOM",
+        "BAND_HOME_ROOM",
+    ):
+        monkeypatch.delenv(var, raising=False)

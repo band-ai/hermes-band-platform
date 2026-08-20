@@ -316,6 +316,9 @@ def test_register_agent_reads_user_key_from_band_api_key(monkeypatch):
     monkeypatch.setattr(
         module, "_save_credentials", lambda agent_id, api_key: captured.update(saved=(agent_id, api_key))
     )
+    # Stub the pre-flight so this test asserts registration, not whether the
+    # host happens to be installed in the environment running the suite.
+    monkeypatch.setattr(module, "_resolve_env_writer", lambda: None)
 
     class _Resp:
         status = 200
@@ -358,6 +361,78 @@ def test_register_agent_short_circuits_when_already_registered(monkeypatch):
         "agent_id": "existing-agent",
         "saved": [],
     }
+
+def test_register_agent_checks_the_env_writer_before_posting(monkeypatch):
+    """A wrong interpreter must fail before Band mints anything.
+
+    Band returns the agent key only in the creation response. Checked after the
+    POST, an unusable interpreter leaves a registered agent whose key was
+    discarded — unrecoverable, and the retry collides on the taken name.
+    """
+    module = _load_script("register_agent.py")
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
+    monkeypatch.setenv("BAND_USER_API_KEY", "user-key")
+
+    # Break the writer at the import, the one seam every version shares, so this
+    # asserts ordering rather than the presence of a particular helper.
+    monkeypatch.setitem(sys.modules, "hermes_cli", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", SimpleNamespace())
+
+    posted: list[object] = []
+
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return b'{"agent": {"id": "a1"}, "credentials": {"api_key": "agent-key"}}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _record(request, *a, **k):
+        posted.append(request)
+        return _Resp()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", _record)
+
+    with pytest.raises(RuntimeError, match="save_env_value"):
+        module.register_agent()
+
+    assert posted == [], "an agent was registered before the writer was checked"
+
+
+def test_register_agent_preflight_runs_after_the_user_key_check(monkeypatch):
+    """Ordering: a missing key still reports the key, not the interpreter."""
+    module = _load_script("register_agent.py")
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
+    monkeypatch.delenv("BAND_USER_API_KEY", raising=False)
+    monkeypatch.delenv("BAND_API_KEY", raising=False)
+
+    def _no_writer():
+        raise AssertionError("the env-writer probe ran before the user-key check")
+
+    monkeypatch.setattr(module, "_resolve_env_writer", _no_writer)
+
+    with pytest.raises(RuntimeError, match="Band API key is required"):
+        module.register_agent()
+
+
+def test_register_agent_env_writer_error_names_the_resolver(monkeypatch):
+    """The message has to say how to get the right interpreter.
+
+    ``hermes_cli`` is stubbed rather than assumed absent, so the assertion holds
+    in a developer environment that happens to have hermes-agent installed.
+    """
+    module = _load_script("register_agent.py")
+    monkeypatch.setitem(sys.modules, "hermes_cli", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="gateway_python.py"):
+        module._resolve_env_writer()
+
 
 def test_register_agent_headers_use_browser_like_fingerprint(monkeypatch):
     module = _load_script("register_agent.py")

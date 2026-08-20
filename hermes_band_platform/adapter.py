@@ -44,7 +44,7 @@ import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, TypedDict
+from typing import Any, Callable, Dict, Iterable, List, Optional, TypedDict
 from urllib.parse import urlsplit
 
 from gateway.config import HomeChannel, Platform, PlatformConfig  # noqa: E402
@@ -253,6 +253,29 @@ def _derive_urls(base_url: str) -> tuple[str, str]:
 _MENTION_KIND_REFERENCE = "reference"
 
 
+def _dedupe_ids(values: Iterable[str]) -> List[str]:
+    """First occurrence of each id, in the order the caller gave them.
+
+    Band's business rule is one mention entry per participant: a repeated id is
+    rejected with ``422 duplicate_mentions`` — the same id twice, or once as a
+    mention and once as a reference, makes no difference — and the whole message
+    is rejected with it.
+
+    Collapsing is silent because a repeat carries nothing the first entry does
+    not: the recipient set is identical either way, so nothing the caller asked
+    for is lost. That is the opposite of the self-mention case, where the entry
+    means something (a narrative reference) and is demoted rather than removed.
+    """
+    seen: set = set()
+    out: List[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
 def _is_delivery_mention_item(item: Any) -> bool:
     """Whether an *outbound* mention item actually delivers to its recipient.
 
@@ -299,9 +322,14 @@ def _mention_items(
     ``kind`` is set **only** for that self entry: every other item omits the
     field so the server applies its own ``"mention"`` default, keeping the wire
     payload for normal recipients identical to before.
+
+    **Postcondition: no id appears twice.** Band's rule is one entry per
+    participant — a repeated id is ``422 duplicate_mentions`` and takes the whole
+    message with it — so every branch here collapses repeats to their first
+    occurrence, whatever their source.
     """
     by_id = {p["id"]: p for p in participants if p.get("id")}
-    ids = [str(m).strip() for m in (explicit_ids or []) if str(m).strip()]
+    ids = _dedupe_ids(str(m).strip() for m in (explicit_ids or []) if str(m).strip())
     if ids:
         return [
             ChatMessageRequestMentionsItem(
@@ -321,10 +349,14 @@ def _mention_items(
             )
         ]
     items: List[Any] = []
+    seen: set = set()
     for p in participants:
         pid = p.get("id")
         if not pid or pid == agent_id or (p.get("type") or "") == "Agent":
             continue
+        if pid in seen:
+            continue
+        seen.add(pid)
         items.append(
             ChatMessageRequestMentionsItem(
                 id=pid, handle=p.get("handle"), name=p.get("name")

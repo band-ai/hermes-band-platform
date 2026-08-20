@@ -388,6 +388,25 @@ class TestSendMessage:
         assert mentions[1].kind == "reference"               # us, demoted
 
     @pytest.mark.asyncio
+    async def test_duplicate_mention_ids_reach_band_once(self, owner_session):
+        """A repeated id would be 422 duplicate_mentions, losing the message."""
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[_peer("u-x", handle="x"), _peer("u-y", handle="y")]
+            )
+        )
+        with _patch_rest(rest), _patch_agent_id("agent-self"):
+            out = _parse(
+                await band_tools._handle_send_message(
+                    {"content": "hi", "mention_ids": ["u-y", "u-x", "u-y"]}
+                )
+            )
+        assert out["success"] is True
+        call = rest.agent_api_messages.create_agent_chat_message.await_args
+        assert [m.id for m in call.kwargs["message"].mentions] == ["u-y", "u-x"]
+
+    @pytest.mark.asyncio
     async def test_only_self_in_mention_ids_errors_before_sending(
         self, owner_session
     ):
@@ -850,6 +869,52 @@ class TestMentionItems:
         assert items[1].handle == "bot"                  # still resolved
         assert _is_delivery_mention_item(items[0]) is True
         assert _is_delivery_mention_item(items[1]) is False
+
+    def test_a_repeated_explicit_id_collapses_to_its_first_occurrence(self):
+        """Band rejects the same participant twice with 422 duplicate_mentions.
+
+        The repeat says nothing the first entry does not, so it is dropped rather
+        than errored — the recipient set is identical either way.
+        """
+        from hermes_band_platform.adapter import _mention_items
+
+        parts = [{"id": "u1", "handle": "alice"}, {"id": "u2", "handle": "bob"}]
+        items = _mention_items(parts, agent_id="me", explicit_ids=["u1", "u2", "u1"])
+        assert self._ids(items) == ["u1", "u2"]   # order of first appearance
+        assert items[0].handle == "alice"
+
+    def test_a_repeated_self_id_collapses_to_one_reference(self):
+        """Duplicate and self are separate server rules; both must hold at once.
+
+        Band counts one entry per participant *regardless of kind*, so a self id
+        given twice must arrive once — and still as a reference.
+        """
+        from hermes_band_platform.adapter import _mention_items
+
+        items = _mention_items(
+            [{"id": "u1", "handle": "alice"}],
+            agent_id="me",
+            explicit_ids=["me", "u1", "me"],
+        )
+        assert self._ids(items) == ["me", "u1"]
+        assert items[0].kind == "reference"
+        assert getattr(items[1], "kind", None) is None
+
+    def test_duplicate_participants_do_not_produce_duplicate_fallbacks(self):
+        """The postcondition holds whatever the source of the ids.
+
+        The fallback builds from the room roster rather than caller input, so a
+        roster repeating a participant would otherwise send the same id twice.
+        """
+        from hermes_band_platform.adapter import _mention_items
+
+        parts = [
+            {"id": "h1", "handle": "alice", "type": "User"},
+            {"id": "h1", "handle": "alice", "type": "User"},
+            {"id": "h2", "handle": "bob", "type": "User"},
+        ]
+        items = _mention_items(parts, agent_id="me")
+        assert self._ids(items) == ["h1", "h2"]
 
     def test_self_only_explicit_list_has_no_delivery_recipient(self):
         """The demotion does not conjure a recipient — the caller must error."""

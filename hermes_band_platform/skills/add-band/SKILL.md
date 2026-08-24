@@ -68,7 +68,7 @@ If the user already knows the interpreter, pre-set `HERMES_PY` (or `HERMES_PYTHO
 resolver validates it instead of detecting — an override that can't import `hermes_cli.config`
 is a hard error, never silently replaced by a guess.
 
-Canonical install: the repo's **installer**, which ships the plugin as a **directory plugin** with zero site-packages writes — it works even when the gateway venv (e.g. `/opt/hermes/.venv` on hosted runtimes) is root-owned and read-only. It stages the plugin into `$HERMES_HOME/plugins/band/`, resolves `band-sdk>=1.0.0,<2.0.0` with the gateway interpreter into the user-writable `$HERMES_HOME/band-libs/` (the plugin prepends it to `sys.path` at load), verifies `import band`, and enables the plugin. Idempotent — safe to re-run:
+Canonical install: the repo's **installer**, which ships the plugin as a **directory plugin** with zero site-packages writes — it works even when the gateway venv (e.g. `/opt/hermes/.venv` on hosted runtimes) is root-owned and read-only. It stages the plugin into `$HERMES_HOME/plugins/band/`, resolves `band-sdk>=1.3.0,<2.0.0` with the gateway interpreter into the user-writable `$HERMES_HOME/band-libs/` (the plugin prepends it to `sys.path` at load), verifies `import band`, and enables the plugin. Idempotent — safe to re-run:
 
 ```bash
 # From the repo clone (this skill lives at <repo>/hermes_band_platform/skills/add-band):
@@ -213,6 +213,10 @@ re-installs or re-registers what's already in place.
 10. **Close the loop — offer the first real room.** The hub is a private owner↔agent control room; the user's actual goal is usually a room with other people. Don't stop at the hub:
    - Offer: *"You're live in the Hub. Want me to create your first room? Tell me who to add."*
    - On yes, use `band_create_room(person=<handle/name>, message=<intro>)` — it resolves → creates → adds → messages in one call and returns `{room_id, added, sent}`.
+   - Tool-call/result events stay private by default (`BAND_EMIT_EXECUTION=off`). Only set
+     `BAND_EMIT_EXECUTION=hub` if the user wants execution visibility in the private owner
+     hub, or `all` after explicitly confirming that every participant in an originating Band
+     room may see the redacted tool args/results. Invalid values fail closed to `off`.
    - The Band tools are owner-gated and **fail-closed**. From this setup session the caller may not be the resolved Band owner, so a mutation can be refused: if so, either have the user run the request from the Hub in Band (where the owner bypass applies) or add the calling `platform:user_id` to `BAND_TOOL_OWNERS`. On decline, point them at `band_create_room` / the Band UI for later.
    - Remind them Band has no DMs; an unmentioned message is ignored by design.
 

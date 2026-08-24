@@ -5,9 +5,12 @@ BEFORE this module imports the adapter — so the adapter's top-level
 ``try: from band ...`` binds the stub and ``BAND_AVAILABLE`` stays True.
 """
 
+import time
+import concurrent.futures
 import asyncio
 import logging
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -59,6 +62,24 @@ class TestBandAdapterInit:
         adapter = _make_adapter(monkeypatch, agent_id="env-agent-id", api_key="env-api-key")
         assert adapter._cfg_agent_id == "env-agent-id"
         assert adapter._api_key == "env-api-key"
+
+    def test_execution_emission_defaults_off(self, monkeypatch):
+        monkeypatch.delenv("BAND_EMIT_EXECUTION", raising=False)
+        assert _make_adapter(monkeypatch)._execution_scope == "off"
+
+    def test_blank_execution_emission_scope_is_off(self, monkeypatch):
+        monkeypatch.setenv("BAND_EMIT_EXECUTION", "")
+        assert _make_adapter(monkeypatch)._execution_scope == "off"
+
+    @pytest.mark.parametrize("scope", ["off", "all", "hub"])
+    def test_execution_emission_accepts_documented_scopes(self, monkeypatch, scope):
+        monkeypatch.setenv("BAND_EMIT_EXECUTION", scope)
+        assert _make_adapter(monkeypatch)._execution_scope == scope
+
+    def test_invalid_execution_emission_scope_fails_closed(self, monkeypatch):
+        """A typo must not publish tool args — anything unknown means off."""
+        monkeypatch.setenv("BAND_EMIT_EXECUTION", "yes")
+        assert _make_adapter(monkeypatch)._execution_scope == "off"
 
     def test_init_reads_credentials_from_config_extra(self, monkeypatch):
         for key in ("BAND_AGENT_ID", "BAND_API_KEY", "BAND_BASE_URL", "BAND_OWNER_ID"):
@@ -270,6 +291,47 @@ class TestBandPluginRegistration:
         register(ctx)
         kwargs = ctx.register_platform.call_args[1]
         assert callable(kwargs["env_enablement_fn"])
+
+    def _hint(self):
+        ctx = MagicMock()
+        register(ctx)
+        return ctx.register_platform.call_args[1]["platform_hint"]
+
+    def test_platform_hint_does_not_claim_plain_text_is_undelivered(self):
+        """Regression guard: the gateway auto-delivers the final assistant text
+        and there is no way to suppress that, so a hint claiming otherwise makes
+        the model call band_send_message and every reply gets posted twice."""
+        hint = self._hint()
+        assert "plain text is not delivered" not in hint
+        assert "not delivered" not in hint
+
+    def test_platform_hint_says_reply_is_delivered_and_mentioned_for_you(self):
+        hint = self._hint()
+        assert "delivered to the room automatically" in hint
+        assert "@mentioned for you" in hint
+
+    def test_platform_hint_forbids_send_message_for_the_current_room(self):
+        hint = self._hint()
+        assert (
+            "Do NOT call band_send_message to reply in the room you are "
+            "already in" in hint
+        )
+        assert "twice" in hint
+
+    def test_platform_hint_keeps_owner_no_room_id_guidance(self):
+        """Still-correct guidance the fix must not drop: reaching the owner from
+        a non-Band session or another room does need an explicit tool call."""
+        hint = self._hint()
+        assert "call band_send_message with no room_id" in hint
+        assert "owner's hub" in hint
+
+    def test_conversation_skill_agrees_that_final_text_is_auto_delivered(self):
+        skill = Path(_band_mod.__file__).parent / "skills" / "band-conversations" / "SKILL.md"
+        guidance = skill.read_text()
+        assert "final assistant text is delivered" in guidance
+        assert "Plain assistant text is **not** delivered" not in guidance
+        assert "Do **not** call" in guidance
+        assert "`band_send_message` for that routine reply" in guidance
 
 
 # ---------------------------------------------------------------------------
@@ -983,6 +1045,16 @@ class TestHandleEvent:
         await adapter._handle_event(event)
         adapter._link.subscribe_room.assert_not_called()
         adapter._link.unsubscribe_room.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event_type", ["room_removed", "room_deleted"])
+    async def test_room_departure_forgets_working_state(self, adapter, event_type):
+        adapter._working_reported["gone-room"] = time.monotonic()
+        event = SimpleNamespace(type=event_type, room_id="gone-room")
+
+        await adapter._handle_event(event)
+
+        assert "gone-room" not in adapter._working_reported
 
 
 # ---------------------------------------------------------------------------
@@ -2074,6 +2146,122 @@ class TestProcessingAckHooks:
         adapter._link.mark_processed.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "outcome", [ProcessingOutcome.FAILURE, ProcessingOutcome.CANCELLED]
+    )
+    async def test_incomplete_outcomes_flush_originating_usage(
+        self, adapter, monkeypatch, outcome
+    ):
+        flush = MagicMock()
+        monkeypatch.setattr(_band_mod.usage_events, "flush_incomplete_turn", flush)
+        monkeypatch.setattr(adapter, "_session_id_for_event", lambda event: "sid-1")
+        event = self._evt(room_id="room-abc")
+
+        await adapter.on_processing_complete(event, outcome)
+
+        flush.assert_called_once_with(adapter, "sid-1", "room-abc")
+
+    @pytest.mark.asyncio
+    async def test_success_does_not_use_incomplete_flush(self, adapter, monkeypatch):
+        flush = MagicMock()
+        monkeypatch.setattr(_band_mod.usage_events, "flush_incomplete_turn", flush)
+
+        await adapter.on_processing_complete(self._evt(), ProcessingOutcome.SUCCESS)
+
+        flush.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_incomplete_finalization_flushes_once(
+        self, adapter, monkeypatch
+    ):
+        usage = _band_mod.usage_events
+        usage._PENDING.clear()
+        monkeypatch.setenv("BAND_EMIT_USAGE", "all")
+        # The scope is captured once at hook registration and never re-read, so
+        # setting the env var alone cannot enable emission here: the ``adapter``
+        # fixture has already registered hooks and pinned ``_STARTUP_SCOPE`` to
+        # "off". Clear it so ``_effective_scope()`` falls through to the env.
+        # ``test_usage_events.py`` does the same for its whole module via an
+        # autouse fixture.
+        monkeypatch.setattr(usage, "_STARTUP_SCOPE", None)
+        emitted = MagicMock(return_value=True)
+        monkeypatch.setattr(usage, "_schedule_emit", emitted)
+        flush = MagicMock(wraps=usage.flush_incomplete_turn)
+        monkeypatch.setattr(usage, "flush_incomplete_turn", flush)
+        monkeypatch.setattr(adapter, "_session_id_for_event", lambda event: "sid-1")
+        monkeypatch.setattr(usage, "_live_adapters", lambda: [adapter])
+        monkeypatch.setattr(usage, "_room_for_session", lambda a, sid: "room-abc")
+        usage.on_post_api_request(
+            session_id="sid-1",
+            turn_id="turn-1",
+            platform="band",
+            model="test-model",
+            provider="test-provider",
+            usage={
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+            },
+        )
+        source = adapter.build_source(chat_id="room-abc", chat_type="group")
+        first = _band_mod.MessageEvent(
+            text="hello", source=source, message_id="m1"
+        )
+        duplicate = _band_mod.MessageEvent(
+            text="hello", source=source, message_id="m1"
+        )
+
+        try:
+            await adapter.on_processing_complete(first, ProcessingOutcome.FAILURE)
+            await adapter.on_processing_complete(duplicate, ProcessingOutcome.FAILURE)
+        finally:
+            usage._PENDING.clear()
+
+        assert flush.call_count == 2
+        emitted.assert_called_once()
+        assert not hasattr(first, "_band_usage_finalized")
+        assert not hasattr(duplicate, "_band_usage_finalized")
+
+    def test_usage_session_resolution_uses_store_profile_key(self, adapter):
+        adapter.config.extra["group_sessions_per_user"] = True
+        source = adapter.build_source(
+            chat_id="room-abc", chat_type="group", user_id="user-7"
+        )
+        key = "agent:profile:review-profile:band:group:room-abc"
+        generate_key = MagicMock(return_value=key)
+        adapter._session_store = SimpleNamespace(
+            config=SimpleNamespace(group_sessions_per_user=False),
+            _generate_session_key=generate_key,
+            _ensure_loaded=lambda: None,
+            _entries={key: SimpleNamespace(session_id="sid-user-7")},
+        )
+
+        event = SimpleNamespace(source=source)
+
+        assert adapter._session_id_for_event(event) == "sid-user-7"
+        generate_key.assert_called_once_with(source)
+
+    def test_usage_session_resolution_fallback_uses_store_config(self, adapter):
+        adapter.config.extra["group_sessions_per_user"] = True
+        source = adapter.build_source(
+            chat_id="room-abc", chat_type="group", user_id="user-7"
+        )
+        key = _band_mod.build_session_key(
+            source, group_sessions_per_user=False, thread_sessions_per_user=False
+        )
+        adapter._session_store = SimpleNamespace(
+            config=SimpleNamespace(
+                group_sessions_per_user=False,
+                thread_sessions_per_user=False,
+            ),
+            _ensure_loaded=lambda: None,
+            _entries={key: SimpleNamespace(session_id="sid-shared")},
+        )
+
+        assert adapter._session_id_for_event(SimpleNamespace(source=source)) == "sid-shared"
+
+    @pytest.mark.asyncio
     async def test_internal_event_is_not_acked(self, adapter):
         # Participant notices carry no Band id — never touch the cursor.
         await adapter.on_processing_start(self._evt(internal=True))
@@ -2474,13 +2662,16 @@ class TestConnectDisconnect:
         assert adapter._agent_id == "resolved-agent-id"
         assert adapter._handle == "bot-handle"
         assert adapter._consumer_task is not None
+        assert adapter in _band_mod.usage_events._adapters()
 
         # Cleanup
         await adapter.disconnect()
+        assert adapter not in _band_mod.usage_events._adapters()
 
     @pytest.mark.asyncio
     async def test_connect_returns_false_on_link_exception(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
+        _band_mod.usage_events.track_adapter(adapter)
 
         monkeypatch.setattr(
             "gateway.status.acquire_scoped_lock",
@@ -2497,6 +2688,7 @@ class TestConnectDisconnect:
         monkeypatch.setattr(_band_mod, "BandLink", _bad_link)
         result = await adapter.connect()
         assert result is False
+        assert adapter not in _band_mod.usage_events._adapters()
 
     @pytest.mark.asyncio
     async def test_disconnect_cancels_consumer_task(self, monkeypatch):
@@ -2550,6 +2742,37 @@ class TestConnectDisconnect:
 
         assert task.cancelled() or task.done()
         assert adapter._room_catch_up_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_forgets_working_state_for_reconnect(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        old_link = MagicMock()
+        old_link.disconnect = AsyncMock()
+        adapter._link = old_link
+        adapter._working_reported["room-1"] = time.monotonic()
+
+        await adapter.disconnect()
+
+        assert adapter._working_reported == {}
+        new_link = TestWorkingIndicator._link()
+        adapter._link = new_link
+        await adapter.send_typing("room-1")
+        assert new_link.calls == [("room-1", True)]
+    async def test_disconnect_cancels_pending_execution_emissions(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        pending = concurrent.futures.Future()
+        adapter._execution_pending.add(pending)
+        adapter._execution_accepting = True
+
+        fake_link = MagicMock()
+        fake_link.disconnect = AsyncMock()
+        adapter._link = fake_link
+
+        await adapter.disconnect()
+
+        assert pending.cancelled()
+        assert adapter._execution_pending == set()
+        assert adapter._execution_accepting is False
 
 
 # ---------------------------------------------------------------------------
@@ -2660,6 +2883,10 @@ class TestHubBootstrap:
         a = _make_adapter(monkeypatch, agent_id="agent-1")
         a._agent_id = "agent-1"
         a._owner_uuid = "owner-1"
+        # get_agent_me returns the agent handle as ``owner_handle/agent_slug``,
+        # so the owner's handle is derivable without a roster call — the shape
+        # every hub send needs, since Band rejects a mention with handle: null.
+        a._handle = "owner/hermes"
         # Record .env persistence instead of writing the operator's real file.
         saved = {}
         import hermes_cli.config as _hcfg
@@ -3165,6 +3392,7 @@ class TestHubAnnouncement:
         a = _make_adapter(monkeypatch, agent_id="agent-1")
         a._agent_id = "agent-1"
         a._owner_uuid = "owner-1"
+        a._handle = "owner/hermes"  # owner_handle/agent_slug (see TestHubBootstrap)
         saved = {}
         import hermes_cli.config as _hcfg
         monkeypatch.setattr(_hcfg, "save_env_value", lambda k, v: saved.__setitem__(k, v))
@@ -3442,3 +3670,1207 @@ class TestHubFailover:
         await adapter._record_hub_send("old-hub", ok=False)
 
         link.rest.agent_api_chats.create_agent_chat.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 24. Renderer capability flags (what the host may assume Band can render)
+# ---------------------------------------------------------------------------
+
+class TestRendererCapabilities:
+    """The host reads capability flags off the adapter to pick a rendering.
+
+    Every flag the adapter does not declare falls back to the conservative
+    plain-text default on ``BasePlatformAdapter``, so silence here is not
+    neutral — it downgrades output. These tests pin the two flags Band claims
+    and the host-side names they hook into, so an upstream rename turns our
+    declaration into dead code *here* instead of quietly in production.
+    """
+
+    def test_declares_supports_code_blocks(self, monkeypatch):
+        # Band clients render markdown fences; gateway/run.py's tool-progress
+        # renderer gates the fenced-code-block rendering on this flag.
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.supports_code_blocks is True
+
+    def test_declares_splits_long_messages(self, monkeypatch):
+        # send() chunks via truncate_message(), so the host must not pre-trim.
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.splits_long_messages is True
+
+    def test_flags_are_real_host_capabilities_and_default_off(self):
+        """Both flags exist on the host base and default False there.
+
+        If either name disappears or flips its default upstream, the adapter's
+        declaration stops meaning what its comment says — catch that here.
+        """
+        base = pytest.importorskip("gateway.platforms.base")
+        assert base.BasePlatformAdapter.supports_code_blocks is False
+        assert base.BasePlatformAdapter.splits_long_messages is False
+
+    @pytest.mark.asyncio
+    async def test_host_delivery_router_sends_full_payload_unchunked_by_gateway(
+        self, monkeypatch, tmp_path
+    ):
+        """End-to-end: the real cron delivery router hands Band the whole payload.
+
+        Drives ``gateway.delivery.DeliveryRouter._deliver_to_platform`` — the
+        only host consumer of ``splits_long_messages``. With the flag set, an
+        oversized cron output reaches ``send()`` intact and Band splits it into
+        several messages; without it the host truncates at
+        ``MAX_PLATFORM_OUTPUT`` and appends a "full output saved to <path>"
+        footer pointing at a file on the gateway host that a Band reader cannot
+        open. Skips if the host module isn't importable.
+        """
+        delivery = pytest.importorskip("gateway.delivery")
+
+        adapter = _make_adapter(monkeypatch)
+        adapter._last_human_sender["room-cron"] = {
+            "id": "user-c", "handle": "uc", "name": "User C",
+        }
+        posted: list = []
+
+        async def _create(*args, **kwargs):
+            posted.append(kwargs["message"].content)
+            return SimpleNamespace(data=SimpleNamespace(id=f"cron-{len(posted)}"))
+
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = _create
+        adapter._link = mock_link
+
+        router = delivery.DeliveryRouter(
+            SimpleNamespace(platforms={}), {adapter.platform: adapter}
+        )
+        # The router audit-saves oversized output to the real hermes home; keep
+        # the test off the filesystem while leaving the branch under test intact.
+        router._save_full_output = lambda *_a, **_k: tmp_path / "full-output.txt"
+        target = delivery.DeliveryTarget(
+            platform=adapter.platform, chat_id="room-cron", is_explicit=True,
+        )
+
+        long_output = "band-cron-line\n" * 800  # ~12000 chars, well over the cap
+        assert len(long_output) > delivery.MAX_PLATFORM_OUTPUT
+
+        result = await router._deliver_to_platform(target, long_output, {"job_id": "job-1"})
+
+        assert result.success is True
+        # Chunked by the adapter, not truncated by the host: every line survived
+        # across the chunks and no footer was substituted for the tail.
+        assert len(posted) > 1
+        assert sum(chunk.count("band-cron-line") for chunk in posted) == 800
+        assert not any("full output saved to" in chunk for chunk in posted)
+
+        # Negative control: clear the flag and the same host path truncates.
+        posted.clear()
+        adapter.splits_long_messages = False
+        await router._deliver_to_platform(target, long_output, {"job_id": "job-1"})
+        assert len(posted) == 1
+        assert "full output saved to" in posted[0]
+
+
+# ---------------------------------------------------------------------------
+# 25. Shared send primitives — _fetch_participants / _post_chunks
+# ---------------------------------------------------------------------------
+
+_fetch_participants = _band_mod._fetch_participants
+_post_chunks = _band_mod._post_chunks
+
+
+def _rest_stub(participants=()):
+    """Fake REST client exposing only what the shared send primitives drive.
+
+    Mirrors the fake links used elsewhere in this file: the participant listing
+    and the message create, both AsyncMocks so individual tests can override
+    ``side_effect``. Posted messages get sequential ``std-msg-<n>`` ids so a
+    chunked send is traceable back to its last chunk.
+    """
+    rest = MagicMock()
+    rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+        return_value=SimpleNamespace(data=list(participants))
+    )
+    posted = 0
+
+    async def _create(*args, **kwargs):
+        nonlocal posted
+        posted += 1
+        return SimpleNamespace(data=SimpleNamespace(id=f"std-msg-{posted}"))
+
+    rest.agent_api_messages.create_agent_chat_message = AsyncMock(side_effect=_create)
+    return rest
+
+
+def _participant(pid, name=None, handle=None, ptype="User"):
+    return SimpleNamespace(id=pid, name=name, handle=handle, type=ptype)
+
+
+def _mention_tuples(create_mock):
+    """``[(id, handle, name), ...]`` per posted chunk, in call order."""
+    return [
+        [
+            (getattr(m, "id", None), getattr(m, "handle", None), getattr(m, "name", None))
+            for m in call.kwargs["message"].mentions
+        ]
+        for call in create_mock.await_args_list
+    ]
+
+
+class TestFetchParticipants:
+
+    @pytest.mark.asyncio
+    async def test_normalizes_sdk_objects_to_mention_item_shape(self):
+        rest = _rest_stub(
+            [
+                _participant("agent-1", "Bot", "bot", ptype="Agent"),
+                _participant("human-1", "Alice", "alice"),
+            ]
+        )
+
+        participants = await _fetch_participants(rest, "room-1")
+
+        assert participants == [
+            {"id": "agent-1", "name": "Bot", "handle": "bot", "type": "Agent"},
+            {"id": "human-1", "name": "Alice", "handle": "alice", "type": "User"},
+        ]
+        # The room is passed as chat_id, with the retry-enabled request options.
+        kwargs = rest.agent_api_participants.list_agent_chat_participants.await_args.kwargs
+        assert kwargs["chat_id"] == "room-1"
+        assert kwargs["request_options"] is _band_mod.DEFAULT_REQUEST_OPTIONS
+
+    @pytest.mark.asyncio
+    async def test_missing_attributes_become_none(self):
+        rest = _rest_stub([SimpleNamespace(id="bare-1")])
+
+        assert await _fetch_participants(rest, "room-1") == [
+            {"id": "bare-1", "name": None, "handle": None, "type": None}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_absent_or_empty_data_yields_empty_list(self):
+        for payload in (SimpleNamespace(data=None), SimpleNamespace(data=[]), SimpleNamespace()):
+            rest = MagicMock()
+            rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+                return_value=payload
+            )
+            assert await _fetch_participants(rest, "room-1") == []
+
+    @pytest.mark.asyncio
+    async def test_errors_propagate_to_the_caller(self):
+        rest = MagicMock()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            side_effect=RuntimeError("participants 503")
+        )
+
+        with pytest.raises(RuntimeError, match="participants 503"):
+            await _fetch_participants(rest, "room-1")
+
+    @pytest.mark.asyncio
+    async def test_adapter_cache_swallows_the_error_and_caches_empty(self, monkeypatch):
+        """_get_participants still owns the swallow-and-warn policy."""
+        adapter = _make_adapter(monkeypatch)
+        link = MagicMock()
+        link.rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        adapter._link = link
+
+        assert await adapter._get_participants("room-1") == []
+        assert adapter._participants_cache["room-1"] == []
+
+
+class TestPostChunks:
+
+    @staticmethod
+    def _mentions(*ids):
+        return [
+            _band_mod.ChatMessageRequestMentionsItem(id=i, handle=None, name=None)
+            for i in ids
+        ]
+
+    @pytest.mark.asyncio
+    async def test_short_content_posts_once_with_no_continuation(self):
+        rest = _rest_stub()
+        mentions = self._mentions("human-1")
+
+        last_id, continuation, last_resp = await _post_chunks(
+            rest, "room-1", "hello", mentions, 4000
+        )
+
+        assert (last_id, continuation) == ("std-msg-1", [])
+        assert last_resp.data.id == "std-msg-1"
+        create = rest.agent_api_messages.create_agent_chat_message
+        create.assert_awaited_once()
+        assert create.await_args.kwargs["chat_id"] == "room-1"
+        assert create.await_args.kwargs["message"].content == "hello"
+        assert create.await_args.kwargs["message"].mentions is mentions
+
+    @pytest.mark.asyncio
+    async def test_long_content_is_split_exactly_as_truncate_message(self):
+        rest = _rest_stub()
+        content = "x" * 9000
+        expected = BandAdapter.truncate_message(content, 4000)
+        assert len(expected) >= 2  # guard: the fixture must actually chunk
+
+        last_id, continuation, _ = await _post_chunks(
+            rest, "room-1", content, self._mentions("human-1"), 4000
+        )
+
+        create = rest.agent_api_messages.create_agent_chat_message
+        assert [c.kwargs["message"].content for c in create.await_args_list] == expected
+        # Last id is returned; every earlier id is a continuation.
+        assert last_id == f"std-msg-{len(expected)}"
+        assert continuation == [f"std-msg-{n}" for n in range(1, len(expected))]
+
+    @pytest.mark.asyncio
+    async def test_mentions_are_repeated_on_every_chunk(self):
+        rest = _rest_stub()
+        content = "y" * 9000
+        expected = BandAdapter.truncate_message(content, 4000)
+
+        await _post_chunks(
+            rest, "room-1", content, self._mentions("human-1", "human-2"), 4000
+        )
+
+        # Band mandates >=1 mention per message, so continuations keep them.
+        create = rest.agent_api_messages.create_agent_chat_message
+        assert _mention_tuples(create) == [
+            [("human-1", None, None), ("human-2", None, None)]
+        ] * len(expected)
+
+    @pytest.mark.asyncio
+    async def test_on_sent_receives_every_returned_id(self):
+        rest = _rest_stub()
+        seen: list = []
+        content = "z" * 9000
+        expected = BandAdapter.truncate_message(content, 4000)
+
+        await _post_chunks(
+            rest,
+            "room-1",
+            content,
+            self._mentions("human-1"),
+            4000,
+            on_sent=seen.append,
+        )
+
+        assert seen == [f"std-msg-{n}" for n in range(1, len(expected) + 1)]
+
+    @pytest.mark.asyncio
+    async def test_id_less_responses_do_not_advance_the_cursor(self):
+        rest = _rest_stub()
+        rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=None)
+        )
+        seen: list = []
+
+        last_id, continuation, last_resp = await _post_chunks(
+            rest, "room-1", "hello", self._mentions("human-1"), 4000, on_sent=seen.append
+        )
+
+        assert (last_id, continuation, seen) == (None, [], [])
+        assert last_resp is not None  # the response is still handed back
+
+    @pytest.mark.asyncio
+    async def test_errors_propagate_so_the_caller_owns_the_failure_shape(self):
+        rest = _rest_stub()
+        rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            side_effect=RuntimeError("network failure")
+        )
+
+        with pytest.raises(RuntimeError, match="network failure"):
+            await _post_chunks(rest, "room-1", "hello", self._mentions("human-1"), 4000)
+
+    @pytest.mark.asyncio
+    async def test_send_on_link_still_records_its_own_sent_ids(self, monkeypatch):
+        """The live path's echo backstop rides on the on_sent hook."""
+        adapter = _make_adapter(monkeypatch)
+        link = MagicMock()
+        link.rest = _rest_stub()
+        adapter._link = link
+        adapter._last_human_sender["room-1"] = {
+            "id": "human-1", "handle": "alice", "name": "Alice",
+        }
+
+        result = await adapter._send_on_link("room-1", "x" * 9000)
+
+        assert result.success is True
+        assert result.message_id in adapter._sent_ids
+        # Continuation ids are surfaced on the SendResult and also recorded.
+        assert result.continuation_message_ids
+        assert set(result.continuation_message_ids) <= adapter._sent_ids
+
+
+# ---------------------------------------------------------------------------
+# 25. Standalone (out-of-process) sender — deliver=band with no live gateway
+#
+# Drives the shared primitives from section 24 with no adapter instance, so it
+# reuses that section's _rest_stub / _participant / _mention_tuples helpers.
+# ---------------------------------------------------------------------------
+
+_standalone_send = _band_mod._standalone_send
+_standalone_room = _band_mod._standalone_room
+
+
+class TestStandaloneSenderRegistration:
+    """The hook must be reachable exactly the way _send_via_adapter reaches it."""
+
+    def test_register_passes_standalone_sender_fn(self):
+        ctx = MagicMock()
+        register(ctx)
+        kwargs = ctx.register_platform.call_args[1]
+        assert kwargs["standalone_sender_fn"] is _standalone_send
+
+    def test_platform_entry_accepts_standalone_sender_fn(self):
+        """PlatformEntry really carries the field (no version guard needed)."""
+        from gateway.platform_registry import PlatformEntry
+
+        ctx = MagicMock()
+        register(ctx)
+        entry = PlatformEntry(**ctx.register_platform.call_args[1])
+        assert entry.standalone_sender_fn is _standalone_send
+        # The home-channel var the sender falls back to is the one cron reads.
+        assert entry.cron_deliver_env_var == "BAND_HOME_ROOM"
+
+
+class TestStandaloneSend:
+
+    @pytest.fixture
+    def env(self, monkeypatch):
+        """Minimal out-of-process environment: credentials only, no home room."""
+        monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
+        monkeypatch.setenv("BAND_API_KEY", "secret-key")
+        for var in ("BAND_BASE_URL", "BAND_HOME_ROOM", "BAND_HUB_ROOM"):
+            monkeypatch.delenv(var, raising=False)
+        return monkeypatch
+
+    @staticmethod
+    def _patch_rest(monkeypatch, rest):
+        """Route the send at ``rest`` and expose its owned HTTP transport."""
+        seen = {}
+
+        def _factory(_api_key, _base_url, httpx_client):
+            seen["httpx_client"] = httpx_client
+            return rest
+
+        monkeypatch.setattr(_band_mod, "_standalone_rest", _factory)
+        return seen
+
+    # ── happy path + room resolution ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_posts_to_explicit_chat_id(self, env):
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        seen = self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-explicit", "cron output")
+
+        assert result == {
+            "success": True,
+            "platform": "band",
+            "chat_id": "room-explicit",
+            "message_id": "std-msg-1",
+        }
+        create = rest.agent_api_messages.create_agent_chat_message
+        create.assert_awaited_once()
+        assert create.await_args.kwargs["chat_id"] == "room-explicit"
+        assert create.await_args.kwargs["message"].content == "cron output"
+        assert _mention_tuples(create) == [[("human-1", "alice", "Alice")]]
+        assert seen["httpx_client"].is_closed
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_home_room_when_no_chat_id(self, env):
+        env.setenv("BAND_HOME_ROOM", "room-home")
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "", "hello")
+
+        assert result["success"] is True
+        assert result["chat_id"] == "room-home"
+        assert (
+            rest.agent_api_participants.list_agent_chat_participants.await_args.kwargs[
+                "chat_id"
+            ]
+            == "room-home"
+        )
+
+    def test_room_resolution_precedence(self, env):
+        """Explicit id > BAND_HOME_ROOM > BAND_HUB_ROOM > config extra."""
+        extra = {"home_channel": {"chat_id": "room-extra-home"}, "hub_room": "room-extra-hub"}
+        env.setenv("BAND_HOME_ROOM", "room-home")
+        env.setenv("BAND_HUB_ROOM", "room-hub")
+        assert _standalone_room("room-explicit", extra) == "room-explicit"
+        assert _standalone_room(None, extra) == "room-home"
+
+        env.delenv("BAND_HOME_ROOM")
+        assert _standalone_room(None, extra) == "room-hub"
+
+        env.delenv("BAND_HUB_ROOM")
+        assert _standalone_room(None, extra) == "room-extra-home"
+        assert _standalone_room(None, {"hub_room": "room-extra-hub"}) == "room-extra-hub"
+        assert _standalone_room(None, {}) is None
+        # Whitespace-only is not a room.
+        assert _standalone_room("   ", {}) is None
+
+    @pytest.mark.asyncio
+    async def test_credentials_and_host_read_from_config_extra_when_env_absent(self, env):
+        """PlatformConfig.extra is the secondary source, as in BandAdapter.__init__."""
+        env.delenv("BAND_AGENT_ID")
+        env.delenv("BAND_API_KEY")
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        seen: dict = {}
+
+        def _factory(api_key, base_url, httpx_client):
+            seen["api_key"] = api_key
+            seen["base_url"] = base_url
+            seen["httpx_client"] = httpx_client
+            return rest
+
+        env.setattr(_band_mod, "_standalone_rest", _factory)
+        cfg = _make_config(
+            {"agent_id": "agent-extra", "api_key": "key-extra", "base_url": "band.internal"}
+        )
+
+        result = await _standalone_send(cfg, "room-1", "hi")
+
+        assert result["success"] is True
+        assert seen["api_key"] == "key-extra"
+        assert seen["base_url"] == "band.internal"
+        assert seen["httpx_client"].is_closed
+
+    # ── parity with the live _send_on_link path ───────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_agent_itself_is_never_mentioned(self, env):
+        rest = _rest_stub(
+            [
+                _participant("agent-self", "Bot", "bot", ptype="Agent"),
+                _participant("human-1", "Alice", "alice"),
+            ]
+        )
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert result["success"] is True
+        assert _mention_tuples(rest.agent_api_messages.create_agent_chat_message) == [
+            [("human-1", "alice", "Alice")]
+        ]
+
+    @pytest.mark.asyncio
+    async def test_chunks_long_message_and_repeats_mentions_on_every_chunk(self, env):
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        self._patch_rest(env, rest)
+        long_content = "x" * 9000
+        expected_chunks = BandAdapter.truncate_message(
+            long_content, BandAdapter.MAX_MESSAGE_LENGTH
+        )
+        assert len(expected_chunks) >= 2  # guard: the fixture must actually chunk
+
+        result = await _standalone_send(_make_config(), "room-1", long_content)
+
+        create = rest.agent_api_messages.create_agent_chat_message
+        assert [c.kwargs["message"].content for c in create.await_args_list] == expected_chunks
+        # Band mandates >=1 mention per message, so continuations keep them.
+        assert _mention_tuples(create) == [[("human-1", "alice", "Alice")]] * len(
+            expected_chunks
+        )
+        # message_id is the LAST chunk's id, as in _send_on_link.
+        assert result["message_id"] == f"std-msg-{len(expected_chunks)}"
+
+    @pytest.mark.asyncio
+    async def test_mentions_match_the_live_path_for_a_room_with_no_cached_sender(self, env):
+        """Both paths take _mention_items' all-non-agent-participants branch.
+
+        The standalone path cannot reach ``_build_mentions``' preferred
+        last-human-sender (that cache lives on a connected adapter), so parity is
+        against the live path's behaviour for a room it has not heard from.
+        """
+        participants = [
+            _participant("agent-self", "Bot", "bot", ptype="Agent"),
+            _participant("human-1", "Alice", "alice"),
+            _participant("human-2", "Bob", "bob"),
+        ]
+
+        standalone_rest = _rest_stub(participants)
+        self._patch_rest(env, standalone_rest)
+        await _standalone_send(_make_config(), "room-parity", "same text")
+
+        adapter = _make_adapter(env, agent_id="agent-self")
+        adapter._agent_id = "agent-self"
+        live_link = MagicMock()
+        live_link.rest = _rest_stub(participants)
+        adapter._link = live_link
+        assert not adapter._last_human_sender  # cold room, no cached sender
+        live_result = await adapter._send_on_link("room-parity", "same text")
+
+        assert live_result.success is True
+        assert _mention_tuples(standalone_rest.agent_api_messages.create_agent_chat_message) \
+            == _mention_tuples(live_link.rest.agent_api_messages.create_agent_chat_message)
+
+    # ── actionable failures ───────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_missing_api_key_names_the_variable(self, env):
+        env.delenv("BAND_API_KEY")
+        rest = _rest_stub([_participant("human-1")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "BAND_API_KEY" in result["error"]
+        assert "BAND_AGENT_ID" not in result["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_agent_id_names_the_variable(self, env):
+        env.delenv("BAND_AGENT_ID")
+        rest = _rest_stub([_participant("human-1")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "BAND_AGENT_ID" in result["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_both_credentials_names_both(self, env):
+        env.delenv("BAND_AGENT_ID")
+        env.delenv("BAND_API_KEY")
+        self._patch_rest(env, _rest_stub([_participant("human-1")]))
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "BAND_AGENT_ID" in result["error"]
+        assert "BAND_API_KEY" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_no_target_room_points_at_band_home_room(self, env):
+        rest = _rest_stub([_participant("human-1")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "", "hi")
+
+        assert "BAND_HOME_ROOM" in result["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_mentionable_recipient_fails_without_posting(self, env):
+        # Agent-only room: nothing to mention once self is excluded.
+        rest = _rest_stub([_participant("agent-self", "Bot", "bot", ptype="Agent")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "mention" in result["error"].lower()
+        assert "success" not in result
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_participant_fetch_failure_reports_the_real_cause(self, env):
+        rest = _rest_stub()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            side_effect=RuntimeError("participants 503")
+        )
+        seen = self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "participants 503" in result["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_called()
+        assert seen["httpx_client"].is_closed
+
+    @pytest.mark.asyncio
+    async def test_post_failure_returns_error_dict_instead_of_raising(self, env):
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            side_effect=RuntimeError("network failure")
+        )
+        seen = self._patch_rest(env, rest)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "network failure" in result["error"]
+        assert "success" not in result
+        assert seen["httpx_client"].is_closed
+
+    @pytest.mark.asyncio
+    async def test_client_build_failure_is_reported(self, env):
+        def _boom(api_key, base_url, httpx_client):
+            raise RuntimeError("no client")
+
+        env.setattr(_band_mod, "_standalone_rest", _boom)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "no client" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_missing_sdk_returns_the_install_command(self, env):
+        env.setattr(_band_mod, "check_band_requirements", lambda: False)
+
+        result = await _standalone_send(_make_config(), "room-1", "hi")
+
+        assert "band-sdk" in result["error"]
+        assert _band_mod._band_libs.sdk_install_command() in result["error"]
+
+    # ── contract shape ────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_accepts_the_full_sender_signature(self, env):
+        """thread_id / media_files / force_document are parity-only, never fatal."""
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        self._patch_rest(env, rest)
+
+        result = await _standalone_send(
+            _make_config(),
+            "room-1",
+            "hi",
+            thread_id="ignored",
+            media_files=["/tmp/nope.png"],
+            force_document=True,
+        )
+
+        assert result["success"] is True
+        # Band has rooms, not threads — nothing thread-shaped reaches the API.
+        assert set(rest.agent_api_messages.create_agent_chat_message.await_args.kwargs) == {
+            "chat_id",
+            "message",
+            "request_options",
+        }
+
+
+class TestStandaloneRestClient:
+    """``_standalone_rest`` injects the caller-owned HTTP transport."""
+
+    def test_builds_async_rest_client_with_derived_url(self, monkeypatch):
+        built: dict = {}
+
+        class _FakeAsyncRestClient:
+            def __init__(self, api_key, base_url, httpx_client):
+                built["api_key"] = api_key
+                built["base_url"] = base_url
+                built["httpx_client"] = httpx_client
+
+        monkeypatch.setattr(
+            sys.modules["band.client.rest"], "AsyncRestClient", _FakeAsyncRestClient
+        )
+
+        httpx_client = MagicMock()
+        client = _band_mod._standalone_rest(
+            "secret-key", "band.internal:8443", httpx_client
+        )
+
+        assert isinstance(client, _FakeAsyncRestClient)
+        assert built == {
+            "api_key": "secret-key",
+            "base_url": "https://band.internal:8443",
+            "httpx_client": httpx_client,
+        }
+
+    def test_default_host_when_no_base_url(self, monkeypatch):
+        built: dict = {}
+
+        class _FakeAsyncRestClient:
+            def __init__(self, api_key, base_url, httpx_client):
+                built["base_url"] = base_url
+
+        monkeypatch.setattr(
+            sys.modules["band.client.rest"], "AsyncRestClient", _FakeAsyncRestClient
+        )
+
+        _band_mod._standalone_rest("secret-key", "", MagicMock())
+
+        assert built["base_url"] == "https://app.band.ai"
+
+
+# A distinctive body used to prove message content never reaches a log.
+SECRET_BODY = "correct-horse-battery-staple-9d2f"
+
+# Logger the adapter emits under; asserted against via caplog.
+_ADAPTER_LOGGER = "hermes_band_platform.adapter"
+
+
+class TestSendLogging:
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        link = MagicMock()
+        link.rest = _rest_stub()
+        adapter._link = link
+        adapter._last_human_sender["room-1"] = {
+            "id": "human-1", "handle": "alice", "name": "Alice",
+        }
+        return adapter
+
+    @staticmethod
+    def _posted_line(caplog):
+        lines = [r for r in caplog.records if "Posted" in r.getMessage()]
+        assert len(lines) == 1, f"expected one post line, got {len(lines)}"
+        return lines[0]
+
+    @pytest.mark.asyncio
+    async def test_successful_send_reports_room_size_and_message_id(
+        self, adapter, caplog
+    ):
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await adapter._send_on_link("room-1", "hello there")
+
+        assert result.success is True
+        record = self._posted_line(caplog)
+        # Routine success is debug — this runs on every turn.
+        assert record.levelno == logging.DEBUG
+        message = record.getMessage()
+        assert "1 chunk(s)" in message
+        assert "11 chars" in message
+        assert _short_id("room-1") in message
+        assert _short_id("std-msg-1") in message
+
+    @pytest.mark.asyncio
+    async def test_chunked_send_reports_how_many_chunks_went_out(
+        self, adapter, caplog
+    ):
+        content = "x" * 9000
+        expected = BandAdapter.truncate_message(content, BandAdapter.MAX_MESSAGE_LENGTH)
+        assert len(expected) >= 2  # guard: this must actually chunk
+
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter._send_on_link("room-1", content)
+
+        assert f"{len(expected)} chunk(s)" in self._posted_line(caplog).getMessage()
+
+    @pytest.mark.asyncio
+    async def test_failed_post_logs_the_room_at_error(self, adapter, caplog):
+        adapter._link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            side_effect=RuntimeError("network failure")
+        )
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await adapter._send_on_link("room-1", "hi")
+
+        assert result.success is False
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert _short_id("room-1") in errors[0].getMessage()
+        assert "network failure" in errors[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_link_lost_mid_flight_warns_that_a_reply_was_dropped(
+        self, adapter, caplog
+    ):
+        # send() marshals onto the link loop, so the link can go away between
+        # the caller's check and this one. That drop is otherwise invisible.
+        adapter._link = None
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await adapter._send_on_link("room-1", "hi")
+
+        assert result.success is False
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "Dropping send" in warnings[0].getMessage()
+        assert _short_id("room-1") in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_id_less_response_warns_that_delivery_is_unconfirmed(
+        self, adapter, caplog
+    ):
+        adapter._link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=None)
+        )
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await adapter._send_on_link("room-1", "hi")
+
+        # Band accepted it but named no message: not an error, not a clean
+        # success either, and everything downstream keys off that id.
+        assert result.success is True and result.message_id is None
+        assert any(
+            r.levelno == logging.WARNING and "unconfirmed" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_participant_fetch_logs_a_count_not_a_roster(self, caplog):
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await _fetch_participants(rest, "room-1")
+
+        counted = [r for r in caplog.records if "participant(s)" in r.getMessage()]
+        assert len(counted) == 1
+        assert "1 participant(s)" in counted[0].getMessage()
+        # Names and handles are room data, not diagnostics.
+        assert "Alice" not in caplog.text
+        assert "alice" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_message_body_never_reaches_the_log(self, adapter, caplog):
+        """The reply is the user's content; only its size may be logged."""
+        body = f"here it is: {SECRET_BODY}"
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter._send_on_link("room-1", body)
+
+        assert caplog.records  # not vacuously true
+        assert SECRET_BODY not in caplog.text
+        assert f"{len(body)} chars" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_message_body_never_reaches_the_log_on_failure(
+        self, adapter, caplog
+    ):
+        adapter._link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            side_effect=RuntimeError("network failure")
+        )
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter._send_on_link("room-1", f"here it is: {SECRET_BODY}")
+
+        assert caplog.records
+        assert SECRET_BODY not in caplog.text
+
+
+class TestStandaloneSendLogging:
+    """Out-of-process delivery: the error is returned AND logged.
+
+    The returned text lands in the cron job's result; an operator reading the
+    gateway log would otherwise see a delivery that never happened and never
+    explained itself.
+    """
+
+    @pytest.mark.asyncio
+    async def test_missing_credentials_are_logged(self, monkeypatch, caplog):
+        for var in ("BAND_AGENT_ID", "BAND_API_KEY", "BAND_HOME_ROOM", "BAND_HUB_ROOM"):
+            monkeypatch.delenv(var, raising=False)
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await _standalone_send(_make_config(), "room-1", "cron output")
+
+        assert "error" in result
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "BAND_AGENT_ID and BAND_API_KEY" in errors[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_missing_target_room_is_logged(self, monkeypatch, caplog):
+        monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
+        monkeypatch.setenv("BAND_API_KEY", "secret-key")
+        for var in ("BAND_HOME_ROOM", "BAND_HUB_ROOM"):
+            monkeypatch.delenv(var, raising=False)
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await _standalone_send(_make_config(), "", "cron output")
+
+        assert "error" in result
+        assert any(
+            r.levelno == logging.ERROR and "no target room" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_mentionable_recipient_is_logged_with_the_count(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
+        monkeypatch.setenv("BAND_API_KEY", "secret-key")
+        # Only the agent itself is in the room, so nobody can be @mentioned.
+        rest = _rest_stub([_participant("agent-self", "Bot", "bot", ptype="Agent")])
+        monkeypatch.setattr(_band_mod, "_standalone_rest", lambda *a, **k: rest)
+
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await _standalone_send(_make_config(), "room-1", "cron output")
+
+        assert "error" in result
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "1 participant(s)" in errors[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_delivery_reports_the_message_id(self, monkeypatch, caplog):
+        monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
+        monkeypatch.setenv("BAND_API_KEY", "secret-key")
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
+        monkeypatch.setattr(_band_mod, "_standalone_rest", lambda *a, **k: rest)
+
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            result = await _standalone_send(
+                _make_config(), "room-1", f"cron output: {SECRET_BODY}"
+            )
+
+        assert result["success"] is True
+        delivered = [r for r in caplog.records if "delivered" in r.getMessage()]
+        assert len(delivered) == 1
+        assert _short_id("std-msg-1") in delivered[0].getMessage()
+        assert SECRET_BODY not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 26. Working indicator (Band activity API)
+# ---------------------------------------------------------------------------
+
+class TestWorkingIndicator:
+    """send_typing / stop_typing drive Band's boolean activity surface.
+
+    The indicator is live state with a ~10s platform TTL, so these tests pin
+    both halves of the guard: repeats inside the refresh floor are thinned, and
+    a repeat *past* the floor still re-asserts (otherwise the bubble would die
+    mid-turn).
+    """
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        return _make_adapter(monkeypatch)
+
+    @staticmethod
+    def _link(result=True, raises=None):
+        """A link whose report_activity records calls as (room_id, working)."""
+        link = MagicMock()
+        calls = []
+
+        async def _report(room_id, working, *, timeout_seconds=2):
+            calls.append((room_id, working))
+            if raises is not None:
+                raise raises
+            return result
+
+        link.report_activity = _report
+        link.calls = calls
+        return link
+
+    @staticmethod
+    def _age(adapter, chat_id, seconds):
+        """Backdate a room's last report so the refresh floor has elapsed."""
+        adapter._working_reported[chat_id] = (
+            adapter._working_reported[chat_id] - seconds
+        )
+
+    # ── Reporting ──
+
+    @pytest.mark.asyncio
+    async def test_send_typing_reports_working_true(self, adapter):
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        assert adapter._link.calls == [("room-1", True)]
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_reports_working_false(self, adapter):
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        await adapter.stop_typing("room-1")
+        assert adapter._link.calls == [("room-1", True), ("room-1", False)]
+
+    @pytest.mark.asyncio
+    async def test_reports_are_per_chat(self, adapter):
+        adapter._link = self._link()
+        await adapter.send_typing("room-a")
+        await adapter.send_typing("room-b")
+        assert adapter._link.calls == [("room-a", True), ("room-b", True)]
+
+    @pytest.mark.asyncio
+    async def test_send_typing_accepts_metadata(self, adapter):
+        # The host passes thread metadata positionally/by keyword on every tick;
+        # Band ignores it (rooms aren't threaded) but must still accept it.
+        adapter._link = self._link()
+        await adapter.send_typing("room-1", metadata={"thread_id": "t-1"})
+        assert adapter._link.calls == [("room-1", True)]
+
+    # ── The refresh floor ──
+
+    @pytest.mark.asyncio
+    async def test_repeat_within_floor_does_not_hit_the_network(self, adapter):
+        adapter._link = self._link()
+        for _ in range(5):
+            await adapter.send_typing("room-1")
+        assert adapter._link.calls == [("room-1", True)]
+
+    @pytest.mark.asyncio
+    async def test_repeat_past_floor_reasserts(self, adapter):
+        # Critical: the platform expires the indicator ~10s after the last
+        # report, so the guard must thin refreshes, never stop them.
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        self._age(adapter, "room-1", _band_mod._WORKING_REFRESH_SECONDS + 1)
+        await adapter.send_typing("room-1")
+        assert adapter._link.calls == [("room-1", True), ("room-1", True)]
+
+    @pytest.mark.asyncio
+    async def test_floor_is_within_the_platform_ttl_headroom(self, adapter):
+        # The SDK's rule is cadence < TTL/2. The host refreshes every ~2s, so
+        # the effective cadence is floor rounded up to the next tick (4s here).
+        assert 0 < _band_mod._WORKING_REFRESH_SECONDS < 5.0
+
+    @pytest.mark.asyncio
+    async def test_new_turn_reasserts_after_stop(self, adapter):
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        await adapter.stop_typing("room-1")
+        # A fresh turn must light the indicator immediately — the floor from the
+        # previous turn must not suppress it.
+        await adapter.send_typing("room-1")
+        assert adapter._link.calls == [
+            ("room-1", True),
+            ("room-1", False),
+            ("room-1", True),
+        ]
+
+    # ── Repeated / spurious stops ──
+
+    @pytest.mark.asyncio
+    async def test_stop_without_start_is_a_no_op(self, adapter):
+        adapter._link = self._link()
+        await adapter.stop_typing("never-started")
+        assert adapter._link.calls == []
+
+    @pytest.mark.asyncio
+    async def test_repeated_stops_hit_the_network_once(self, adapter):
+        # The host stops several times per turn (_stop_typing_refresh retries
+        # twice, plus _keep_typing's finally).
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        for _ in range(3):
+            await adapter.stop_typing("room-1")
+        assert adapter._link.calls == [("room-1", True), ("room-1", False)]
+
+    @pytest.mark.asyncio
+    async def test_failed_stop_is_retried_by_the_next_stop(self, adapter):
+        # A clear that didn't land keeps the room asserted, so the host's own
+        # repeat becomes the retry.
+        adapter._link = self._link(result=False)
+        await adapter.send_typing("room-1")
+        await adapter.stop_typing("room-1")
+        await adapter.stop_typing("room-1")
+        assert adapter._link.calls == [
+            ("room-1", True),
+            ("room-1", False),
+            ("room-1", False),
+        ]
+
+    # ── Robustness ──
+
+    @pytest.mark.asyncio
+    async def test_raising_report_does_not_propagate_from_send_typing(self, adapter):
+        adapter._link = self._link(raises=RuntimeError("activity endpoint down"))
+        await adapter.send_typing("room-1")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_raising_report_does_not_propagate_from_stop_typing(self, adapter):
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        adapter._link.report_activity = AsyncMock(side_effect=RuntimeError("boom"))
+        await adapter.stop_typing("room-1")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_failing_report_still_respects_the_floor(self, adapter):
+        # The attempt is stamped, not the success — a dead endpoint must not be
+        # hammered on every host tick.
+        adapter._link = self._link(raises=RuntimeError("down"))
+        for _ in range(5):
+            await adapter.send_typing("room-1")
+        assert adapter._link.calls == [("room-1", True)]
+
+    @pytest.mark.asyncio
+    async def test_old_sdk_without_report_activity_is_a_no_op(self, adapter):
+        link = MagicMock()
+        del link.report_activity
+        adapter._link = link
+        await adapter.send_typing("room-1")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_cache_is_capped(self, adapter):
+        adapter._link = self._link()
+        for i in range(_band_mod._ROOM_CACHE_MAX + 10):
+            await adapter.send_typing(f"room-{i}")
+        assert len(adapter._working_reported) <= _band_mod._ROOM_CACHE_MAX
+
+    # ── No live link (standalone / out-of-process) ──
+
+    @pytest.mark.asyncio
+    async def test_send_typing_without_link_is_a_no_op(self, adapter):
+        assert adapter._link is None  # as constructed
+        await adapter.send_typing("room-1")
+        # No state recorded either — nothing to clear later.
+        assert adapter._working_reported == {}
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_without_link_is_a_no_op(self, adapter):
+        adapter._link = self._link()
+        await adapter.send_typing("room-1")
+        adapter._link = None
+        await adapter.stop_typing("room-1")  # must not raise
+
+    # ── Capability flag: the deliberate non-declaration ──
+
+    def test_does_not_claim_status_text_support(self, adapter):
+        # The activity API carries a bare boolean and the platform renders its
+        # own "Reasoning…" label, so there is nowhere to put a status phrase.
+        # Declaring support would make the host compute phrases we discard.
+        assert adapter.supports_status_text is False
+
+    # ── Wire level, through the SDK stub ──
+
+    @pytest.mark.asyncio
+    async def test_reaches_the_activity_rest_group(self, adapter):
+        from band.platform.link import BandLink
+
+        link = BandLink("agent", "key", "wss://h/ws", "https://h")
+        if not isinstance(link.rest, MagicMock):
+            pytest.skip("real band-sdk installed; stub-only wire assertion")
+        adapter._link = link
+
+        await adapter.send_typing("room-1")
+        await adapter.stop_typing("room-1")
+
+        reported = link.rest.agent_api_activity.report_agent_chat_activity
+        assert [c.kwargs["working"] for c in reported.await_args_list] == [True, False]
+        assert reported.await_args_list[0].kwargs["chat_id"] == "room-1"
+
+
+# Logger the adapter emits under; asserted against via caplog.
+_ADAPTER_LOGGER = "hermes_band_platform.adapter"
+
+
+class TestWorkingIndicatorLogging:
+    """The indicator refreshes every ~2s per turn — restraint is the point."""
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        return _make_adapter(monkeypatch)
+
+    @pytest.mark.asyncio
+    async def test_assertion_is_logged_once_per_turn_not_per_tick(
+        self, adapter, caplog
+    ):
+        adapter._link = TestWorkingIndicator._link()
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter.send_typing("room-1")   # first assertion
+            await adapter.send_typing("room-1")   # inside the floor — thinned
+            TestWorkingIndicator._age(adapter, "room-1", 10)
+            await adapter.send_typing("room-1")   # past the floor — re-asserted
+
+        # Two POSTs, one line: the refreshes are deliberately silent.
+        assert adapter._link.calls == [("room-1", True), ("room-1", True)]
+        asserted = [r for r in caplog.records if "asserted" in r.getMessage()]
+        assert len(asserted) == 1
+        assert asserted[0].levelno == logging.DEBUG
+
+    @pytest.mark.asyncio
+    async def test_clearing_the_indicator_is_logged(self, adapter, caplog):
+        adapter._link = TestWorkingIndicator._link()
+        await adapter.send_typing("room-1")
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter.stop_typing("room-1")
+
+        assert any("cleared" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_clear_says_the_indicator_is_still_set(
+        self, adapter, caplog
+    ):
+        adapter._link = TestWorkingIndicator._link(result=False)
+        await adapter.send_typing("room-1")
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter.stop_typing("room-1")
+
+        assert any("still set" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_no_op_stop_stays_silent(self, adapter, caplog):
+        # The host calls stop several times per turn; nothing was asserted for
+        # this room, so there is nothing to say.
+        adapter._link = TestWorkingIndicator._link()
+        with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
+            await adapter.stop_typing("room-never-typed")
+
+        assert caplog.records == []

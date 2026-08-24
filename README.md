@@ -140,7 +140,7 @@ hermes-band-platform/install.sh
 ```
 
 The installer stages the plugin into `$HERMES_HOME/plugins/band/`, resolves
-`band-sdk>=1.0.0,<2.0.0` **with the gateway's interpreter** (Python 3.11–3.13; correct wheels for
+`band-sdk>=1.3.0,<2.0.0` **with the gateway's interpreter** (Python 3.11–3.13; correct wheels for
 its platform) into the user-writable `$HERMES_HOME/band-libs/`, verifies `import band`, and runs
 `hermes plugins enable band`. The plugin prepends `band-libs` to `sys.path` at load, so the
 gateway venv is never written to — **no sudo, works when site-packages is read-only**. Re-running
@@ -179,7 +179,7 @@ Clones the repo root into `$HERMES_HOME/plugins/band` and enables it. **Director
 carry their own dependencies**, so resolve `band-sdk` into `band-libs` (no site-packages write):
 
 ```bash
-uv pip install --python "$HERMES_PY" --target "${HERMES_HOME:-$HOME/.hermes}/band-libs" 'band-sdk>=1.0.0,<2.0.0'
+uv pip install --python "$HERMES_PY" --target "${HERMES_HOME:-$HOME/.hermes}/band-libs" 'band-sdk>=1.3.0,<2.0.0'
 ```
 
 The plugin's loader shim finds `band-libs` on its own; if the SDK is still missing at load, the
@@ -306,6 +306,20 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
 | `BAND_HOME_ROOM` | Main-channel override for cron / notification delivery (also set by `/sethome` from a Band room). Defaults to the hub. |
 | `BAND_HUB_FAILOVER_THRESHOLD` | Consecutive failed hub sends before failing over to a fresh hub room (default `3`). A successful hub send resets the count. See [Hub failover](#hub-failover). |
 | `BAND_HUB_FAILOVER_MAX_PER_CONNECT` | Backstop cap on hub failovers per gateway connection (default `5`). |
+| `BAND_EMIT_USAGE` | Startup-only usage-event scope: `off` (default), `all`, or `hub`. `true`/`1`/`yes`/`on` alias `all`; `false`/`0`/`no` alias `off`; invalid values fail closed to `off`. Restart the gateway after changing it. |
+| `BAND_EMIT_EXECUTION` | Publish redacted tool-call and tool-result events: `off` (default), `hub` (only turns originating in the private owner hub), or `all` (every Band room). `all` is an explicit opt-in because room participants can see tool args/results. Invalid values fail closed to `off`. |
+
+Usage emission defaults to `off` while the SDK carries usage in task events and
+Band has no consumer for their structured metadata. `all` posts the aggregate in
+the room where that turn originated. `hub` posts only when the turn itself
+originated in the owner's hub; it never reroutes usage from another room into the
+hub. Because `off` avoids registering Hermes's per-API-call hook, changes to
+`BAND_EMIT_USAGE` take effect only after a gateway restart.
+
+Execution events are **off by default**. `hub` shows redacted tool calls and results only
+for turns started in the private owner hub; `all` publishes them in every originating Band
+room, where each participant can read them. A Band event cannot be deleted once written, so
+the default is the private one and widening it is a deliberate act.
 
 ---
 
@@ -326,6 +340,13 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
   carry the recipient's Band handle — the API rejects a null one — so handles are resolved
   locally (roster → peers/contacts → owner handle from `owner_handle/agent_slug`) and an
   unresolvable recipient fails before the send instead of during it.
+- **Outbound without a gateway**: the plugin also registers a `standalone_sender_fn`, so a
+  `deliver: band` cron job delivers even when it fires in a process that holds no gateway runner —
+  a forced `hermes cron run <id>` is the everyday case. That path has no link and no caches, so it
+  resolves everything from the environment (`BAND_AGENT_ID`, `BAND_API_KEY`, `BAND_BASE_URL`, and
+  the target room from `BAND_HOME_ROOM` → `BAND_HUB_ROOM`) and mentions all non-agent participants
+  — the same branch the live path takes for a room it has not yet heard a human speak in. Chunking
+  and the mandatory per-chunk @mention are shared code with the live send, so the two cannot drift.
 
 ### The Hub (main channel + command surface)
 
@@ -490,9 +511,11 @@ whatever the agent didn't mark `processed` is still owed to it, across any outag
 
 ### Limitations
 
-- **Memory + standalone cron deferred.** Memory preload/write-through and out-of-process cron
-  delivery (`standalone_sender_fn`) land in later passes (extension points are marked
-  `# TODO (<pass>):` in the adapter).
+- **Memory deferred.** Memory preload/write-through lands in a later pass (the extension point is
+  marked `# TODO (<pass>):` in the adapter).
+- **Out-of-process delivery is text-only.** The `standalone_sender_fn` accepts `media_files` /
+  `force_document` for signature parity but ignores them, and it cannot prefer a room's last human
+  sender (that cache lives on a connected adapter) — it mentions all non-agent participants.
 - **No per-message retry cap on failure.** A turn that errors is marked `failed`, which the server
   may re-offer on a later `/next` drain. There is no attempt-count ceiling yet, so a
   persistently-failing message can re-deliver across reconnects.

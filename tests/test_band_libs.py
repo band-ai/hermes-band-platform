@@ -94,6 +94,19 @@ def test_sdk_install_command_is_target_form():
     assert _band_libs.BAND_SDK_SPEC in cmd
 
 
+def test_sdk_floor_is_the_first_version_carrying_the_usage_contract():
+    """The floor is load-bearing, so pin it here rather than leave it to drift.
+
+    ``usage_events`` imports ``TurnUsage`` / ``USAGE_EVENT_TYPE`` /
+    ``USAGE_METADATA_KEY`` from ``band.core.types``. Those first exist in
+    band-sdk 1.3.0 — 1.2.0 and earlier have none of them — and their absence is
+    handled by turning usage emission off, so an under-declared floor produces a
+    silently featureless install rather than an error. Any lowering of this
+    constant must therefore be deliberate.
+    """
+    assert _band_libs.BAND_SDK_SPEC == "band-sdk>=1.3.0,<2.0.0"
+
+
 def test_bootstrap_never_raises_and_logs_the_fix(
     monkeypatch, tmp_path, clean_sys_path, caplog
 ):

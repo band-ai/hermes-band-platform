@@ -20,7 +20,9 @@ tests exercise the production read path (``get_session_env``).
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -125,6 +127,34 @@ def _owner_env(monkeypatch):
 def _parse(result: str) -> dict:
     assert isinstance(result, str)
     return json.loads(result)
+
+
+@pytest.fixture
+def other_loop():
+    """A second event loop, really running, in another thread.
+
+    Stands in for the gateway's loop while the test body runs on the agent's.
+    A mismatch cannot be faked with a non-running loop object: the condition
+    under test is two live loops in one process, which is exactly the shape a
+    gateway-hosted tool call has.
+    """
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def _run():
+        asyncio.set_event_loop(loop)
+        loop.call_soon(ready.set)
+        loop.run_forever()
+
+    thread = threading.Thread(target=_run, daemon=True, name="other-loop")
+    thread.start()
+    assert ready.wait(timeout=5), "second loop never started"
+    try:
+        yield loop
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        loop.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1006,3 +1036,105 @@ class TestOwnerAuthority:
         import gateway.run as gateway_run
         monkeypatch.setattr(gateway_run, "_gateway_runner_ref", lambda: fake_runner)
         assert band_tools._owner_identity() == "live-owner"
+
+
+# ---------------------------------------------------------------------------
+# 10. _rest() loop affinity — the live link's REST client is loop-bound
+# ---------------------------------------------------------------------------
+
+class TestRestClientLoopAffinity:
+    """``_rest`` must not hand a gateway-loop client to an agent-loop caller.
+
+    ``BandLink`` builds one long-lived ``AsyncRestClient`` in its constructor, so
+    its pool binds to the loop that issues the first request. Awaiting it from
+    another loop raises ``<asyncio.locks.Event ...> is bound to a different event
+    loop`` — observed on a live gateway as every ``band_*`` tool failing in
+    ~0.02s without reaching the network.
+
+    Not reachable through the mocked-``_rest`` strategy the rest of this file
+    uses: the bug is in ``_rest`` itself and needs two real running loops.
+    """
+
+    @staticmethod
+    def _fake_runner(adapter):
+        return SimpleNamespace(adapters={band_tools.Platform("band"): adapter})
+
+    @pytest.mark.asyncio
+    async def test_same_loop_reuses_the_live_link(self, monkeypatch):
+        """The no-second-connection optimisation must survive the fix."""
+        link = SimpleNamespace(rest=MagicMock(name="link-rest"))
+        adapter = SimpleNamespace(_link=link, _link_loop=asyncio.get_running_loop())
+        import gateway.run as gateway_run
+        monkeypatch.setattr(
+            gateway_run, "_gateway_runner_ref", lambda: self._fake_runner(adapter)
+        )
+        assert await band_tools._rest() is link.rest
+
+    @pytest.mark.asyncio
+    async def test_unknown_link_loop_keeps_previous_behaviour(self, monkeypatch):
+        """Only a *proven* mismatch declines; an unrecorded loop does not."""
+        link = SimpleNamespace(rest=MagicMock(name="link-rest"))
+        adapter = SimpleNamespace(_link=link, _link_loop=None)
+        import gateway.run as gateway_run
+        monkeypatch.setattr(
+            gateway_run, "_gateway_runner_ref", lambda: self._fake_runner(adapter)
+        )
+        assert await band_tools._rest() is link.rest
+
+    @pytest.mark.asyncio
+    async def test_cross_loop_declines_the_shared_client(self, monkeypatch, other_loop):
+        """The regression: a different running loop must not get link.rest."""
+        monkeypatch.setenv("BAND_API_KEY", "k-test")
+        monkeypatch.setenv("BAND_BASE_URL", "")
+        link = SimpleNamespace(rest=MagicMock(name="link-rest"))
+        adapter = SimpleNamespace(_link=link, _link_loop=other_loop)
+        import gateway.run as gateway_run
+        monkeypatch.setattr(
+            gateway_run, "_gateway_runner_ref", lambda: self._fake_runner(adapter)
+        )
+
+        fresh = MagicMock(name="fresh-per-call-client")
+        with patch("band.client.rest.AsyncRestClient", return_value=fresh) as ctor:
+            got = await band_tools._rest()
+
+        assert got is not link.rest, (
+            "returned the gateway loop's client to an agent-loop caller — "
+            "awaiting it raises 'bound to a different event loop'"
+        )
+        assert got is fresh, "did not fall back to a fresh per-call client"
+        assert ctor.call_args.kwargs["api_key"] == "k-test"
+
+    @pytest.mark.asyncio
+    async def test_cross_loop_without_credentials_reports_clearly(
+        self, monkeypatch, other_loop
+    ):
+        """Declining must not degrade into a cryptic failure."""
+        monkeypatch.delenv("BAND_API_KEY", raising=False)
+        link = SimpleNamespace(rest=MagicMock(name="link-rest"))
+        adapter = SimpleNamespace(_link=link, _link_loop=other_loop)
+        import gateway.run as gateway_run
+        monkeypatch.setattr(
+            gateway_run, "_gateway_runner_ref", lambda: self._fake_runner(adapter)
+        )
+        with pytest.raises(band_tools._ToolUnavailable):
+            await band_tools._rest()
+
+
+class TestToolExcLogging:
+    """An unexpected tool exception must leave frames behind, not one bare line."""
+
+    def test_unexpected_exception_logs_traceback(self, caplog):
+        try:
+            raise RuntimeError("<Event> is bound to a different event loop")
+        except RuntimeError as exc:
+            with caplog.at_level("DEBUG", logger=band_tools.logger.name):
+                out = _parse(band_tools._tool_exc(exc))
+        assert "error" in out
+        assert any(r.exc_info for r in caplog.records), "no traceback captured"
+        assert "RuntimeError" in caplog.text
+
+    def test_expected_tool_error_stays_quiet(self, caplog):
+        with caplog.at_level("DEBUG", logger=band_tools.logger.name):
+            out = _parse(band_tools._tool_exc(band_tools._ToolError("no room_id")))
+        assert "error" in out
+        assert not any(r.exc_info for r in caplog.records)

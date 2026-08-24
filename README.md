@@ -354,6 +354,9 @@ idempotent:
 
 Existing rooms are **never adopted** — a fresh install with no pinned id always gets its own
 dedicated room, so the hub can't collide with an unrelated owner↔agent conversation.
+Because this room authorizes slash commands, `band_add_participant` and
+`band_remove_participant` refuse to change its membership.
+
 
 The resolved hub id is written back to `BAND_HUB_ROOM` (Hermes `.env`) and the hub is wired as the
 Band **home channel** — the default target for cron jobs (`deliver=band`) and gateway

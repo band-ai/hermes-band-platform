@@ -39,6 +39,7 @@ import logging
 import os
 import threading
 import time
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, TypedDict
@@ -310,6 +311,13 @@ class _MentionPlan(NamedTuple):
     unresolved: List[str]
     ambiguous: List[str]
 
+_MENTION_KIND_REFERENCE = "reference"
+
+
+def _is_delivery_mention_item(item: Any) -> bool:
+    """Whether a mention item notifies its participant."""
+    return getattr(item, "kind", None) != _MENTION_KIND_REFERENCE
+
 
 def _clean_handle(participant: Optional[Dict[str, Any]]) -> Optional[str]:
     if not participant:
@@ -332,9 +340,50 @@ def _available_handles(participants: List[Dict[str, Any]]) -> List[str]:
     )
 
 
+def _substitutes_safely(content: str, token: str) -> bool:
+    """Whether Band's substring replacement stays inside a whole @token."""
+    if not token:
+        return False
+    literal = "@" + token
+    occurrences = (content or "").count(literal)
+    if occurrences == 0:
+        return True
+    pattern = rf"(?<![\w@/])@{re.escape(token)}(?![\w/@]|[.-]\w)"
+    return len(re.findall(pattern, content or "")) == occurrences
+
+
+def align_mentions_to_content(content: str, mention_items: List[Any]) -> List[Any]:
+    """Withhold fields Band would substitute into a longer @token."""
+    if not mention_items:
+        return []
+    aligned: List[Any] = []
+    changed = False
+    for item in mention_items:
+        handle = getattr(item, "handle", None)
+        name = getattr(item, "name", None)
+        safe_handle = (
+            handle if _substitutes_safely(content, str(handle or "")) else None
+        )
+        safe_name = name if _substitutes_safely(content, str(name or "")) else None
+        if safe_handle == handle and safe_name == name:
+            aligned.append(item)
+            continue
+        changed = True
+        fields = {
+            "id": getattr(item, "id", None),
+            "handle": safe_handle,
+            "name": safe_name,
+        }
+        if (kind := getattr(item, "kind", None)) is not None:
+            fields["kind"] = kind
+        aligned.append(type(item)(**fields))
+    return aligned if changed else mention_items
+
 def _resolve_mentions(
     participants: List[Dict[str, Any]],
     entries: Optional[List[Any]],
+    *,
+    agent_id: Optional[str] = None,
 ) -> _MentionPlan:
     """Resolve explicit handles/IDs/unique names against one room roster."""
     by_handle: Dict[str, Dict[str, Any]] = {}
@@ -352,6 +401,7 @@ def _resolve_mentions(
     items: List[Any] = []
     unresolved: List[str] = []
     ambiguous: List[str] = []
+    seen_participant_ids: set[str] = set()
     for raw_entry in entries or []:
         if isinstance(raw_entry, dict):
             identifier = str(
@@ -378,13 +428,18 @@ def _resolve_mentions(
         if participant is None or not handle:
             unresolved.append(identifier)
             continue
-        items.append(
-            ChatMessageRequestMentionsItem(
-                id=participant["id"],
-                handle=handle,
-                name=participant.get("name"),
-            )
-        )
+        resolved_id = str(participant["id"])
+        if resolved_id in seen_participant_ids:
+            continue
+        seen_participant_ids.add(resolved_id)
+        item_fields = {
+            "id": participant["id"],
+            "handle": handle,
+            "name": participant.get("name"),
+        }
+        if participant["id"] == agent_id:
+            item_fields["kind"] = _MENTION_KIND_REFERENCE
+        items.append(ChatMessageRequestMentionsItem(**item_fields))
     return _MentionPlan(items, unresolved, ambiguous)
 
 
@@ -408,6 +463,11 @@ def _mention_error(
         )
     if plan.unresolved:
         details.append("unknown or handle-less recipients: " + ", ".join(plan.unresolved))
+    if plan.items and not any(_is_delivery_mention_item(item) for item in plan.items):
+        return (
+            "Band requires at least one delivery mention of someone else; an "
+            "agent cannot @mention itself. Nothing was sent."
+        )
     if not details and plan.items:
         return None
     available = ", ".join(_available_handles(participants)) or "none"
@@ -486,6 +546,7 @@ async def _post_chunks(
     last_resp: Any = None
     continuation: List[str] = []
     posted = 0
+    mention_items = align_mentions_to_content(content, mention_items)
     for chunk in BasePlatformAdapter.truncate_message(content, max_length):
         resp = await rest.agent_api_messages.create_agent_chat_message(
             chat_id=room_id,
@@ -2753,7 +2814,9 @@ class BandAdapter(BasePlatformAdapter):
         if not isinstance(raw_entries, list) or not raw_entries:
             return [], _mention_error(_MentionPlan([], [], []), [], missing=True)
         participants = await self._get_participants(room_id)
-        plan = _resolve_mentions(participants, raw_entries)
+        plan = _resolve_mentions(
+            participants, raw_entries, agent_id=self._agent_id
+        )
         return plan.items, _mention_error(plan, participants)
 
     def _record_sent_id(self, sent_id: str) -> None:
@@ -3114,7 +3177,6 @@ async def _standalone_send(
         try:
             participants = await _fetch_participants(rest, room_id)
         except Exception as e:
-            # The live path swallows this inside _get_participants and then fails on
             # the empty mention list. Report the real cause instead: a cron job that
             # cannot deliver should say why, not blame the mention list.
             logger.error(
@@ -3129,7 +3191,7 @@ async def _standalone_send(
                 )
             }
 
-        plan = _resolve_mentions(participants, mentions)
+        plan = _resolve_mentions(participants, mentions, agent_id=agent_id)
         if error := _mention_error(plan, participants):
             logger.error(
                 "[band] Standalone recipient resolution failed for room %s",

@@ -51,6 +51,7 @@ from .adapter import (
     _derive_urls,
     _mention_error,
     _resolve_mentions,
+    align_mentions_to_content,
     _short_id,
     note_deliberate_send,
     check_band_requirements,
@@ -450,7 +451,8 @@ async def _mentions_for(
             "participant handle (for example `@alice`). Nothing was sent."
         )
     participants = await _list_participants(rest, room_id)
-    plan = _resolve_mentions(participants, entries)
+    agent_id = await _agent_id_or_none(rest)
+    plan = _resolve_mentions(participants, entries, agent_id=agent_id)
     if error := _mention_error(plan, participants):
         raise _ToolError(error)
     return plan.items
@@ -564,6 +566,7 @@ async def _handle_create_room(args: dict, **kwargs) -> str:
                     id=resolved["id"], handle=resolved.get("handle"), name=resolved.get("name")
                 )
             ]
+            mentions = align_mentions_to_content(message, mentions)
             chunks = BasePlatformAdapter.truncate_message(message, _MAX_MESSAGE_LENGTH)
             sent_id: Optional[str] = None
             for chunk in chunks:
@@ -684,6 +687,7 @@ async def _handle_send_message(args: dict, **kwargs) -> str:
             entries = [entries]
         mentions = await _mentions_for(rest, room_id, entries)
 
+        mentions = align_mentions_to_content(content, mentions)
         chunks = BasePlatformAdapter.truncate_message(content, _MAX_MESSAGE_LENGTH)
         last_id: Optional[str] = None
         for chunk in chunks:

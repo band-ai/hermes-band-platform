@@ -378,6 +378,98 @@ class TestSendMessage:
         assert (mention.id, mention.handle) == ("u-y", "y")
 
     @pytest.mark.asyncio
+    async def test_self_recipient_is_a_reference_but_human_still_delivers(
+        self, owner_session
+    ):
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[
+                    _peer("agent-self", handle="bot", ptype="Agent"),
+                    _peer("u-y", handle="y"),
+                ]
+            )
+        )
+        with _patch_rest(rest), _patch_agent_id("agent-self"):
+            out = _parse(
+                await band_tools._handle_send_message(
+                    {"content": "hi", "mentions": ["@y", "@bot"]}
+                )
+            )
+        assert out["success"] is True
+        mentions = (
+            rest.agent_api_messages.create_agent_chat_message.await_args
+            .kwargs["message"].mentions
+        )
+        assert [mention.id for mention in mentions] == ["u-y", "agent-self"]
+        assert getattr(mentions[0], "kind", None) is None
+        assert mentions[1].kind == "reference"
+
+    @pytest.mark.asyncio
+    async def test_self_only_recipient_list_fails_before_posting(self, owner_session):
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[_peer("agent-self", handle="bot", ptype="Agent")]
+            )
+        )
+        with _patch_rest(rest), _patch_agent_id("agent-self"):
+            out = _parse(
+                await band_tools._handle_send_message(
+                    {"content": "hi", "mentions": ["@bot"]}
+                )
+            )
+        assert "error" in out
+        assert "itself" in out["error"]
+        rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+
+    @pytest.mark.asyncio
+    async def test_duplicate_recipient_forms_reach_band_once(self, owner_session):
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[_peer("u-y", handle="y")])
+        )
+        with _patch_rest(rest), _patch_agent_id("agent-self"):
+            out = _parse(
+                await band_tools._handle_send_message(
+                    {"content": "hi", "mentions": ["@y", "u-y", "@y"]}
+                )
+            )
+        assert out["success"] is True
+        mentions = (
+            rest.agent_api_messages.create_agent_chat_message.await_args
+            .kwargs["message"].mentions
+        )
+        assert [mention.id for mention in mentions] == ["u-y"]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_self_recipient_collapses_to_one_reference(
+        self, owner_session
+    ):
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[
+                    _peer("agent-self", handle="bot", ptype="Agent"),
+                    _peer("u-y", handle="y"),
+                ]
+            )
+        )
+        with _patch_rest(rest), _patch_agent_id("agent-self"):
+            out = _parse(
+                await band_tools._handle_send_message(
+                    {"content": "hi", "mentions": ["@bot", "agent-self", "@y"]}
+                )
+            )
+        assert out["success"] is True
+        mentions = (
+            rest.agent_api_messages.create_agent_chat_message.await_args
+            .kwargs["message"].mentions
+        )
+        assert [mention.id for mention in mentions] == ["agent-self", "u-y"]
+        assert mentions[0].kind == "reference"
+    @pytest.mark.asyncio
     async def test_successful_tool_send_marks_active_turn_replied(self, owner_session):
         rest = _make_rest()
         rest.agent_api_participants.list_agent_chat_participants = AsyncMock(

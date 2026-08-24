@@ -1263,15 +1263,16 @@ def test_verify_roundtrip_url_derivation_matches_the_adapter():
 
 @pytest.mark.asyncio
 async def test_verify_roundtrip_mentions_match_the_adapter(monkeypatch):
-    """The inlined mention builder must stay equivalent to `_mention_items`."""
+    """The inlined mention builder must stay equivalent to `_mention_plan`."""
     module = _load_script("verify_roundtrip.py")
-    from hermes_band_platform.adapter import _mention_items
+    from hermes_band_platform.adapter import _mention_plan
 
     peers = [
         SimpleNamespace(id="u1", handle="owner", name="Owner", type="User"),
         SimpleNamespace(id="bot", handle="agent", name="Agent", type="Agent"),
         SimpleNamespace(id="self", handle="me", name="Me", type="User"),
         SimpleNamespace(id=None, handle="ghost", name="Ghost", type="User"),
+        SimpleNamespace(id="u2", handle=None, name="Handleless", type="User"),
     ]
 
     class _Rest:
@@ -1283,16 +1284,17 @@ async def test_verify_roundtrip_mentions_match_the_adapter(monkeypatch):
     monkeypatch.setattr(module, "_env_value", lambda name: "self" if name == "BAND_AGENT_ID" else "")
 
     inlined = await module._mentions_for(_Rest(), "room-1")
-    expected = _mention_items(
+    expected = _mention_plan(
         [
             {"id": p.id, "handle": p.handle, "name": p.name, "type": p.type}
             for p in peers
         ],
         agent_id="self",
         explicit_ids=None,
-    )
+    ).items
 
     assert [(m.id, m.handle, m.name) for m in inlined] == [
         (m.id, m.handle, m.name) for m in expected
     ]
-    assert [m.id for m in inlined] == ["u1"]  # not the agent, not self, not id-less
+    # not the agent, not self, not id-less, not handle-less (API rejects null)
+    assert [m.id for m in inlined] == ["u1"]

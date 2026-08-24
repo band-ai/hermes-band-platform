@@ -19,13 +19,13 @@ is marked with ``# TODO (<pass>):`` below so it drops in cleanly.
 
 Scope notes:
   * Band rooms are not threads — ``thread_id`` is always None.
-  * Sends require at least one @mention (API enforces ≥1); mentions are built
-    from the cached last-human-sender, falling back to all non-agent room
-    participants.
+  * Sends require at least one @mention (API enforces ≥1) and every mention
+    must carry a non-null ``handle``; mentions are built from the cached
+    last-human-sender, falling back to all non-agent room participants.
   * Outbound sends have two entry points over one primitive: the live adapter's
     ``send``/``_send_on_link`` (link-bound) and the module-level
     ``_standalone_send`` (env-only, for a process with no gateway runner —
-    see its section below). Both resolve mentions with ``_mention_items`` and
+    see its section below). Both resolve mentions with ``_mention_plan`` and
     write through ``_post_chunks``, so they cannot drift.
   * The HUB: on connect the adapter ensures a private owner↔agent control
     room — the pinned ``BAND_HUB_ROOM`` if set, else a freshly created
@@ -44,7 +44,7 @@ import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, TypedDict
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, TypedDict
 from urllib.parse import urlsplit
 
 from gateway.config import HomeChannel, Platform, PlatformConfig  # noqa: E402
@@ -247,13 +247,42 @@ def _derive_urls(base_url: str) -> tuple[str, str]:
     return ws_url, rest_url
 
 
-def _mention_items(
+def _clean_handle(entry: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """A participant's usable Band handle, or None.
+
+    Band's message API requires a non-null handle on every @mention
+    (``/message/mentions/0/handle: null value where string expected``), while a
+    participant record documents ``handle`` as optional ("Omitted if
+    unavailable"). Blank is treated as absent so the gap is caught locally
+    instead of becoming a 422 on send.
+    """
+    if not entry:
+        return None
+    handle = str(entry.get("handle") or "").strip()
+    return handle or None
+
+
+class _MentionPlan(NamedTuple):
+    """The result of resolving mention targets into sendable mention items.
+
+    ``items`` is safe to send: every entry carries a handle. ``unresolved``
+    holds the ids we wanted to mention but have no handle for, so callers can
+    hydrate them from another directory or fail locally with a specific message
+    naming the recipient — instead of shipping ``handle: null`` and getting an
+    opaque API rejection.
+    """
+
+    items: List[Any]
+    unresolved: List[str]
+
+
+def _mention_plan(
     participants: List[Dict[str, Any]],
     *,
     agent_id: Optional[str],
     explicit_ids: Optional[List[str]] = None,
     preferred: Optional[Dict[str, Any]] = None,
-) -> List[Any]:
+) -> _MentionPlan:
     """Build Band's mandatory mention list (Band requires ≥1 per message).
 
     Single source of mention semantics, shared by the adapter's outbound ``send``
@@ -265,45 +294,47 @@ def _mention_items(
          last human sender).
       3. otherwise — every non-agent participant in the room.
 
-    Returns a possibly-empty list; the caller decides whether empty is an error
-    (the tool raises; the adapter lets Band reject the send).
+    A target with no usable handle is *not* turned into a mention item — it is
+    reported in ``unresolved`` (see :class:`_MentionPlan`). Both fields may be
+    empty; the caller decides what that means (the tool raises a recipient
+    error, the adapter drops the send).
     """
     by_id = {p["id"]: p for p in participants if p.get("id")}
+    items: List[Any] = []
+    unresolved: List[str] = []
+
+    def _add(entry: Mapping[str, Any]) -> None:
+        handle = _clean_handle(entry)
+        if not handle:
+            unresolved.append(str(entry["id"]))
+            return
+        items.append(
+            ChatMessageRequestMentionsItem(
+                id=entry["id"], handle=handle, name=entry.get("name")
+            )
+        )
+
     ids = [str(m).strip() for m in (explicit_ids or []) if str(m).strip()]
     if ids:
-        return [
-            ChatMessageRequestMentionsItem(
-                id=mid,
-                handle=(by_id.get(mid) or {}).get("handle"),
-                name=(by_id.get(mid) or {}).get("name"),
-            )
-            for mid in ids
-        ]
+        for mid in ids:
+            known = by_id.get(mid) or {}
+            _add({"id": mid, "handle": known.get("handle"), "name": known.get("name")})
+        return _MentionPlan(items, unresolved)
     if preferred and preferred.get("id"):
-        return [
-            ChatMessageRequestMentionsItem(
-                id=preferred["id"],
-                handle=preferred.get("handle"),
-                name=preferred.get("name"),
-            )
-        ]
-    items: List[Any] = []
+        _add(preferred)
+        return _MentionPlan(items, unresolved)
     for p in participants:
         pid = p.get("id")
         if not pid or pid == agent_id or (p.get("type") or "") == "Agent":
             continue
-        items.append(
-            ChatMessageRequestMentionsItem(
-                id=pid, handle=p.get("handle"), name=p.get("name")
-            )
-        )
-    return items
+        _add(p)
+    return _MentionPlan(items, unresolved)
 
 
 async def _fetch_participants(rest: Any, room_id: str) -> List[Dict[str, Any]]:
     """Fetch a room's participants as ``{id, name, handle, type}`` dicts.
 
-    The exact shape ``_mention_items`` consumes. Shared by the live adapter's
+    The exact shape ``_mention_plan`` consumes. Shared by the live adapter's
     cached ``_get_participants`` and the out-of-process ``_standalone_send`` so
     both resolve mentions from identical data. Errors propagate — each caller
     decides whether a failed fetch is fatal.
@@ -1166,7 +1197,7 @@ class BandAdapter(BasePlatformAdapter):
                 chat_id=room_id,
                 message=ChatMessageRequest(
                     content=self._build_hub_greeting(),
-                    mentions=[ChatMessageRequestMentionsItem(id=self._owner_uuid)],
+                    mentions=[await self._owner_mention(room_id)],
                 ),
                 request_options=DEFAULT_REQUEST_OPTIONS,
             )
@@ -2410,7 +2441,8 @@ class BandAdapter(BasePlatformAdapter):
 
         mention_items = await self._build_mentions(room_id)
         if not mention_items:
-            # API requires ≥1 mention; without a recipient we cannot post.
+            # API requires ≥1 mention, each with a handle; without a resolvable
+            # recipient we cannot post.
             logger.warning(
                 "[band] No mentionable recipient for room %s — dropping send",
                 _short_id(room_id),
@@ -2420,7 +2452,10 @@ class BandAdapter(BasePlatformAdapter):
             )
             return SendResult(
                 success=False,
-                error="No mentionable recipient (Band requires >=1 mention)",
+                error=(
+                    "No mentionable recipient (Band requires >=1 mention and a "
+                    "handle for each; no room participant has one)"
+                ),
                 retryable=False,
             )
 
@@ -2556,13 +2591,136 @@ class BandAdapter(BasePlatformAdapter):
 
         Prefer the cached last-human-sender; otherwise mention every non-agent
         participant in the room. Shares mention semantics with the
-        ``band_send_message`` tool via :func:`_mention_items`.
+        ``band_send_message`` tool via :func:`_mention_plan`.
+
+        Every mention must carry a handle, so a handle-less preferred sender is
+        hydrated from the room roster, then peers/contacts (or the owner handle)
+        and, failing that, we fall through to the room sweep rather than posting
+        a mention Band will reject.
         """
+        participants = await self._get_participants(room_id)
         last = self._last_human_sender.get(room_id)
         if last and last.get("id"):
-            return _mention_items([], agent_id=self._agent_id, preferred=last)
-        participants = await self._get_participants(room_id)
-        return _mention_items(participants, agent_id=self._agent_id)
+            preferred = await self._with_resolved_handle(last, participants)
+            plan = _mention_plan(
+                [],
+                agent_id=self._agent_id,
+                preferred=preferred,
+            )
+            if plan.items:
+                return plan.items
+            logger.debug(
+                "[band] No handle for last sender %s in room %s — mentioning the room",
+                _short_id(str(last.get("id"))),
+                _short_id(room_id),
+            )
+        plan = _mention_plan(participants, agent_id=self._agent_id)
+        if plan.unresolved:
+            logger.warning(
+                "[band] Skipping %d handle-less mention target(s) in room %s "
+                "(Band requires a handle per @mention)",
+                len(plan.unresolved),
+                _short_id(room_id),
+            )
+        return plan.items
+
+    async def _with_resolved_handle(
+        self, entry: Dict[str, Any], participants: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Fill in a mention target's missing handle from known Band sources.
+
+        Sources, in order: the entry itself, the room roster, peers/contacts, and
+        — when the target is the owner — the owner handle derived from this
+        agent's own handle. Returns a copy; the handle stays None when nothing
+        resolves.
+        """
+        if _clean_handle(entry):
+            return entry
+        pid = entry.get("id")
+        handle = self._handle_for_participant(participants, pid)
+        if not handle and pid:
+            handle = await self._handle_from_directory(str(pid))
+        if not handle and pid and pid == self._owner_uuid:
+            handle = self._owner_handle()
+        return {**entry, "handle": handle}
+
+    async def _handle_from_directory(self, participant_id: str) -> Optional[str]:
+        """Resolve a participant handle from peers/contacts when the room omits it."""
+        rest = getattr(getattr(self, "_link", None), "rest", None)
+        if rest is None:
+            return None
+        try:
+            peers_api = getattr(rest, "agent_api_peers", None)
+            list_peers = getattr(peers_api, "list_agent_peers", None)
+            if callable(list_peers):
+                page = 1
+                while page <= 5:
+                    resp = await list_peers(
+                        page=page,
+                        page_size=50,
+                        request_options=DEFAULT_REQUEST_OPTIONS,
+                    )
+                    rows = list(getattr(resp, "data", None) or [])
+                    for row in rows:
+                        if getattr(row, "id", None) == participant_id:
+                            handle = _clean_handle(
+                                {"handle": getattr(row, "handle", None)}
+                            )
+                            if handle:
+                                return handle
+                    if len(rows) < 50:
+                        break
+                    page += 1
+
+            contacts_api = getattr(rest, "agent_api_contacts", None)
+            list_contacts = getattr(contacts_api, "list_agent_contacts", None)
+            if callable(list_contacts):
+                resp = await list_contacts(request_options=DEFAULT_REQUEST_OPTIONS)
+                for row in getattr(resp, "data", None) or []:
+                    if getattr(row, "id", None) == participant_id:
+                        handle = _clean_handle({"handle": getattr(row, "handle", None)})
+                        if handle:
+                            return handle
+        except Exception as e:
+            logger.debug(
+                "[band] mention-handle directory lookup skipped for %s: %s",
+                _short_id(participant_id),
+                e,
+            )
+        return None
+
+    def _owner_handle(self) -> Optional[str]:
+        """The owner's Band handle, derived from this agent's own handle.
+
+        ``get_agent_me`` returns the agent handle as ``owner_handle/agent_slug``,
+        so the prefix is the owner's handle. This is the free last-resort source
+        when a participant record omits it — needed because Band rejects an
+        @mention without a handle, and the owner is the one recipient the
+        adapter must always be able to reach (hub greeting, hub failover).
+        """
+        raw = self._handle or ""
+        if "/" not in raw:
+            return None
+        prefix = raw.split("/", 1)[0].strip()
+        return prefix or None
+
+    async def _owner_mention(self, room_id: str) -> Any:
+        """The owner mention item for a hub send (handle required by the API).
+
+        Prefers the free derivation from the agent handle, then the room roster
+        (one extra REST call, only on the rare hub-bootstrap path). Raises before
+        sending when neither resolves because Band rejects ``handle: null``.
+        """
+        handle = self._owner_handle()
+        if not handle:
+            handle = self._handle_for_participant(
+                await self._get_participants(room_id), self._owner_uuid
+            )
+        if not handle:
+            raise RuntimeError(
+                "No handle resolved for owner mention; Band requires a handle per @mention"
+            )
+        return ChatMessageRequestMentionsItem(id=self._owner_uuid, handle=handle)
 
     def _record_sent_id(self, sent_id: str) -> None:
         """Track a sent message id for the inbound self-echo backstop.
@@ -2743,7 +2901,7 @@ class BandAdapter(BasePlatformAdapter):
 #
 # Everything below resolves from env — with ``PlatformConfig.extra`` as the
 # secondary source, exactly as ``BandAdapter.__init__`` does — and writes
-# through the same ``_mention_items`` / ``_post_chunks`` primitives the live
+# through the same ``_mention_plan`` / ``_post_chunks`` primitives the live
 # path uses.
 # ---------------------------------------------------------------------------
 
@@ -2822,7 +2980,7 @@ async def _standalone_send(
     failure, because the error text is what the operator sees in the job result.
 
     Send behaviour matches ``_send_on_link``: mentions come from the room's
-    participants via the shared ``_mention_items``, and chunking runs through
+    participants via the shared ``_mention_plan``, and chunking runs through
     ``_post_chunks`` at ``BandAdapter.MAX_MESSAGE_LENGTH`` with the mandatory
     mention list repeated on every chunk. The one thing this path cannot
     reproduce is ``_build_mentions``'s *preferred* last-human-sender — that cache
@@ -2857,7 +3015,7 @@ async def _standalone_send(
     agent_id = (os.getenv("BAND_AGENT_ID") or extra.get("agent_id", "")).strip()
     api_key = (os.getenv("BAND_API_KEY") or extra.get("api_key", "")).strip()
     # The agent id is not optional here even though only mentions use it: without
-    # it _mention_items cannot exclude the agent itself, and an agent that
+    # it _mention_plan cannot exclude the agent itself, and an agent that
     # @mentions itself pings itself into a loop.
     missing = [
         name
@@ -2932,7 +3090,17 @@ async def _standalone_send(
                 )
             }
 
-        mention_items = _mention_items(participants, agent_id=agent_id)
+        plan = _mention_plan(participants, agent_id=agent_id)
+        if plan.unresolved:
+            # Same rule as the live path (_build_mentions): a handle-less target
+            # is dropped rather than sent as handle: null, which Band rejects.
+            logger.warning(
+                "[band] Standalone send skipping %d handle-less mention "
+                "target(s) in room %s (Band requires a handle per @mention)",
+                len(plan.unresolved),
+                _short_id(room_id),
+            )
+        mention_items = plan.items
         if not mention_items:
             logger.error(
                 "[band] Standalone send found no mentionable recipient in room %s "
@@ -3230,8 +3398,10 @@ def register(ctx) -> None:
             "final reply text IS delivered to the room automatically, and the "
             "recipient is @mentioned for you, so just answer normally. Do NOT "
             "call band_send_message to reply in the room you are already in: "
-            "that posts your answer twice. Answer whoever addressed you, and if "
-            "several did, address each. @mentioning someone pings them to act, so "
+            "that posts your answer twice; when you do call it, it errors "
+            "instead of sending if it cannot resolve a recipient's handle. "
+            "Answer whoever addressed you, and if several did, address each. "
+            "@mentioning someone pings them to act, so "
             "mention only when you need a reply — never @mention on a plain "
             "acknowledgement, which causes ping-pong loops. You can pull other "
             "people or agents into a room and relay answers between them; load "

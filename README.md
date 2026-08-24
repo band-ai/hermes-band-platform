@@ -336,7 +336,10 @@ the default is the private one and widening it is a deliberate act.
 - **Self-filter**: the adapter skips its own agent messages by sender, with a sent-message-id
   backstop in addition to the SDK's own filtering.
 - **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions the
-  room's last human sender (falling back to all non-agent participants).
+  room's last human sender (falling back to all non-agent participants). Every mention must
+  carry the recipient's Band handle — the API rejects a null one — so handles are resolved
+  locally (roster → peers/contacts → owner handle from `owner_handle/agent_slug`) and an
+  unresolvable recipient fails before the send instead of during it.
 - **Outbound without a gateway**: the plugin also registers a `standalone_sender_fn`, so a
   `deliver: band` cron job delivers even when it fires in a process that holds no gateway runner —
   a forced `hermes cron run <id>` is the everyday case. That path has no link and no caches, so it

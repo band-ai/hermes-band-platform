@@ -38,10 +38,9 @@ this repo (the plugin) →  install steps, the band adapter + toolset, the add-b
 Band (the platform)    →  credentials, agent registration, access control
 ```
 
-- **Band manages access.** A message reaches the agent only if Band delivered it (someone
-  messaged the agent or added it to a room), so the adapter trusts Band's own ACL as the gate
-  (`enforces_own_access_policy`). A fresh install with just an agent id + API key is reachable
-  out of the box; narrow it later with [`BAND_ALLOWED_USERS`](#optional).
+- **Band manages access.** A message reaches the agent only if Band delivered it, so the adapter
+  trusts Band as the sole message-intake authorization boundary (`enforces_own_access_policy`).
+  A fresh install with just an agent id + API key is reachable without a Hermes sender allowlist.
 - **First connect is the installation.** On the first successful connect the adapter resolves
   the owner, creates the **Hermes Agent Hub** room, wires it as the Band main channel, persists
   `BAND_HUB_ROOM`, and greets the owner in-band. See [The Hub](#the-hub-main-channel--command-surface).
@@ -298,11 +297,9 @@ means you're live. If you see `[band] Owner unresolved — hub disabled`, set
 | Variable | Description |
 | --- | --- |
 | `BAND_BASE_URL` | Band host base URL (default `https://app.band.ai`). WS + REST URLs are derived from this host. |
-| `BAND_ALLOWED_USERS` | Comma-separated Band user IDs allowed to talk to the agent. **Optional** — Band's own ACL is trusted by default; set this only to narrow access below what Band already permits. |
-| `BAND_ALLOW_ALL` | Explicitly allow anyone in a room to talk to the agent. Redundant with the default Band-ACL trust; mainly useful to override a `BAND_ALLOWED_USERS` restriction. |
 | `BAND_TOOL_OWNERS` | Comma-separated `platform:user_id` identities allowed to drive Band actions (e.g. `telegram:<tg-id>`). The resolved Band owner is always authorized from Band rooms; this allowlist grants others. |
 | `BAND_GROUP_SESSIONS_PER_USER` | Split a group room into a separate session per participant (`true`) or keep one shared session for the whole room (`false`). Default `false`. |
-| `BAND_OWNER_ID` | Owner UUID override. Normally resolved from the agent identity on connect; anchors the hub and the owner-only gates. |
+| `BAND_OWNER_ID` | Owner UUID override. Normally resolved from the agent identity on connect; anchors the private hub and owner-directed operational messages. |
 | `BAND_HUB_ROOM` | Hub room UUID. Auto-created and persisted on first connect; set it to pin an existing room. |
 | `BAND_HOME_ROOM` | Main-channel override for cron / notification delivery (also set by `/sethome` from a Band room). Defaults to the hub. |
 | `BAND_HUB_FAILOVER_THRESHOLD` | Consecutive failed hub sends before failing over to a fresh hub room (default `3`). A successful hub send resets the count. See [Hub failover](#hub-failover). |
@@ -330,9 +327,9 @@ the default is the private one and widening it is a deliberate act.
 
 - **Inbound**: subscribes to the agent's rooms (including new `room_added` rooms) and consumes
   `message_created` events. Band has no DMs — every room, including the hub, is a group room.
-  Delivery is the addressing signal: a message Band routes to the agent is answered, with no
-  second mention-metadata check, so a room the agent was just added to is live immediately.
-  Slash commands stay owner-only; command-shaped text from anyone else is declined.
+  Delivery is the addressing and authorization signal: every non-self text message Band routes
+  to the agent is answered without a second sender or mention-metadata check. Slash commands are
+  accepted only in the private Hermes Hub.
 - **Self-filter**: the adapter skips its own agent messages by sender, with a sent-message-id
   backstop in addition to the SDK's own filtering.
 - **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions the
@@ -364,11 +361,10 @@ Band **home channel** — the default target for cron jobs (`deliver=band`) and 
 notifications. An explicit `BAND_HOME_ROOM` (or running `/sethome` in another Band room) overrides
 that default.
 
-**Slash-command gate.** Slash commands (`/help`, `/new`, …) are accepted only from the **owner**
-— in *any* Band room, the hub included. A command-shaped message from anyone else is dropped
-before it reaches the gateway: human senders get a one-time per-room notice; other agents are
-dropped silently (a notice would invite bot↔bot ping-pong). The gate is **fail-closed**: if no
-owner can be resolved, Band slash commands are refused everywhere. File-path-like text
+**Slash-command gate.** Slash commands (`/help`, `/new`, …) are accepted only in the private
+Hermes Hub. The hub itself is the authorization boundary, so sender IDs are not rechecked there.
+Command-shaped text in every other room is consumed and acknowledged without a denial message;
+this prevents `/next` redelivery and avoids command/reply loops. File-path-like text
 (`/usr/bin/ls`) is not treated as a command and flows through as plain chat.
 
 #### Hub failover

@@ -9,7 +9,8 @@ description: >
   Wraps the official ``band-sdk`` BandLink — it does not reimplement the
   Band protocol.  Includes the Band action toolset and the Hermes Hub: an
   auto-created owner control room that serves as the Band main channel.
-  Slash commands and Band actions are owner-only across all Band rooms.
+  Slash commands are accepted only in the private Hermes Hub; Band authorizes
+  ordinary message intake.
 author: Thenvoi Inc
 # ``requires_env`` entries are surfaced in ``hermes config`` UI via the
 # platform-plugin env var injector in ``hermes_cli/config.py``.
@@ -29,7 +30,7 @@ optional_env:
     prompt: "Band base URL (or empty for default)"
     password: false
   - name: BAND_OWNER_ID
-    description: "Owner UUID override. Normally resolved from the agent identity on connect; anchors the Hermes Hub (owner control room) and the owner-only gates (slash commands, mutating Band tools)."
+    description: "Owner UUID override. Normally resolved from the agent identity on connect; anchors the private Hermes Hub and owner-directed operational messages."
     prompt: "Owner UUID (or empty)"
     password: false
   - name: BAND_HUB_ROOM
@@ -47,14 +48,6 @@ optional_env:
   - name: BAND_HUB_FAILOVER_MAX_PER_CONNECT
     description: "Backstop cap on how many hub failovers may occur per gateway connection, so a platform-wide outage can't spin up rooms without bound (default 5)."
     prompt: "Max hub failovers per connect (or empty for 5)"
-    password: false
-  - name: BAND_ALLOWED_USERS
-    description: "Optional. Comma-separated Band user IDs allowed to talk to the agent. Band's own ACL is trusted by default (the adapter enforces its own access policy); set this only to narrow access below what Band already permits."
-    prompt: "Allowed user IDs (comma-separated, or empty to trust Band's ACL)"
-    password: false
-  - name: BAND_ALLOW_ALL
-    description: "Explicitly allow anyone in a room to talk to the agent. Redundant with the default Band-ACL trust; mainly useful to override a BAND_ALLOWED_USERS restriction. Does not grant owner-only slash commands."
-    prompt: "Allow all users? (true/false)"
     password: false
   - name: BAND_TOOL_OWNERS
     description: "Optional. Band action tools are loose by default (Band owns access control and enforces roles server-side). Set this to a comma-separated platform:user_id allowlist (e.g. telegram:<tg-id>) to restrict the tools to specific callers; the resolved Band owner always passes. Leave empty to allow anyone the agent is conversing with."

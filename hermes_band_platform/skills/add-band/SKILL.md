@@ -185,7 +185,6 @@ re-installs or re-registers what's already in place.
    "$HERMES_PY" scripts/ensure_access_policy.py   # writes platforms.band.extra.{group,dm}_policy=allowlist; idempotent
    ```
    - Restart the gateway after a change for it to take effect.
-   - Quick alternative for an immediate unblock without editing config: `hermes config set BAND_ALLOW_ALL true` (broader — trusts every sender Band delivers; the `allowlist` policy is the precise equivalent of Band's ACL).
 
 7. Restart the gateway.
    - Use the user's normal Hermes gateway restart command.

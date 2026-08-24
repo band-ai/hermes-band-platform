@@ -268,17 +268,12 @@ class TestBandPluginRegistration:
         assert "BAND_AGENT_ID" in kwargs["required_env"]
         assert "BAND_API_KEY" in kwargs["required_env"]
 
-    def test_register_passes_allowed_users_env(self):
+    def test_register_exposes_no_sender_allowlist_envs(self):
         ctx = MagicMock()
         register(ctx)
         kwargs = ctx.register_platform.call_args[1]
-        assert kwargs["allowed_users_env"] == "BAND_ALLOWED_USERS"
-
-    def test_register_passes_allow_all_env(self):
-        ctx = MagicMock()
-        register(ctx)
-        kwargs = ctx.register_platform.call_args[1]
-        assert kwargs["allow_all_env"] == "BAND_ALLOW_ALL"
+        assert "allowed_users_env" not in kwargs
+        assert "allow_all_env" not in kwargs
 
     def test_register_passes_max_message_length(self):
         ctx = MagicMock()
@@ -868,9 +863,9 @@ class TestInboundSelfFilter:
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_owner_command_dispatches_without_mention(self, adapter):
-        # A validated owner slash command is answered even with no @mention.
-        adapter._owner_uuid = "human-sender"
+    async def test_hub_command_dispatches_without_mention_or_owner_check(self, adapter):
+        adapter._hub_room_id = "room-abc"
+        adapter._owner_uuid = "different-user"
         event = self._make_event(
             sender_id="human-sender",
             sender_type="User",
@@ -3053,37 +3048,32 @@ class TestStripSelfMention:
         assert adapter._strip_self_mention("") == ""
 
     @pytest.mark.asyncio
-    async def test_addressed_command_dispatches(self, monkeypatch):
-        """An @mentioned slash command from the owner reaches the gateway."""
-        monkeypatch.delenv("BAND_HUB_ROOM", raising=False)
+    async def test_hub_command_strips_self_mention_before_dispatch(self, monkeypatch):
         a = _make_adapter(monkeypatch, agent_id="agent-self-id")
         a._agent_id = "agent-self-id"
-        a._owner_uuid = "owner-1"
-        a.handle_message = AsyncMock()
-        a.send = AsyncMock()
-        a._participants_cache["chat-room"] = [
-            {"id": "agent-self-id", "type": "Agent", "name": "Bot", "handle": "bot"},
-            {"id": "owner-1", "type": "User", "name": "Owner", "handle": "owner"},
+        a._hub_room_id = "hub-room"
+        a._participants_cache["hub-room"] = [
+            {"id": "any-band-user", "type": "User", "name": "User", "handle": "user"}
         ]
+        a.handle_message = AsyncMock()
         payload = SimpleNamespace(
             id="m1",
             content="@[[agent-self-id]] /help",
             message_type="text",
-            sender_id="owner-1",
+            sender_id="any-band-user",
             sender_type="User",
-            sender_name="Owner",
-            chat_room_id="chat-room",
+            sender_name="User",
+            chat_room_id="hub-room",
             metadata=SimpleNamespace(mentions=[]),
         )
         await a._handle_message_created(
-            SimpleNamespace(type="message_created", room_id="chat-room", payload=payload)
+            SimpleNamespace(type="message_created", room_id="hub-room", payload=payload)
         )
         a.handle_message.assert_called_once()
-        # The relayed text is the bare command, so the gateway dispatches it.
         assert a.handle_message.call_args.args[0].text == "/help"
 
 
-class TestOwnerCommandGate:
+class TestHubCommandGate:
 
     @pytest.fixture
     def adapter(self, monkeypatch):
@@ -3092,16 +3082,15 @@ class TestOwnerCommandGate:
         a._agent_id = "agent-self-id"
         a._owner_uuid = "owner-1"
         a._hub_room_id = "hub-room"
-        a.handle_message = AsyncMock()
-        a.send = AsyncMock()
+        a._link = _ack_link()
         a._participants_cache["hub-room"] = [
-            {"id": "agent-self-id", "type": "Agent", "name": "Bot", "handle": "bot"},
-            {"id": "owner-1", "type": "User", "name": "Owner", "handle": "owner"},
+            {"id": "any-band-user", "type": "User", "name": "User", "handle": "user"}
         ]
         a._participants_cache["chat-room"] = [
-            {"id": "agent-self-id", "type": "Agent", "name": "Bot", "handle": "bot"},
-            {"id": "human-2", "type": "User", "name": "Bob", "handle": "bob"},
+            {"id": "human-2", "type": "User", "name": "Human", "handle": "human"}
         ]
+        a.handle_message = AsyncMock()
+        a.send = AsyncMock()
         return a
 
     @staticmethod
@@ -3123,85 +3112,67 @@ class TestOwnerCommandGate:
         return SimpleNamespace(type="message_created", room_id=room_id, payload=payload)
 
     @pytest.mark.asyncio
-    async def test_owner_command_in_hub_relayed(self, adapter):
-        await adapter._handle_message_created(self._event("hub-room", "owner-1", "/help"))
+    async def test_command_in_hub_relayed_without_sender_check(self, adapter):
+        await adapter._handle_message_created(
+            self._event("hub-room", "not-the-owner", "/help")
+        )
         adapter.handle_message.assert_called_once()
         adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_owner_command_outside_hub_relayed(self, adapter):
-        await adapter._handle_message_created(self._event("chat-room", "owner-1", "/help"))
-        adapter.handle_message.assert_called_once()
+    async def test_command_outside_hub_is_acked_and_not_forwarded(self, adapter):
+        await adapter._handle_message_created(
+            self._event("chat-room", "owner-1", "/help")
+        )
+        adapter.handle_message.assert_not_called()
         adapter.send.assert_not_called()
+        adapter._link.mark_processed.assert_awaited_once_with(
+            "chat-room", "msg-gate-1"
+        )
 
     @pytest.mark.asyncio
-    async def test_owner_command_works_without_hub(self, adapter):
+    async def test_command_rejected_when_hub_is_unresolved(self, adapter):
         adapter._hub_room_id = None
-        await adapter._handle_message_created(self._event("chat-room", "owner-1", "/help"))
-        adapter.handle_message.assert_called_once()
-        adapter.send.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_non_owner_command_dropped_with_notice(self, adapter):
-        await adapter._handle_message_created(self._event("chat-room", "human-2", "/help"))
-        adapter.handle_message.assert_not_called()
-        adapter.send.assert_awaited_once()
-        args = adapter.send.await_args.args
-        assert args[0] == "chat-room"
-        assert "owner" in args[1]
-
-    @pytest.mark.asyncio
-    async def test_notice_sent_only_once_per_room(self, adapter):
-        await adapter._handle_message_created(self._event("chat-room", "human-2", "/help"))
         await adapter._handle_message_created(
-            self._event("chat-room", "human-2", "/new", msg_id="msg-gate-2")
-        )
-        adapter.handle_message.assert_not_called()
-        assert adapter.send.await_count == 1
-
-    @pytest.mark.asyncio
-    async def test_non_owner_command_in_hub_dropped(self, adapter):
-        await adapter._handle_message_created(self._event("hub-room", "intruder-9", "/new"))
-        adapter.handle_message.assert_not_called()
-        adapter.send.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_agent_sender_command_dropped_silently(self, adapter):
-        await adapter._handle_message_created(
-            self._event("chat-room", "other-agent-7", "/help", sender_type="Agent")
+            self._event("chat-room", "owner-1", "/help")
         )
         adapter.handle_message.assert_not_called()
         adapter.send.assert_not_called()
+        adapter._link.mark_processed.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_path_like_text_relayed_as_chat(self, adapter):
-        # Path-like text isn't a command, so the command gate relays it as plain
-        # chat. Mention metadata is irrelevant to inbound routing.
-        await adapter._handle_message_created(
-            self._event("chat-room", "human-2", "/usr/bin/ls is missing", mentioned=True)
-        )
-        adapter.handle_message.assert_called_once()
-        adapter.send.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_fail_closed_without_owner(self, adapter):
+    async def test_hub_command_does_not_depend_on_owner_resolution(self, adapter):
         adapter._owner_uuid = None
-        await adapter._handle_message_created(self._event("hub-room", "owner-1", "/help"))
-        adapter.handle_message.assert_not_called()
-        adapter.send.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_plain_chat_in_hub_relayed_without_mention_metadata(self, adapter):
-        # Delivery is the address signal in the hub just like every joined room.
-        await adapter._handle_message_created(self._event("hub-room", "owner-1", "hello"))
+        await adapter._handle_message_created(
+            self._event("hub-room", "any-band-user", "/new")
+        )
         adapter.handle_message.assert_called_once()
         adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_mentioned_chat_in_hub_relayed(self, adapter):
-        # Direct mention metadata does not change normal inbound routing.
+    async def test_path_like_text_outside_hub_is_plain_chat(self, adapter):
         await adapter._handle_message_created(
-            self._event("hub-room", "owner-1", "hello", mentioned=True)
+            self._event("chat-room", "human-2", "/usr/bin/ls is missing")
+        )
+        adapter.handle_message.assert_called_once()
+        adapter.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_plain_text_outside_hub_is_forwarded_without_mention_metadata(
+        self, adapter
+    ):
+        await adapter._handle_message_created(
+            self._event("chat-room", "human-2", "hello")
+        )
+        adapter.handle_message.assert_called_once()
+        adapter.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_plain_text_in_hub_is_forwarded_without_mention_metadata(
+        self, adapter
+    ):
+        await adapter._handle_message_created(
+            self._event("hub-room", "any-band-user", "hello")
         )
         adapter.handle_message.assert_called_once()
         adapter.send.assert_not_called()

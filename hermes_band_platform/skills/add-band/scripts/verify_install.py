@@ -168,17 +168,12 @@ def _env_value(name: str) -> str:
 
 
 def _access_policy_allowlist() -> bool:
-    """Whether Band's access policy authorizes Band traffic at the gateway.
+    """Whether config records Band's platform-authorized intake policy.
 
-    The gateway only trusts Band's own ACL when the effective policy for the
-    chat type is ``"allowlist"`` (Band has no DMs, so traffic is group). True if
-    the config records ``platforms.band.extra.group_policy = "allowlist"`` (the
-    version-independent record written by ``ensure_access_policy.py``) or
-    ``BAND_ALLOW_ALL`` is set. False (→ default-deny, "not an authorized user")
-    when neither is present.
+    The gateway trusts Band's own ACL only when the effective group policy is
+    ``"allowlist"``. ``ensure_access_policy.py`` writes that version-independent
+    config record. Legacy sender env overrides do not participate.
     """
-    if _env_value("BAND_ALLOW_ALL").strip().lower() in {"true", "1", "yes"}:
-        return True
     try:
         from hermes_cli.config import load_config
 

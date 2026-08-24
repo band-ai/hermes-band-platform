@@ -21,7 +21,8 @@ Design anchors (see ``Drafts/hermes-band-tools-events-buildplan.md``):
     adding/removing/messaging are the agent's own outbound actions; Band itself
     is the ACL (it admits participants and enforces member/admin/owner roles
     server-side), so Hermes does not re-gate them — they are loose by default.
-    The one owner-only surface is Hermes slash commands, gated in ``adapter.py``.
+    Slash commands are a separate control surface accepted only in the private
+    Hermes Hub.
     Optional tightening: set ``BAND_TOOL_OWNERS`` (``platform:user_id`` list) to
     restrict these tools to specific callers (the resolved Band owner always
     passes).  Read-only tools (find/get) are never gated.
@@ -323,9 +324,10 @@ def _authorize_band_action() -> None:
 
     Policy: outbound Band actions are **loose** by default. Band itself owns
     access control — it decides who is admitted to a room and enforces role
-    permissions (member/admin/owner) server-side — so Hermes does not re-gate
-    the agent's own outbound actions. The one owner-only surface is Hermes
-    slash commands, gated separately in ``adapter.py``.
+    permissions (member/admin/owner) server-side, so Hermes does not re-gate
+    the agent's own outbound actions.
+    Slash commands are a separate control surface accepted only in the private
+    Hermes Hub.
 
     Optional tightening: set ``BAND_TOOL_OWNERS`` (comma-separated
     ``platform:user_id`` identities) to restrict Band actions to specific

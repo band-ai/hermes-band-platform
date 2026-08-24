@@ -256,8 +256,8 @@ def test_verify_install_access_policy_check_reads_config(monkeypatch):
     store["config"] = {}  # no policy anywhere, BAND_ALLOW_ALL unset
     assert module._access_policy_allowlist() is False
 
-    store["env"] = {"BAND_ALLOW_ALL": "true"}  # the env override authorizes too
-    assert module._access_policy_allowlist() is True
+    store["env"] = {"BAND_ALLOW_ALL": "true"}
+    assert module._access_policy_allowlist() is False
 
 
 def test_verify_install_detects_bundled_conversations_skill():

@@ -31,9 +31,8 @@ Scope notes:
     room — the pinned ``BAND_HUB_ROOM`` if set, else a freshly created
     "Hermes Hub" — and wires it as the platform home channel (the Band main
     channel). Existing rooms are never adopted as the hub.
-  * Slash commands are OWNER-ONLY, in any Band room — command-shaped
-    messages from anyone else are dropped (one-time notice for humans,
-    silent for agents; fail-closed when the owner is unresolved).
+  * Slash commands are accepted only in the private owner↔agent hub. Band is
+    the intake authorization boundary for ordinary delivered text.
 """
 
 import asyncio
@@ -198,10 +197,6 @@ _SESSION_CHAT_TYPE = "group"
 # name the owner and the agent.
 _HUB_TITLE = "Hermes Agent Hub"
 
-# One-time notice posted when a slash command arrives from a non-owner human.
-_OWNER_COMMAND_NOTICE = (
-    "Slash commands are only accepted from this agent's owner."
-)
 
 # Default number of consecutive failed hub sends before the adapter fails over
 # to a fresh hub room, and the per-connect backstop cap on how many failovers
@@ -690,7 +685,7 @@ class BandAdapter(BasePlatformAdapter):
         self._api_key = (os.getenv("BAND_API_KEY") or extra.get("api_key", "")).strip()
         self._base_url = (os.getenv("BAND_BASE_URL") or extra.get("base_url", "")).strip()
         # Owner override; else resolved from agent identity on connect. Anchors
-        # the hub (owner control room) and the command gate.
+        # the private hub; command authorization is room-based, not sender-based.
         self._owner_uuid = os.getenv("BAND_OWNER_ID") or extra.get("owner_id", "") or None
         # Hub room — pinned id from env/extra, else created by _ensure_hub() on
         # connect; it's the platform home channel (cron/notifications land there).
@@ -698,8 +693,6 @@ class BandAdapter(BasePlatformAdapter):
             str(os.getenv("BAND_HUB_ROOM") or extra.get("hub_room", "") or "").strip()
             or None
         )
-        # Rooms already given the one-time "commands are owner-only" notice.
-        self._cmd_notice_rooms: set = set()
 
         # ── Access policy ──
         # Pinned to "allowlist" so the host's authz gate trusts our own-policy
@@ -832,11 +825,9 @@ class BandAdapter(BasePlatformAdapter):
         owner/hub bootstrap on first connect; after that Band governs who can
         reach the agent.
 
-        ``BAND_ALLOWED_USERS`` / ``BAND_ALLOW_ALL`` remain wired (register()) as
-        an *optional* extra restriction an operator can layer on top: once
-        either is set, the gateway's explicit allowlist check applies instead of
-        this default-trust. The owner-only slash-command gate and the
-        ``BAND_TOOL_OWNERS`` mutating-tool gate are independent and unaffected.
+        Sender allowlist env hooks are intentionally not registered: Band is the
+        sole intake authorization boundary. ``BAND_TOOL_OWNERS`` remains a
+        separate authorization control for mutating tools, not message intake.
         """
         return True
 
@@ -1628,15 +1619,13 @@ class BandAdapter(BasePlatformAdapter):
             }
             self._cap_cache(self._last_human_sender, _ROOM_CACHE_MAX)
 
-        # Owner-command gate: slash commands are owner-only, in any room. Others'
-        # command-shaped text is dropped here (one-time notice for humans, silent
-        # for agents to avoid bot↔bot ping-pong); fail-closed when no owner is
-        # resolved. Runs after the last-sender update so a notice can @mention them.
+        # Commands are a control-room capability. The private hub itself is the
+        # authorization boundary; sender identity is irrelevant inside it.
         is_command = self._is_command_text(inb.content)
-        if is_command and not self._is_owner_command(inb.sender_id):
-            if inb.sender_type != "Agent":
-                await self._notify_command_blocked(inb.room_id)
-            # Ack rejected commands so the drain does not re-offer them.
+        if is_command and not self._command_allowed(inb.room_id):
+            # /next would re-offer this command-shaped text unless it is made
+            # terminal. Do not post a denial message: that would need its own
+            # explicit recipient and can create command/reply loops.
             await self._ack_consumed(inb.room_id, inb.msg_id)
             return False
 
@@ -2315,27 +2304,13 @@ class BandAdapter(BasePlatformAdapter):
             first = first.split("@", 1)[0]
         return bool(first) and "/" not in first
 
-    def _is_owner_command(self, sender_id: Any) -> bool:
-        """True when a slash command is allowed: from the owner, any room."""
-        return bool(self._owner_uuid and sender_id == self._owner_uuid)
+    def _command_allowed(self, room_id: str) -> bool:
+        """Whether slash commands are accepted in this room.
 
-    async def _notify_command_blocked(self, room_id: str) -> None:
-        """Drop a non-owner slash command, with a one-time per-room notice."""
-        if room_id in self._cmd_notice_rooms:
-            logger.debug(
-                "[band] Dropped non-owner slash command in room %s", _short_id(room_id)
-            )
-            return
-        self._cmd_notice_rooms.add(room_id)
-        # Bound like _sent_ids: evict half (arbitrary) when over — a re-notice
-        # after eviction is harmless.
-        if len(self._cmd_notice_rooms) > _ROOM_CACHE_MAX:
-            for _ in range(_ROOM_CACHE_MAX // 2):
-                self._cmd_notice_rooms.pop()
-        try:
-            await self.send(room_id, _OWNER_COMMAND_NOTICE)
-        except Exception as e:
-            logger.debug("[band] Could not send command-gate notice: %s", e)
+        The hub is created as a private owner↔agent room, so hub membership is
+        the authorization proof. Ordinary Band-delivered text is not screened.
+        """
+        return bool(self._hub_room_id and room_id == self._hub_room_id)
 
     def _session_key_for(self, room_id: str) -> Optional[str]:
         """The Hermes session key for a Band room, derived the way the store does.
@@ -3231,14 +3206,10 @@ def interactive_setup() -> None:
     two credentials (plus an optional host override). Invoked by ``hermes
     gateway setup`` with no arguments via the registry ``setup_fn`` hook.
 
-    ACCESS MODEL: there is intentionally no chat-allowlist step. Band's own
-    platform ACL is the access gate — a message only reaches the agent if Band
-    delivered it (the user could message the agent or add it to a room), so
-    ``BandAdapter.enforces_own_access_policy`` is ``True`` and the gateway
-    trusts Band traffic without a Hermes-side allowlist or per-user pairing
-    codes. ``BAND_ALLOWED_USERS`` / ``BAND_ALLOW_ALL`` remain available as an
-    *optional* extra restriction (configured via env / ``hermes config``), not
-    a required setup step.
+    ACCESS MODEL: Band is the sole message-intake authorization boundary. The
+    adapter does not register Hermes-side sender allowlists or pairing rules;
+    every non-self text message Band delivers reaches Hermes. Slash commands
+    are separately accepted only in the private owner↔agent hub.
     """
     from hermes_cli.config import get_env_value, save_env_value
     from hermes_cli.cli_output import (
@@ -3302,8 +3273,8 @@ def interactive_setup() -> None:
     print_info("  • A private 'Hermes Hub' control room is created automatically")
     print_info("    on first connect and wired as the Band main channel (where")
     print_info("    cron and notification deliveries land).")
-    print_info("Band has no DMs — messages delivered in joined rooms are treated as addressed.")
-    print_info("To restrict further, set BAND_ALLOWED_USERS (optional) later.")
+    print_info("Band has no DMs — every non-self text message Band delivers is accepted.")
+    print_info("Slash commands are accepted only in the private Hermes Hub.")
     print_info("")
     print_success("🎵 Band configured!")
 
@@ -3326,9 +3297,6 @@ def register(ctx) -> None:
         # setup`` flow as Slack/Discord (called with no args via this hook).
         setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,
-        # Auth env vars for _is_user_authorized() integration
-        allowed_users_env="BAND_ALLOWED_USERS",
-        allow_all_env="BAND_ALLOW_ALL",
         # Conservative content cap (no confirmed Band per-message limit).
         max_message_length=BandAdapter.MAX_MESSAGE_LENGTH,
         # Display

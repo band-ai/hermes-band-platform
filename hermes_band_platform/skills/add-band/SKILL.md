@@ -207,7 +207,7 @@ re-installs or re-registers what's already in place.
    ```
    - A successful send exercises auth + room + the exact REST path real replies use. If this fails after `verify_gateway.py` passed, the problem is mentions/room state, not the socket.
    - `--await-reply` additionally posts the check, then waits for the owner to @mention back — proving inbound delivery too. Use it when you want the user to confirm live.
-   - This is also the proof that **"send a message to me" works**: the agent reaches its owner by calling `band_send_message` with no `room_id` (it falls back to the owner's hub/home and @mentions the owner), which is the same path the round-trip exercises.
+   - This also proves owner routing: selecting the hub/home room does not infer a recipient; the roundtrip explicitly mentions the configured owner's hub handle.
 
 10. **Close the loop — offer the first real room.** The hub is a private owner↔agent control room; the user's actual goal is usually a room with other people. Don't stop at the hub:
    - Offer: *"You're live in the Hub. Want me to create your first room? Tell me who to add."*

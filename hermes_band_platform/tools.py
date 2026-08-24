@@ -49,7 +49,8 @@ from tools.registry import tool_error, tool_result
 from .adapter import (
     DEFAULT_REQUEST_OPTIONS,
     _derive_urls,
-    _mention_items,
+    _mention_error,
+    _resolve_mentions,
     _short_id,
     note_deliberate_send,
     check_band_requirements,
@@ -438,31 +439,21 @@ async def _find_participant(rest: Any, query: str) -> Optional[Dict[str, Any]]:
 
 
 async def _mentions_for(
-    rest: Any, room_id: str, mention_ids: Optional[List[str]]
+    rest: Any, room_id: str, entries: Optional[List[Any]]
 ) -> List[Any]:
-    """Build the mandatory mention list for a send (Band requires ≥1).
-
-    If ``mention_ids`` is given, build one mention per id (handle resolved from
-    the room participants when cheap). Otherwise mention every non-agent
-    participant in the room. Raises ``_ToolError`` if the result is empty.
-    """
+    """Resolve explicit recipients against the target-room roster."""
     if not _load_sdk():
         raise _ToolUnavailable("Band not available (band-sdk not installed)")
-
-    # Fetch participants once for handle resolution / fallback mentions, then
-    # delegate to the shared builder (same semantics as the adapter's send).
-    participants = await _list_participants(rest, room_id)
-    # Resolve the running agent's id so the fallback never @mentions ourselves
-    # (irrelevant when explicit mention_ids are given).
-    agent_id = None if mention_ids else await _agent_id_or_none(rest)
-    items = _mention_items(participants, agent_id=agent_id, explicit_ids=mention_ids)
-
-    if not items:
+    if not entries:
         raise _ToolError(
-            "Band requires at least one @mention; no mentionable recipient was found "
-            "(pass mention_ids or add a participant to the room first)"
+            "Band messages require explicit `mentions`; pass at least one room "
+            "participant handle (for example `@alice`). Nothing was sent."
         )
-    return items
+    participants = await _list_participants(rest, room_id)
+    plan = _resolve_mentions(participants, entries)
+    if error := _mention_error(plan, participants):
+        raise _ToolError(error)
+    return plan.items
 
 
 async def _list_participants(rest: Any, room_id: str) -> List[Dict[str, Any]]:
@@ -679,24 +670,19 @@ async def _handle_send_message(args: dict, **kwargs) -> str:
         if not _load_sdk():
             raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
-        # Send may fall back to the owner's hub when no room is in context, so
-        # the agent can reach its owner from anywhere.
-        room_id, fell_back_to_home = _resolve_room_for_send(args)
+        # Room targeting is independent from recipient routing: current room,
+        # explicit room, or configured home may select the room, but never a
+        # delivery recipient.
+        room_id, _fell_back_to_home = _resolve_room_for_send(args)
 
         content = str(args.get("content") or "")
         if not content.strip():
             return tool_error("content is required")
 
-        mention_ids = args.get("mention_ids")
-        if mention_ids is not None and not isinstance(mention_ids, list):
-            mention_ids = [mention_ids]
-        # When reaching the owner via the hub fallback with no explicit mentions,
-        # @mention the owner specifically so "message me" always pings the owner.
-        if mention_ids is None and fell_back_to_home:
-            owner = _owner_identity()
-            if owner:
-                mention_ids = [owner]
-        mentions = await _mentions_for(rest, room_id, mention_ids)
+        entries = args.get("mentions")
+        if entries is not None and not isinstance(entries, list):
+            entries = [entries]
+        mentions = await _mentions_for(rest, room_id, entries)
 
         chunks = BasePlatformAdapter.truncate_message(content, _MAX_MESSAGE_LENGTH)
         last_id: Optional[str] = None
@@ -881,25 +867,27 @@ BAND_FIND_CONTACT_SCHEMA = {
 BAND_SEND_MESSAGE_SCHEMA = {
     "name": "band_send_message",
     "description": (
-        "Send a message to a Band room. Band requires at least one @mention per message: pass "
-        "`mention_ids` to choose recipients, otherwise all non-agent participants are mentioned. "
-        "Targets the current Band room by default; pass `room_id` to target another. To message "
-        "your owner ('me' / 'the owner') from anywhere — including a non-Band session — omit "
-        "`room_id`: with no current Band room the message goes to your owner's hub (home channel) "
-        "and @mentions the owner."
+        "Send a message to a Band room with explicit recipients. `mentions` is required and "
+        "accepts Band handles (preferred), participant UUIDs, or an unambiguous display name. "
+        "Every recipient is resolved against the target-room roster; unknown, out-of-room, "
+        "ambiguous, or handle-less recipients fail before any message is posted. Targets the "
+        "current Band room by default; pass `room_id` to target another."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "Message text to send."},
-            "mention_ids": {
+            "mentions": {
                 "type": "array",
                 "items": _STRING,
-                "description": "Participant UUIDs to @mention. If omitted, all non-agent participants are mentioned.",
+                "description": (
+                    "Required recipients. Prefer Band handles such as `@alice`; participant "
+                    "UUIDs are supported as a compatibility fallback."
+                ),
             },
             "room_id": _ROOM_ID_PROP,
         },
-        "required": ["content"],
+        "required": ["content", "mentions"],
     },
 }
 

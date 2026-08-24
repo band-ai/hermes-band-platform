@@ -344,17 +344,17 @@ class TestReason:
     async def test_send_path_records_the_missing_mention_failure(self, adapter):
         # The Band-specific silent failure: no mentionable recipient means the
         # reply is dropped before it is ever posted.
-        adapter._build_mentions = AsyncMock(return_value=[])
+        adapter._build_mentions = AsyncMock(return_value=([], "explicit mentions required"))
         result = await adapter.send("room-abc", "a reply nobody will see")
         assert result.success is False
         assert (
             _events_mod.pop_send_failure(adapter, "room-abc")
-            == "No mentionable recipient (Band requires >=1 mention)"
+            == "explicit mentions required"
         )
 
     @pytest.mark.asyncio
     async def test_send_path_records_api_errors(self, adapter):
-        adapter._build_mentions = AsyncMock(return_value=[MagicMock()])
+        adapter._build_mentions = AsyncMock(return_value=([MagicMock()], None))
         adapter._link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
             side_effect=RuntimeError("422 Unprocessable Entity")
         )
@@ -363,7 +363,7 @@ class TestReason:
 
     @pytest.mark.asyncio
     async def test_send_path_clears_the_reason_on_success(self, adapter):
-        adapter._build_mentions = AsyncMock(return_value=[MagicMock()])
+        adapter._build_mentions = AsyncMock(return_value=([MagicMock()], None))
         adapter._link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
             return_value=SimpleNamespace(data=SimpleNamespace(id="sent-1"))
         )

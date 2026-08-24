@@ -124,7 +124,6 @@ class TestBandAdapterInit:
         assert adapter._consumer_task is None
         assert adapter._sent_ids == set()
         assert adapter._participants_cache == {}
-        assert adapter._last_human_sender == {}
 
     def test_name_property(self, monkeypatch):
         assert _make_adapter(monkeypatch).name == "Band"
@@ -292,41 +291,32 @@ class TestBandPluginRegistration:
         register(ctx)
         return ctx.register_platform.call_args[1]["platform_hint"]
 
-    def test_platform_hint_does_not_claim_plain_text_is_undelivered(self):
-        """Regression guard: the gateway auto-delivers the final assistant text
-        and there is no way to suppress that, so a hint claiming otherwise makes
-        the model call band_send_message and every reply gets posted twice."""
+    def test_platform_hint_requires_deliberate_tool_send(self):
         hint = self._hint()
-        assert "plain text is not delivered" not in hint
-        assert "not delivered" not in hint
+        assert "must send each reply deliberately with band_send_message" in hint
+        assert "choose its recipients in `mentions`" in hint
 
-    def test_platform_hint_says_reply_is_delivered_and_mentioned_for_you(self):
+    def test_platform_hint_explains_unsent_final_text(self):
         hint = self._hint()
-        assert "delivered to the room automatically" in hint
-        assert "@mentioned for you" in hint
+        assert "non-notifying thought" in hint
+        assert "notifies nobody" in hint
 
-    def test_platform_hint_forbids_send_message_for_the_current_room(self):
+    def test_platform_hint_says_invalid_routing_posts_nothing(self):
         hint = self._hint()
-        assert (
-            "Do NOT call band_send_message to reply in the room you are "
-            "already in" in hint
-        )
-        assert "twice" in hint
+        assert "send without mentions" in hint
+        assert "fails without posting" in hint
 
-    def test_platform_hint_keeps_owner_no_room_id_guidance(self):
-        """Still-correct guidance the fix must not drop: reaching the owner from
-        a non-Band session or another room does need an explicit tool call."""
+    def test_platform_hint_keeps_explicit_owner_room_guidance(self):
         hint = self._hint()
-        assert "call band_send_message with no room_id" in hint
-        assert "owner's hub" in hint
+        assert "band_send_message with no room_id" in hint
+        assert "owner's hub handle in `mentions`" in hint
 
-    def test_conversation_skill_agrees_that_final_text_is_auto_delivered(self):
+    def test_conversation_skill_matches_explicit_send_contract(self):
         skill = Path(_band_mod.__file__).parent / "skills" / "band-conversations" / "SKILL.md"
         guidance = skill.read_text()
-        assert "final assistant text is delivered" in guidance
-        assert "Plain assistant text is **not** delivered" not in guidance
-        assert "Do **not** call" in guidance
-        assert "`band_send_message` for that routine reply" in guidance
+        assert "Send every reply deliberately with `band_send_message`" in guidance
+        assert "`mentions` is required" in guidance
+        assert "non-notifying thought" in guidance
 
 
 # ---------------------------------------------------------------------------
@@ -529,42 +519,45 @@ class TestBandAdapterSend:
         assert result.error is not None
 
     @pytest.mark.asyncio
-    async def test_send_success_returns_message_id(self, adapter):
-        # Wire up a fake link with REST API
+    async def test_send_resolves_handle_recipient_from_room_roster(self, adapter):
         mock_link = MagicMock()
-        resp_data = SimpleNamespace(id="sent-msg-id-001")
-        resp = SimpleNamespace(data=resp_data)
         mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
-            return_value=resp
+            return_value=SimpleNamespace(data=SimpleNamespace(id="sent-msg-id-001"))
         )
         adapter._link = mock_link
+        adapter._participants_cache["room-123"] = [
+            {"id": "user-abc", "handle": "userhandle", "name": "User Name"}
+        ]
 
-        # Seed last human sender so build_mentions has something to work with
-        adapter._last_human_sender["room-123"] = {
-            "id": "user-abc",
-            "handle": "userhandle",
-            "name": "User Name",
-        }
+        result = await adapter.send(
+            "room-123",
+            "hello world",
+            metadata={"mentions": ["@userhandle"]},
+        )
 
-        result = await adapter.send("room-123", "hello world")
         assert result.success is True
         assert result.message_id == "sent-msg-id-001"
+        mention = (
+            mock_link.rest.agent_api_messages.create_agent_chat_message.await_args
+            .kwargs["message"].mentions[0]
+        )
+        assert (mention.id, mention.handle) == ("user-abc", "userhandle")
 
     @pytest.mark.asyncio
     async def test_send_records_message_id_in_sent_ids(self, adapter):
         mock_link = MagicMock()
-        resp = SimpleNamespace(data=SimpleNamespace(id="tracked-id"))
         mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
-            return_value=resp
+            return_value=SimpleNamespace(data=SimpleNamespace(id="tracked-id"))
         )
         adapter._link = mock_link
-        adapter._last_human_sender["room-99"] = {
-            "id": "user-x",
-            "handle": "ux",
-            "name": "User X",
-        }
+        adapter._participants_cache["room-99"] = [
+            {"id": "user-x", "handle": "ux", "name": "User X"}
+        ]
 
-        await adapter.send("room-99", "test message")
+        await adapter.send(
+            "room-99", "test message", metadata={"mentions": ["@ux"]}
+        )
+
         assert "tracked-id" in adapter._sent_ids
 
     @pytest.mark.asyncio
@@ -579,17 +572,17 @@ class TestBandAdapterSend:
 
         mock_link.rest.agent_api_messages.create_agent_chat_message = _fake_send
         adapter._link = mock_link
-        adapter._last_human_sender["room-big"] = {
-            "id": "user-y",
-            "handle": "uy",
-            "name": "User Y",
-        }
+        adapter._participants_cache["room-big"] = [
+            {"id": "user-y", "handle": "uy", "name": "User Y"}
+        ]
 
-        # Create content longer than MAX_MESSAGE_LENGTH (4000)
-        long_content = "x" * 5000
-        result = await adapter.send("room-big", long_content)
+        result = await adapter.send(
+            "room-big",
+            "x" * 5000,
+            metadata={"mentions": ["uy"]},
+        )
+
         assert result.success is True
-        # Should have been called at least twice (chunked)
         assert call_count >= 2
 
     @pytest.mark.asyncio
@@ -599,53 +592,115 @@ class TestBandAdapterSend:
             side_effect=RuntimeError("network failure")
         )
         adapter._link = mock_link
-        adapter._last_human_sender["room-fail"] = {
-            "id": "user-z",
-            "handle": "uz",
-            "name": "User Z",
-        }
+        adapter._participants_cache["room-fail"] = [
+            {"id": "user-z", "handle": "uz", "name": "User Z"}
+        ]
 
-        result = await adapter.send("room-fail", "hi")
+        result = await adapter.send(
+            "room-fail", "hi", metadata={"mentions": ["uz"]}
+        )
+
         assert result.success is False
         assert "network failure" in result.error
 
     @pytest.mark.asyncio
-    async def test_send_no_mention_returns_failure_without_sending(self, adapter):
+    async def test_send_without_mentions_fails_even_with_room_participants(
+        self, adapter
+    ):
         mock_link = MagicMock()
         mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock()
-        mock_link.rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
-            return_value=SimpleNamespace(data=[])
-        )
         adapter._link = mock_link
-
-        # No last human sender and no participants cached
-        result = await adapter.send("room-empty", "hello")
-        assert result.success is False
-        mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_send_builds_mentions_from_participants_when_no_last_sender(self, adapter):
-        mock_link = MagicMock()
-        resp = SimpleNamespace(data=SimpleNamespace(id="msg-x"))
-        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
-            return_value=resp
-        )
-        adapter._link = mock_link
-        adapter._agent_id = "agent-id-xxx"
-
-        # Seed participants cache directly (skipping REST fetch)
         adapter._participants_cache["room-p"] = [
-            {"id": "agent-id-xxx", "type": "Agent", "name": "Bot", "handle": "bot"},
-            {"id": "human-id", "type": "User", "name": "Alice", "handle": "alice"},
+            {"id": "human-id", "type": "User", "name": "Alice", "handle": "alice"}
         ]
 
-        result = await adapter.send("room-p", "hello from fallback")
+        result = await adapter.send("room-p", "hello")
+
+        assert result.success is False
+        assert "mentions" in result.error
+        mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_uuid_recipient_resolves_against_room_roster(self, adapter):
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(id="msg-uuid"))
+        )
+        adapter._link = mock_link
+        adapter._participants_cache["room-u"] = [
+            {"id": "human-id", "type": "User", "name": "Alice", "handle": "alice"}
+        ]
+
+        result = await adapter.send(
+            "room-u", "hello", metadata={"mentions": ["human-id"]}
+        )
+
         assert result.success is True
-        # Ensure the call passed mentions
-        call_kwargs = mock_link.rest.agent_api_messages.create_agent_chat_message.call_args[1]
-        mentions = call_kwargs["message"].mentions
-        assert len(mentions) >= 1
-        assert any(getattr(m, "id", None) == "human-id" for m in mentions)
+        mention = (
+            mock_link.rest.agent_api_messages.create_agent_chat_message.await_args
+            .kwargs["message"].mentions[0]
+        )
+        assert (mention.id, mention.handle) == ("human-id", "alice")
+
+    @pytest.mark.asyncio
+    async def test_unique_display_name_resolves_but_ambiguous_name_fails(
+        self, adapter
+    ):
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(id="msg-name"))
+        )
+        adapter._link = mock_link
+        adapter._participants_cache["room-n"] = [
+            {
+                "id": "alice-1",
+                "type": "User",
+                "name": "Alex Smith",
+                "handle": "alice",
+            },
+        ]
+        success = await adapter.send(
+            "room-n", "hello", metadata={"mentions": ["Alex Smith"]}
+        )
+        assert success.success is True
+
+        adapter._participants_cache["room-n"].append(
+            {
+                "id": "alice-2",
+                "type": "User",
+                "name": "Alex Smith",
+                "handle": "alice2",
+            }
+        )
+        failed = await adapter.send(
+            "room-n", "hello", metadata={"mentions": ["Alex Smith"]}
+        )
+        assert failed.success is False
+        assert "ambiguous" in failed.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_unknown_out_of_room_and_handleless_recipients_fail_locally(
+        self, adapter
+    ):
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock()
+        adapter._link = mock_link
+        adapter._participants_cache["room-e"] = [
+            {"id": "no-handle", "type": "User", "name": "No Handle", "handle": None}
+        ]
+
+        unknown = await adapter.send(
+            "room-e", "hello", metadata={"mentions": ["outside-room"]}
+        )
+        handleless = await adapter.send(
+            "room-e", "hello", metadata={"mentions": ["no-handle"]}
+        )
+
+        assert unknown.success is False
+        assert handleless.success is False
+        assert "outside-room" in unknown.error
+        assert "no-handle" in handleless.error
+        mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_send_marshals_to_link_loop_when_called_from_another_loop(self, adapter):
@@ -667,9 +722,9 @@ class TestBandAdapterSend:
 
         mock_link.rest.agent_api_messages.create_agent_chat_message = _create
         adapter._link = mock_link
-        adapter._last_human_sender["room-x"] = {
-            "id": "user-x", "handle": "ux", "name": "User X",
-        }
+        adapter._participants_cache["room-x"] = [
+            {"id": "user-x", "handle": "ux", "name": "User X"}
+        ]
 
         # Run a dedicated "link" loop in its own thread and pin it on the adapter,
         # exactly as connect() would.
@@ -688,7 +743,11 @@ class TestBandAdapterSend:
         try:
             # We're on the default test loop, which is NOT link_loop.
             assert asyncio.get_running_loop() is not link_loop
-            result = await adapter.send("room-x", "hello from restore")
+            result = await adapter.send(
+                "room-x",
+                "hello from restore",
+                metadata={"mentions": ["ux"]},
+            )
         finally:
             link_loop.call_soon_threadsafe(link_loop.stop)
             t.join(5)
@@ -3407,8 +3466,7 @@ class TestHubFailover:
         a._hub_room_id = "old-hub"
         a._hub_failover_threshold = 3
         a._hub_failover_max_per_connect = 5
-        # Last human sender so send()'s mention build always succeeds.
-        a._last_human_sender["old-hub"] = {"id": "owner-1", "handle": "nir", "name": "Nir"}
+        a._build_mentions = AsyncMock(return_value=([MagicMock()], None))
         # Record .env persistence instead of writing the operator's real file.
         saved = {}
         import hermes_cli.config as _hcfg
@@ -3482,7 +3540,6 @@ class TestHubFailover:
             side_effect=RuntimeError("boom")
         )
         adapter._link = link
-        adapter._last_human_sender["other-room"] = {"id": "u", "handle": "u", "name": "U"}
 
         await adapter.send("other-room", "hi")
         assert adapter._hub_send_failures == 0
@@ -3634,9 +3691,9 @@ class TestRendererCapabilities:
         delivery = pytest.importorskip("gateway.delivery")
 
         adapter = _make_adapter(monkeypatch)
-        adapter._last_human_sender["room-cron"] = {
-            "id": "user-c", "handle": "uc", "name": "User C",
-        }
+        adapter._participants_cache["room-cron"] = [
+            {"id": "user-c", "handle": "uc", "name": "User C"}
+        ]
         posted: list = []
 
         async def _create(*args, **kwargs):
@@ -3660,7 +3717,11 @@ class TestRendererCapabilities:
         long_output = "band-cron-line\n" * 800  # ~12000 chars, well over the cap
         assert len(long_output) > delivery.MAX_PLATFORM_OUTPUT
 
-        result = await router._deliver_to_platform(target, long_output, {"job_id": "job-1"})
+        result = await router._deliver_to_platform(
+            target,
+            long_output,
+            {"job_id": "job-1", "mentions": ["@uc"]},
+        )
 
         assert result.success is True
         # Chunked by the adapter, not truncated by the host: every line survived
@@ -3672,7 +3733,11 @@ class TestRendererCapabilities:
         # Negative control: clear the flag and the same host path truncates.
         posted.clear()
         adapter.splits_long_messages = False
-        await router._deliver_to_platform(target, long_output, {"job_id": "job-1"})
+        await router._deliver_to_platform(
+            target,
+            long_output,
+            {"job_id": "job-1", "mentions": ["@uc"]},
+        )
         assert len(posted) == 1
         assert "full output saved to" in posted[0]
 
@@ -3895,11 +3960,13 @@ class TestPostChunks:
         link = MagicMock()
         link.rest = _rest_stub()
         adapter._link = link
-        adapter._last_human_sender["room-1"] = {
-            "id": "human-1", "handle": "alice", "name": "Alice",
-        }
+        adapter._participants_cache["room-1"] = [
+            {"id": "human-1", "handle": "alice", "name": "Alice"}
+        ]
 
-        result = await adapter._send_on_link("room-1", "x" * 9000)
+        result = await adapter._send_on_link(
+            "room-1", "x" * 9000, metadata={"mentions": ["@alice"]}
+        )
 
         assert result.success is True
         assert result.message_id in adapter._sent_ids
@@ -3970,7 +4037,9 @@ class TestStandaloneSend:
         rest = _rest_stub([_participant("human-1", "Alice", "alice")])
         seen = self._patch_rest(env, rest)
 
-        result = await _standalone_send(_make_config(), "room-explicit", "cron output")
+        result = await _standalone_send(
+            _make_config(), "room-explicit", "cron output", mentions=["@alice"]
+        )
 
         assert result == {
             "success": True,
@@ -3991,7 +4060,9 @@ class TestStandaloneSend:
         rest = _rest_stub([_participant("human-1", "Alice", "alice")])
         self._patch_rest(env, rest)
 
-        result = await _standalone_send(_make_config(), "", "hello")
+        result = await _standalone_send(
+            _make_config(), "", "hello", mentions=["@alice"]
+        )
 
         assert result["success"] is True
         assert result["chat_id"] == "room-home"
@@ -4039,7 +4110,9 @@ class TestStandaloneSend:
             {"agent_id": "agent-extra", "api_key": "key-extra", "base_url": "band.internal"}
         )
 
-        result = await _standalone_send(cfg, "room-1", "hi")
+        result = await _standalone_send(
+            cfg, "room-1", "hi", mentions=["@alice"]
+        )
 
         assert result["success"] is True
         assert seen["api_key"] == "key-extra"
@@ -4049,16 +4122,19 @@ class TestStandaloneSend:
     # ── parity with the live _send_on_link path ───────────────────────────
 
     @pytest.mark.asyncio
-    async def test_agent_itself_is_never_mentioned(self, env):
+    async def test_only_explicit_recipient_is_mentioned(self, env):
         rest = _rest_stub(
             [
                 _participant("agent-self", "Bot", "bot", ptype="Agent"),
                 _participant("human-1", "Alice", "alice"),
+                _participant("human-2", "Bob", "bob"),
             ]
         )
         self._patch_rest(env, rest)
 
-        result = await _standalone_send(_make_config(), "room-1", "hi")
+        result = await _standalone_send(
+            _make_config(), "room-1", "hi", mentions=["@alice"]
+        )
 
         assert result["success"] is True
         assert _mention_tuples(rest.agent_api_messages.create_agent_chat_message) == [
@@ -4075,7 +4151,9 @@ class TestStandaloneSend:
         )
         assert len(expected_chunks) >= 2  # guard: the fixture must actually chunk
 
-        result = await _standalone_send(_make_config(), "room-1", long_content)
+        result = await _standalone_send(
+            _make_config(), "room-1", long_content, mentions=["@alice"]
+        )
 
         create = rest.agent_api_messages.create_agent_chat_message
         assert [c.kwargs["message"].content for c in create.await_args_list] == expected_chunks
@@ -4087,34 +4165,34 @@ class TestStandaloneSend:
         assert result["message_id"] == f"std-msg-{len(expected_chunks)}"
 
     @pytest.mark.asyncio
-    async def test_mentions_match_the_live_path_for_a_room_with_no_cached_sender(self, env):
-        """Both paths take _mention_items' all-non-agent-participants branch.
-
-        The standalone path cannot reach ``_build_mentions``' preferred
-        last-human-sender (that cache lives on a connected adapter), so parity is
-        against the live path's behaviour for a room it has not heard from.
-        """
+    async def test_explicit_mentions_match_live_adapter_resolution(self, env):
         participants = [
-            _participant("agent-self", "Bot", "bot", ptype="Agent"),
             _participant("human-1", "Alice", "alice"),
             _participant("human-2", "Bob", "bob"),
         ]
-
         standalone_rest = _rest_stub(participants)
         self._patch_rest(env, standalone_rest)
-        await _standalone_send(_make_config(), "room-parity", "same text")
+        await _standalone_send(
+            _make_config(),
+            "room-parity",
+            "same text",
+            mentions=["@bob"],
+        )
 
         adapter = _make_adapter(env, agent_id="agent-self")
-        adapter._agent_id = "agent-self"
         live_link = MagicMock()
         live_link.rest = _rest_stub(participants)
         adapter._link = live_link
-        assert not adapter._last_human_sender  # cold room, no cached sender
-        live_result = await adapter._send_on_link("room-parity", "same text")
+        live_result = await adapter._send_on_link(
+            "room-parity",
+            "same text",
+            metadata={"mentions": ["@bob"]},
+        )
 
         assert live_result.success is True
-        assert _mention_tuples(standalone_rest.agent_api_messages.create_agent_chat_message) \
-            == _mention_tuples(live_link.rest.agent_api_messages.create_agent_chat_message)
+        assert _mention_tuples(
+            standalone_rest.agent_api_messages.create_agent_chat_message
+        ) == _mention_tuples(live_link.rest.agent_api_messages.create_agent_chat_message)
 
     # ── actionable failures ───────────────────────────────────────────────
 
@@ -4163,14 +4241,13 @@ class TestStandaloneSend:
         rest.agent_api_messages.create_agent_chat_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_no_mentionable_recipient_fails_without_posting(self, env):
-        # Agent-only room: nothing to mention once self is excluded.
-        rest = _rest_stub([_participant("agent-self", "Bot", "bot", ptype="Agent")])
+    async def test_missing_explicit_mentions_fails_without_posting(self, env):
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
         self._patch_rest(env, rest)
 
         result = await _standalone_send(_make_config(), "room-1", "hi")
 
-        assert "mention" in result["error"].lower()
+        assert "mentions" in result["error"].lower()
         assert "success" not in result
         rest.agent_api_messages.create_agent_chat_message.assert_not_called()
 
@@ -4182,7 +4259,9 @@ class TestStandaloneSend:
         )
         seen = self._patch_rest(env, rest)
 
-        result = await _standalone_send(_make_config(), "room-1", "hi")
+        result = await _standalone_send(
+            _make_config(), "room-1", "hi", mentions=["@alice"]
+        )
 
         assert "participants 503" in result["error"]
         rest.agent_api_messages.create_agent_chat_message.assert_not_called()
@@ -4196,7 +4275,9 @@ class TestStandaloneSend:
         )
         seen = self._patch_rest(env, rest)
 
-        result = await _standalone_send(_make_config(), "room-1", "hi")
+        result = await _standalone_send(
+            _make_config(), "room-1", "hi", mentions=["@alice"]
+        )
 
         assert "network failure" in result["error"]
         assert "success" not in result
@@ -4209,7 +4290,9 @@ class TestStandaloneSend:
 
         env.setattr(_band_mod, "_standalone_rest", _boom)
 
-        result = await _standalone_send(_make_config(), "room-1", "hi")
+        result = await _standalone_send(
+            _make_config(), "room-1", "hi", mentions=["@alice"]
+        )
 
         assert "no client" in result["error"]
 
@@ -4237,6 +4320,7 @@ class TestStandaloneSend:
             thread_id="ignored",
             media_files=["/tmp/nope.png"],
             force_document=True,
+            mentions=["@alice"],
         )
 
         assert result["success"] is True
@@ -4307,9 +4391,7 @@ class TestSendLogging:
         link = MagicMock()
         link.rest = _rest_stub()
         adapter._link = link
-        adapter._last_human_sender["room-1"] = {
-            "id": "human-1", "handle": "alice", "name": "Alice",
-        }
+        adapter._build_mentions = AsyncMock(return_value=([MagicMock()], None))
         return adapter
 
     @staticmethod
@@ -4470,22 +4552,19 @@ class TestStandaloneSendLogging:
         )
 
     @pytest.mark.asyncio
-    async def test_no_mentionable_recipient_is_logged_with_the_count(
-        self, monkeypatch, caplog
-    ):
+    async def test_missing_explicit_recipients_is_logged(self, monkeypatch, caplog):
         monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
         monkeypatch.setenv("BAND_API_KEY", "secret-key")
-        # Only the agent itself is in the room, so nobody can be @mentioned.
-        rest = _rest_stub([_participant("agent-self", "Bot", "bot", ptype="Agent")])
-        monkeypatch.setattr(_band_mod, "_standalone_rest", lambda *a, **k: rest)
 
         with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
-            result = await _standalone_send(_make_config(), "room-1", "cron output")
+            result = await _standalone_send(
+                _make_config(), "room-1", "cron output"
+            )
 
         assert "error" in result
-        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        errors = [record for record in caplog.records if record.levelno == logging.ERROR]
         assert len(errors) == 1
-        assert "1 participant(s)" in errors[0].getMessage()
+        assert "no explicit recipients" in errors[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_delivery_reports_the_message_id(self, monkeypatch, caplog):
@@ -4496,7 +4575,10 @@ class TestStandaloneSendLogging:
 
         with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
             result = await _standalone_send(
-                _make_config(), "room-1", f"cron output: {SECRET_BODY}"
+                _make_config(),
+                "room-1",
+                f"cron output: {SECRET_BODY}",
+                mentions=["@alice"],
             )
 
         assert result["success"] is True

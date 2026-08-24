@@ -101,38 +101,36 @@ async def _rest_client() -> Any:
 
 
 async def _mentions_for(rest: Any, room_id: str) -> list[Any]:
-    """Every non-agent participant in the room, as mention items.
-
-    Band requires ≥1 mention per send. This is ``tools._mentions_for(…, None)``'s
-    fallback branch — the only one reachable without explicit ids — inlined:
-    ``_list_participants`` + ``adapter._mention_items``'s no-preferred path, with
-    the agent's own id excluded so it never @mentions itself. Pinned by
-    ``test_verify_roundtrip_mentions_match_the_adapter``.
-    """
+    """Explicitly target the configured owner in the private Hermes Hub."""
     from band.client.rest import DEFAULT_REQUEST_OPTIONS, ChatMessageRequestMentionsItem
 
-    resp = await rest.agent_api_participants.list_agent_chat_participants(
+    owner_id = _env_value("BAND_OWNER_ID").strip()
+    if not owner_id:
+        raise RuntimeError(
+            "BAND_OWNER_ID is required for the roundtrip check; no recipient "
+            "can be inferred"
+        )
+    response = await rest.agent_api_participants.list_agent_chat_participants(
         chat_id=room_id, request_options=DEFAULT_REQUEST_OPTIONS
     )
-    agent_id = _env_value("BAND_AGENT_ID").strip() or None
-    items: list[Any] = []
-    for peer in getattr(resp, "data", None) or []:
-        pid = getattr(peer, "id", None)
-        if not pid or pid == agent_id or (getattr(peer, "type", None) or "") == "Agent":
+    for participant in getattr(response, "data", None) or []:
+        if getattr(participant, "id", None) != owner_id:
             continue
-        items.append(
-            ChatMessageRequestMentionsItem(
-                id=pid,
-                handle=getattr(peer, "handle", None),
-                name=getattr(peer, "name", None),
+        handle = str(getattr(participant, "handle", None) or "").strip().lstrip("@")
+        if not handle:
+            raise RuntimeError(
+                "The configured owner has no mentionable handle in the hub roster"
             )
-        )
-    if not items:
-        raise RuntimeError(
-            "Band requires at least one @mention; no mentionable recipient was found "
-            "(pass mention_ids or add a participant to the room first)"
-        )
-    return items
+        return [
+            ChatMessageRequestMentionsItem(
+                id=owner_id,
+                handle=handle,
+                name=getattr(participant, "name", None),
+            )
+        ]
+    raise RuntimeError(
+        "The configured owner is not present in the hub roster; nothing was sent"
+    )
 
 
 async def _context_ids(rest: Any, room_id: str) -> set[str]:

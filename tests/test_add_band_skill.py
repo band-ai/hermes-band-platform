@@ -1337,16 +1337,14 @@ def test_verify_roundtrip_url_derivation_matches_the_adapter():
 
 
 @pytest.mark.asyncio
-async def test_verify_roundtrip_mentions_match_the_adapter(monkeypatch):
-    """The inlined mention builder must stay equivalent to `_mention_items`."""
+async def test_verify_roundtrip_targets_only_the_configured_owner(monkeypatch):
     module = _load_script("verify_roundtrip.py")
-    from hermes_band_platform.adapter import _mention_items
+    from hermes_band_platform.adapter import _resolve_mentions
 
     peers = [
         SimpleNamespace(id="u1", handle="owner", name="Owner", type="User"),
+        SimpleNamespace(id="u2", handle="bystander", name="Bystander", type="User"),
         SimpleNamespace(id="bot", handle="agent", name="Agent", type="Agent"),
-        SimpleNamespace(id="self", handle="me", name="Me", type="User"),
-        SimpleNamespace(id=None, handle="ghost", name="Ghost", type="User"),
     ]
 
     class _Rest:
@@ -1355,19 +1353,22 @@ async def test_verify_roundtrip_mentions_match_the_adapter(monkeypatch):
             async def list_agent_chat_participants(chat_id, request_options=None):
                 return SimpleNamespace(data=peers)
 
-    monkeypatch.setattr(module, "_env_value", lambda name: "self" if name == "BAND_AGENT_ID" else "")
-
-    inlined = await module._mentions_for(_Rest(), "room-1")
-    expected = _mention_items(
-        [
-            {"id": p.id, "handle": p.handle, "name": p.name, "type": p.type}
-            for p in peers
-        ],
-        agent_id="self",
-        explicit_ids=None,
+    monkeypatch.setattr(
+        module,
+        "_env_value",
+        lambda name: "u1" if name == "BAND_OWNER_ID" else "",
     )
 
-    assert [(m.id, m.handle, m.name) for m in inlined] == [
-        (m.id, m.handle, m.name) for m in expected
+    inlined = await module._mentions_for(_Rest(), "room-1")
+    expected = _resolve_mentions(
+        [
+            {"id": peer.id, "handle": peer.handle, "name": peer.name, "type": peer.type}
+            for peer in peers
+        ],
+        ["u1"],
+    )
+
+    assert [(mention.id, mention.handle) for mention in inlined] == [
+        (mention.id, mention.handle) for mention in expected.items
     ]
-    assert [m.id for m in inlined] == ["u1"]  # not the agent, not self, not id-less
+    assert [mention.id for mention in inlined] == ["u1"]

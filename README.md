@@ -332,15 +332,14 @@ the default is the private one and widening it is a deliberate act.
   accepted only in the private Hermes Hub.
 - **Self-filter**: the adapter skips its own agent messages by sender, with a sent-message-id
   backstop in addition to the SDK's own filtering.
-- **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions the
-  room's last human sender (falling back to all non-agent participants).
-- **Outbound without a gateway**: the plugin also registers a `standalone_sender_fn`, so a
-  `deliver: band` cron job delivers even when it fires in a process that holds no gateway runner —
-  a forced `hermes cron run <id>` is the everyday case. That path has no link and no caches, so it
-  resolves everything from the environment (`BAND_AGENT_ID`, `BAND_API_KEY`, `BAND_BASE_URL`, and
-  the target room from `BAND_HOME_ROOM` → `BAND_HUB_ROOM`) and mentions all non-agent participants
-  — the same branch the live path takes for a room it has not yet heard a human speak in. Chunking
-  and the mandatory per-chunk @mention are shared code with the live send, so the two cannot drift.
+- **Outbound**: the model sends through `band_send_message` and must choose explicit `mentions`
+  (handles preferred; participant UUIDs supported as a fallback). Recipients resolve only against
+  the target-room roster. Missing, unknown, out-of-room, ambiguous, or handle-less recipients fail
+  before any message POST; there is no last-sender, owner, or room-wide fallback.
+- **Unsent final text**: if the model finishes without an explicit send, its final prose is posted
+  once as a non-notifying thought. A successful explicit send suppresses the host's duplicate copy.
+- **Outbound without a gateway**: the `standalone_sender_fn` retains the same explicit-recipient
+  contract and chunking behavior; it never broadcasts to room participants.
 
 ### The Hub (main channel + command surface)
 
@@ -404,7 +403,7 @@ The tools split into two tiers:
 | `band_create_room` | A | Yes | Create a room. Composite: pass `person` (+ optional `message`, `role`) to resolve, create, add, and message someone in one call. Returns `{room_id, added, sent}`. No `title` arg — the server derives it. |
 | `band_find_room` | A | No (read-only) | Find existing rooms by `query` (matches title/id) → `[{room_id, title}]`. |
 | `band_find_contact` | A | No (read-only) | Resolve a name/handle to a participant UUID over peers + contacts. |
-| `band_send_message` | B | Yes | Send `content` to a room (defaults to the current room; pass `room_id` to target another). Chunks long messages at 4000 chars. **Mentions are mandatory** — pass `mention_ids` or the room's participants are mentioned. |
+| `band_send_message` | B | Yes | Send `content` with required explicit `mentions` (handles preferred; UUID fallback). Defaults to the current room; pass `room_id` to target another. |
 | `band_add_participant` | B | Yes | Add a participant (`participant_id`, optional `role`) to the room. |
 | `band_remove_participant` | B | Yes | Remove a participant from the room. |
 | `band_get_participants` | B | No (read-only) | List the room's participants → `[{id, handle, name, type}]`. |
@@ -506,15 +505,13 @@ whatever the agent didn't mark `processed` is still owed to it, across any outag
 
 - **Memory deferred.** Memory preload/write-through lands in a later pass (the extension point is
   marked `# TODO (<pass>):` in the adapter).
-- **Out-of-process delivery is text-only.** The `standalone_sender_fn` accepts `media_files` /
-  `force_document` for signature parity but ignores them, and it cannot prefer a room's last human
-  sender (that cache lives on a connected adapter) — it mentions all non-agent participants.
+- **Standalone delivery is text-only and requires recipients.** Media arguments are ignored;
+  missing recipient metadata fails locally, and the sender never infers the owner or room roster.
 - **No per-message retry cap on failure.** A turn that errors is marked `failed`, which the server
   may re-offer on a later `/next` drain. There is no attempt-count ceiling yet, so a
   persistently-failing message can re-deliver across reconnects.
-- **Mentions are mandatory on send.** The Band API rejects messages with no mentions, so every
-  reply mentions at least one recipient. If no mentionable recipient is known for a room, the send
-  is dropped.
+- **Mentions are mandatory and explicit.** Every chat message needs at least one validated
+  delivery recipient. Missing or invalid recipients fail before the Band API call.
 - **Rooms, not threads.** Band has no thread primitive; `thread_id` is always `None` and `reply_to`
   is ignored on send.
 - **Message length.** No confirmed Band per-message limit exists in the SDK / REST types, so a

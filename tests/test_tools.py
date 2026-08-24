@@ -549,6 +549,25 @@ class TestParticipantTools:
         rest.agent_api_participants.add_agent_chat_participant.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_private_hub_membership_cannot_be_widened(
+        self, owner_session, monkeypatch
+    ):
+        monkeypatch.setenv("BAND_HUB_ROOM", "hub-private")
+        rest = _make_rest()
+        with (
+            patch.object(band_tools, "_hub_room", return_value="hub-private"),
+            _patch_rest(rest),
+        ):
+            out = _parse(
+                await band_tools._handle_add_participant(
+                    {"room_id": "hub-private", "participant_id": "intruder"}
+                )
+            )
+        assert "error" in out
+        assert "private hermes hub" in out["error"].lower()
+        rest.agent_api_participants.add_agent_chat_participant.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_remove_participant_positional_id(self, owner_session):
         rest = _make_rest()
         with _patch_rest(rest):
@@ -561,6 +580,25 @@ class TestParticipantTools:
         # remove takes (chat_id, participant_id) positionally
         assert call.args[0] == "room-current"
         assert call.args[1] == "u-bye"
+
+    @pytest.mark.asyncio
+    async def test_private_hub_owner_cannot_be_removed(
+        self, owner_session, monkeypatch
+    ):
+        monkeypatch.setenv("BAND_HUB_ROOM", "hub-private")
+        rest = _make_rest()
+        with (
+            patch.object(band_tools, "_hub_room", return_value="hub-private"),
+            _patch_rest(rest),
+        ):
+            out = _parse(
+                await band_tools._handle_remove_participant(
+                    {"room_id": "hub-private", "participant_id": "owner"}
+                )
+            )
+        assert "error" in out
+        assert "private hermes hub" in out["error"].lower()
+        rest.agent_api_participants.remove_agent_chat_participant.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_get_participants_lists_and_is_readonly(self, owner_session):

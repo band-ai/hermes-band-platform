@@ -321,6 +321,29 @@ def _home_room() -> Optional[str]:
         or None
     )
 
+def _hub_room() -> Optional[str]:
+    """Resolve the private command hub, never a separate home override."""
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(Platform("band")) if runner else None
+        hub = getattr(adapter, "_hub_room_id", None) if adapter is not None else None
+        if hub:
+            return str(hub)
+    except Exception:
+        pass
+    return os.getenv("BAND_HUB_ROOM", "").strip() or None
+
+
+def _guard_private_hub_membership(room_id: str) -> None:
+    """Keep the owner↔agent hub private because it authorizes slash commands."""
+    if room_id and room_id == _hub_room():
+        raise _ToolError(
+            "The private Hermes Hub membership cannot be changed; it is the "
+            "slash-command authorization boundary."
+        )
+
 
 def _authorize_band_action() -> None:
     """Authorize a mutating Band action.
@@ -717,6 +740,7 @@ async def _handle_add_participant(args: dict, **kwargs) -> str:
         rest = await _rest()
         room_id = _resolve_room(args)
 
+        _guard_private_hub_membership(room_id)
         participant_id = str(args.get("participant_id") or "").strip()
         if not participant_id:
             return tool_error("participant_id is required")
@@ -747,6 +771,7 @@ async def _handle_remove_participant(args: dict, **kwargs) -> str:
             raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
         room_id = _resolve_room(args)
+        _guard_private_hub_membership(room_id)
 
         participant_id = str(args.get("participant_id") or "").strip()
         if not participant_id:

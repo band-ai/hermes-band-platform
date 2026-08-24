@@ -476,6 +476,41 @@ async def emit_error_event(
         )
         return False
 
+async def emit_thought_event(adapter: Any, room_id: str, content: str) -> bool:
+    """Post unaddressed final prose as a non-notifying thought. Never raises."""
+    link = getattr(adapter, "_link", None)
+    if link is None or not _load_error_event_sdk():
+        logger.warning(
+            "[band] Dropping unaddressed final text for room %s — %s",
+            _short(room_id),
+            "adapter has no live link" if link is None else "band-sdk unavailable",
+        )
+        return False
+    body = _truncate_event_content(content or "") or _EVENT_EMPTY_CONTENT_PLACEHOLDER
+    try:
+        await link.rest.agent_api_events.create_agent_chat_event(
+            chat_id=room_id,
+            event=ChatEventRequest(
+                content=body,
+                message_type=BandMessageType.THOUGHT,
+                metadata=None,
+            ),
+            request_options=DEFAULT_REQUEST_OPTIONS,
+        )
+        logger.debug(
+            "[band] Emitted thought event to room %s (%d chars)",
+            _short(room_id),
+            len(body),
+        )
+        return True
+    except Exception as exc:
+        logger.warning(
+            "[band] Could not emit thought event to room %s: %s",
+            _short(room_id),
+            exc,
+        )
+        return False
+
 
 async def report_turn_failure(adapter: Any, event: Any, outcome: Any) -> None:
     """Surface a failed turn in its room as a Band ``error`` event.

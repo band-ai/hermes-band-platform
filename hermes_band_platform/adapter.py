@@ -58,7 +58,7 @@ from gateway.session import SessionSource, build_session_key  # noqa: E402
 
 from . import _band_libs  # noqa: E402  (stdlib-only shim; safe at module top)
 from . import usage_events  # noqa: E402  (carries its own SDK guard)
-from .error_events import note_send_failure, report_turn_failure  # noqa: E402
+from .error_events import emit_thought_event, note_send_failure, report_turn_failure  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +269,43 @@ def _derive_urls(base_url: str) -> tuple[str, str]:
     return ws_url, rest_url
 
 
+# Band's host always hands the adapter a turn's final text. Model-authored chat
+# replies are sent deliberately through ``band_send_message`` instead, so this
+# per-room state distinguishes a duplicate host copy from unsent final prose.
+_deliberate_sends: Dict[str, int] = {}
+
+
+def note_deliberate_send(room_id: Optional[str]) -> None:
+    """Record one successful model-authored send in the active room turn."""
+    if room_id:
+        _deliberate_sends[room_id] = _deliberate_sends.get(room_id, 0) + 1
+
+
+def begin_turn(room_id: Optional[str]) -> None:
+    """Open a room turn with no successful explicit sends."""
+    if not room_id:
+        return
+    _deliberate_sends[room_id] = 0
+    if len(_deliberate_sends) > _ROOM_CACHE_MAX:
+        for stale in list(_deliberate_sends)[: len(_deliberate_sends) // 2]:
+            if stale != room_id:
+                _deliberate_sends.pop(stale, None)
+
+
+def deliberate_sends_this_turn(room_id: Optional[str]) -> Optional[int]:
+    """Return explicit sends in the open turn, or None when no turn is open."""
+    return _deliberate_sends.get(room_id or "")
+
+
+def end_turn(room_id: Optional[str]) -> None:
+    """Close a room turn after the host hands over its final text."""
+    if room_id:
+        _deliberate_sends.pop(room_id, None)
+
+
+def reset_turn_state() -> None:
+    """Forget all open room turns on disconnect/reconnect."""
+    _deliberate_sends.clear()
 def _mention_items(
     participants: List[Dict[str, Any]],
     *,
@@ -1098,6 +1135,7 @@ class BandAdapter(BasePlatformAdapter):
 
         await cancel_pending_emissions(self)
         usage_events.untrack_adapter(self)
+        reset_turn_state()
         self._mark_disconnected()
 
         if self._catch_up_task and not self._catch_up_task.done():
@@ -1678,6 +1716,9 @@ class BandAdapter(BasePlatformAdapter):
         otherwise rebuilds context from Band first (atomic durable seed, blob
         fallback; best-effort, flag consumed once — see _rehydrate_room).
         """
+        # The host will later hand ``send()`` this turn's final text. Start with
+        # zero explicit model sends so that copy can be suppressed or demoted.
+        begin_turn(inb.room_id)
         if inb.msg_id:
             self._seen_inbound_ids.add(inb.msg_id)
             if len(self._seen_inbound_ids) > _SENT_IDS_MAX:
@@ -2497,6 +2538,20 @@ class BandAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected", retryable=True)
 
         room_id = chat_id
+        state = deliberate_sends_this_turn(room_id)
+        if state is not None:
+            end_turn(room_id)
+            if not (content or "").strip():
+                return SendResult(success=True, message_id=None)
+            if state > 0:
+                logger.debug(
+                    "[band] Model already addressed room %s this turn — dropping "
+                    "the host's duplicate final text (%d chars)",
+                    _short_id(room_id),
+                    len(content or ""),
+                )
+                return SendResult(success=True, message_id=None)
+            return await self._post_unaddressed_thought(room_id, content)
 
         mention_items = await self._build_mentions(room_id)
         if not mention_items:
@@ -2557,6 +2612,18 @@ class BandAdapter(BasePlatformAdapter):
             raw_response=last_resp,
             continuation_message_ids=tuple(continuation),
         )
+
+    async def _post_unaddressed_thought(
+        self, room_id: str, content: str
+    ) -> SendResult:
+        """Expose unsent final prose as a non-notifying Band thought."""
+        if not (content or "").strip():
+            return SendResult(success=True, message_id=None)
+        if await emit_thought_event(self, room_id, content):
+            return SendResult(success=True, message_id=None)
+        reason = "Unaddressed final text could not be posted as a thought"
+        note_send_failure(self, room_id, reason)
+        return SendResult(success=False, error=reason, retryable=False)
 
     async def _record_hub_send(self, room_id: str, *, ok: bool) -> None:
         """Track hub send health and fail over after repeated failures.

@@ -699,6 +699,65 @@ class TestBandAdapterSend:
         # The REST call actually executed on the link's loop, not the caller's.
         assert send_loops == [link_loop]
 
+class TestExplicitSendLifecycle:
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
+        a._agent_id = "agent-self-id"
+        link = MagicMock()
+        link.rest.agent_api_messages.create_agent_chat_message = AsyncMock()
+        link.rest.agent_api_events.create_agent_chat_event = AsyncMock()
+        a._link = link
+        yield a
+        reset = getattr(_band_mod, "reset_turn_state", None)
+        if reset is not None:
+            reset()
+
+    @pytest.mark.asyncio
+    async def test_unaddressed_final_text_becomes_one_thought(self, adapter):
+        _band_mod.begin_turn("room-turn")
+
+        result = await adapter.send("room-turn", "I forgot to address this")
+
+        assert result.success is True
+        adapter._link.rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+        event_call = (
+            adapter._link.rest.agent_api_events.create_agent_chat_event.await_args
+        )
+        assert event_call.kwargs["event"].message_type.value == "thought"
+
+    @pytest.mark.asyncio
+    async def test_explicit_send_suppresses_host_final_copy(self, adapter):
+        _band_mod.begin_turn("room-turn")
+        _band_mod.note_deliberate_send("room-turn")
+
+        result = await adapter.send("room-turn", "host copy")
+
+        assert result.success is True
+        adapter._link.rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+        adapter._link.rest.agent_api_events.create_agent_chat_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_blank_unaddressed_final_posts_nothing(self, adapter):
+        _band_mod.begin_turn("room-turn")
+
+        result = await adapter.send("room-turn", " \n\t ")
+
+        assert result.success is True
+        adapter._link.rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+        adapter._link.rest.agent_api_events.create_agent_chat_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_clears_open_turn_state(self, adapter):
+        _band_mod.begin_turn("room-turn")
+        adapter._consumer_task = None
+        adapter._link.disconnect = AsyncMock()
+
+        await adapter.disconnect()
+
+        assert _band_mod.deliberate_sends_this_turn("room-turn") is None
+
 
 # ---------------------------------------------------------------------------
 # 10. Inbound self-filter — _handle_message_created
@@ -771,6 +830,18 @@ class TestInboundSelfFilter:
         )
         await adapter._handle_message_created(event)
         adapter.handle_message.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_dispatched_message_opens_explicit_send_turn(self, adapter):
+        event = self._make_event(
+            sender_id="human-sender",
+            sender_type="User",
+            msg_id="turn-msg-id",
+        )
+
+        await adapter._handle_message_created(event)
+
+        assert _band_mod.deliberate_sends_this_turn("room-abc") == 0
 
     @pytest.mark.asyncio
     async def test_dispatched_event_has_no_thread_id(self, adapter):

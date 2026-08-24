@@ -30,6 +30,7 @@ import pytest
 
 from gateway.session_context import set_session_vars, clear_session_vars
 from hermes_band_platform import tools as band_tools
+from hermes_band_platform import adapter as band_adapter
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +357,25 @@ class TestSendMessage:
         assert [m.id for m in mentions] == ["u-y"]
         # handle resolved from the participant list
         assert mentions[0].handle == "y"
+
+    @pytest.mark.asyncio
+    async def test_successful_tool_send_marks_active_turn_replied(self, owner_session):
+        rest = _make_rest()
+        rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
+            return_value=SimpleNamespace(data=[_peer("u-y", handle="y")])
+        )
+        band_adapter.begin_turn("room-current")
+        try:
+            with _patch_rest(rest), _patch_agent_id("agent-self"):
+                out = _parse(
+                    await band_tools._handle_send_message(
+                        {"content": "hi", "mention_ids": ["u-y"]}
+                    )
+                )
+            assert out["success"] is True
+            assert band_adapter.deliberate_sends_this_turn("room-current") == 1
+        finally:
+            band_adapter.reset_turn_state()
 
     @pytest.mark.asyncio
     async def test_no_mentionable_recipient_errors(self, owner_session):

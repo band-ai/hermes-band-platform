@@ -51,6 +51,7 @@ from .adapter import (
     _derive_urls,
     _mention_items,
     _short_id,
+    note_deliberate_send,
     check_band_requirements,
 )
 
@@ -706,6 +707,8 @@ async def _handle_send_message(args: dict, **kwargs) -> str:
                 request_options=DEFAULT_REQUEST_OPTIONS,
             )
             last_id = getattr(getattr(resp, "data", None), "id", None) or last_id
+
+        note_deliberate_send(room_id)
 
         logger.info(
             "[band.tools] Sent message to room %s (chunks=%d)", _short_id(room_id), len(chunks)

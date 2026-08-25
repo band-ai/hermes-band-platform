@@ -124,7 +124,6 @@ class TestBandAdapterInit:
         assert adapter._consumer_task is None
         assert adapter._sent_ids == set()
         assert adapter._participants_cache == {}
-        assert adapter._last_human_sender == {}
 
     def test_name_property(self, monkeypatch):
         assert _make_adapter(monkeypatch).name == "Band"
@@ -268,17 +267,12 @@ class TestBandPluginRegistration:
         assert "BAND_AGENT_ID" in kwargs["required_env"]
         assert "BAND_API_KEY" in kwargs["required_env"]
 
-    def test_register_passes_allowed_users_env(self):
+    def test_register_exposes_no_sender_allowlist_envs(self):
         ctx = MagicMock()
         register(ctx)
         kwargs = ctx.register_platform.call_args[1]
-        assert kwargs["allowed_users_env"] == "BAND_ALLOWED_USERS"
-
-    def test_register_passes_allow_all_env(self):
-        ctx = MagicMock()
-        register(ctx)
-        kwargs = ctx.register_platform.call_args[1]
-        assert kwargs["allow_all_env"] == "BAND_ALLOW_ALL"
+        assert "allowed_users_env" not in kwargs
+        assert "allow_all_env" not in kwargs
 
     def test_register_passes_max_message_length(self):
         ctx = MagicMock()
@@ -297,41 +291,32 @@ class TestBandPluginRegistration:
         register(ctx)
         return ctx.register_platform.call_args[1]["platform_hint"]
 
-    def test_platform_hint_does_not_claim_plain_text_is_undelivered(self):
-        """Regression guard: the gateway auto-delivers the final assistant text
-        and there is no way to suppress that, so a hint claiming otherwise makes
-        the model call band_send_message and every reply gets posted twice."""
+    def test_platform_hint_requires_deliberate_tool_send(self):
         hint = self._hint()
-        assert "plain text is not delivered" not in hint
-        assert "not delivered" not in hint
+        assert "must send each reply deliberately with band_send_message" in hint
+        assert "choose its recipients in `mentions`" in hint
 
-    def test_platform_hint_says_reply_is_delivered_and_mentioned_for_you(self):
+    def test_platform_hint_explains_unsent_final_text(self):
         hint = self._hint()
-        assert "delivered to the room automatically" in hint
-        assert "@mentioned for you" in hint
+        assert "non-notifying thought" in hint
+        assert "notifies nobody" in hint
 
-    def test_platform_hint_forbids_send_message_for_the_current_room(self):
+    def test_platform_hint_says_invalid_routing_posts_nothing(self):
         hint = self._hint()
-        assert (
-            "Do NOT call band_send_message to reply in the room you are "
-            "already in" in hint
-        )
-        assert "twice" in hint
+        assert "send without mentions" in hint
+        assert "fails without posting" in hint
 
-    def test_platform_hint_keeps_owner_no_room_id_guidance(self):
-        """Still-correct guidance the fix must not drop: reaching the owner from
-        a non-Band session or another room does need an explicit tool call."""
+    def test_platform_hint_keeps_explicit_owner_room_guidance(self):
         hint = self._hint()
-        assert "call band_send_message with no room_id" in hint
-        assert "owner's hub" in hint
+        assert "band_send_message with no room_id" in hint
+        assert "owner's hub handle in `mentions`" in hint
 
-    def test_conversation_skill_agrees_that_final_text_is_auto_delivered(self):
+    def test_conversation_skill_matches_explicit_send_contract(self):
         skill = Path(_band_mod.__file__).parent / "skills" / "band-conversations" / "SKILL.md"
         guidance = skill.read_text()
-        assert "final assistant text is delivered" in guidance
-        assert "Plain assistant text is **not** delivered" not in guidance
-        assert "Do **not** call" in guidance
-        assert "`band_send_message` for that routine reply" in guidance
+        assert "Send every reply deliberately with `band_send_message`" in guidance
+        assert "`mentions` is required" in guidance
+        assert "non-notifying thought" in guidance
 
 
 # ---------------------------------------------------------------------------
@@ -534,42 +519,45 @@ class TestBandAdapterSend:
         assert result.error is not None
 
     @pytest.mark.asyncio
-    async def test_send_success_returns_message_id(self, adapter):
-        # Wire up a fake link with REST API
+    async def test_send_resolves_handle_recipient_from_room_roster(self, adapter):
         mock_link = MagicMock()
-        resp_data = SimpleNamespace(id="sent-msg-id-001")
-        resp = SimpleNamespace(data=resp_data)
         mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
-            return_value=resp
+            return_value=SimpleNamespace(data=SimpleNamespace(id="sent-msg-id-001"))
         )
         adapter._link = mock_link
+        adapter._participants_cache["room-123"] = [
+            {"id": "user-abc", "handle": "userhandle", "name": "User Name"}
+        ]
 
-        # Seed last human sender so build_mentions has something to work with
-        adapter._last_human_sender["room-123"] = {
-            "id": "user-abc",
-            "handle": "userhandle",
-            "name": "User Name",
-        }
+        result = await adapter.send(
+            "room-123",
+            "hello world",
+            metadata={"mentions": ["@userhandle"]},
+        )
 
-        result = await adapter.send("room-123", "hello world")
         assert result.success is True
         assert result.message_id == "sent-msg-id-001"
+        mention = (
+            mock_link.rest.agent_api_messages.create_agent_chat_message.await_args
+            .kwargs["message"].mentions[0]
+        )
+        assert (mention.id, mention.handle) == ("user-abc", "userhandle")
 
     @pytest.mark.asyncio
     async def test_send_records_message_id_in_sent_ids(self, adapter):
         mock_link = MagicMock()
-        resp = SimpleNamespace(data=SimpleNamespace(id="tracked-id"))
         mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
-            return_value=resp
+            return_value=SimpleNamespace(data=SimpleNamespace(id="tracked-id"))
         )
         adapter._link = mock_link
-        adapter._last_human_sender["room-99"] = {
-            "id": "user-x",
-            "handle": "ux",
-            "name": "User X",
-        }
+        adapter._participants_cache["room-99"] = [
+            {"id": "user-x", "handle": "ux", "name": "User X"}
+        ]
 
-        await adapter.send("room-99", "test message")
+        await adapter.send(
+            "room-99", "test message", metadata={"mentions": ["@ux"]}
+        )
+
         assert "tracked-id" in adapter._sent_ids
 
     @pytest.mark.asyncio
@@ -584,17 +572,17 @@ class TestBandAdapterSend:
 
         mock_link.rest.agent_api_messages.create_agent_chat_message = _fake_send
         adapter._link = mock_link
-        adapter._last_human_sender["room-big"] = {
-            "id": "user-y",
-            "handle": "uy",
-            "name": "User Y",
-        }
+        adapter._participants_cache["room-big"] = [
+            {"id": "user-y", "handle": "uy", "name": "User Y"}
+        ]
 
-        # Create content longer than MAX_MESSAGE_LENGTH (4000)
-        long_content = "x" * 5000
-        result = await adapter.send("room-big", long_content)
+        result = await adapter.send(
+            "room-big",
+            "x" * 5000,
+            metadata={"mentions": ["uy"]},
+        )
+
         assert result.success is True
-        # Should have been called at least twice (chunked)
         assert call_count >= 2
 
     @pytest.mark.asyncio
@@ -604,53 +592,115 @@ class TestBandAdapterSend:
             side_effect=RuntimeError("network failure")
         )
         adapter._link = mock_link
-        adapter._last_human_sender["room-fail"] = {
-            "id": "user-z",
-            "handle": "uz",
-            "name": "User Z",
-        }
+        adapter._participants_cache["room-fail"] = [
+            {"id": "user-z", "handle": "uz", "name": "User Z"}
+        ]
 
-        result = await adapter.send("room-fail", "hi")
+        result = await adapter.send(
+            "room-fail", "hi", metadata={"mentions": ["uz"]}
+        )
+
         assert result.success is False
         assert "network failure" in result.error
 
     @pytest.mark.asyncio
-    async def test_send_no_mention_returns_failure_without_sending(self, adapter):
+    async def test_send_without_mentions_fails_even_with_room_participants(
+        self, adapter
+    ):
         mock_link = MagicMock()
         mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock()
-        mock_link.rest.agent_api_participants.list_agent_chat_participants = AsyncMock(
-            return_value=SimpleNamespace(data=[])
-        )
         adapter._link = mock_link
-
-        # No last human sender and no participants cached
-        result = await adapter.send("room-empty", "hello")
-        assert result.success is False
-        mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_send_builds_mentions_from_participants_when_no_last_sender(self, adapter):
-        mock_link = MagicMock()
-        resp = SimpleNamespace(data=SimpleNamespace(id="msg-x"))
-        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
-            return_value=resp
-        )
-        adapter._link = mock_link
-        adapter._agent_id = "agent-id-xxx"
-
-        # Seed participants cache directly (skipping REST fetch)
         adapter._participants_cache["room-p"] = [
-            {"id": "agent-id-xxx", "type": "Agent", "name": "Bot", "handle": "bot"},
-            {"id": "human-id", "type": "User", "name": "Alice", "handle": "alice"},
+            {"id": "human-id", "type": "User", "name": "Alice", "handle": "alice"}
         ]
 
-        result = await adapter.send("room-p", "hello from fallback")
+        result = await adapter.send("room-p", "hello")
+
+        assert result.success is False
+        assert "mentions" in result.error
+        mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_uuid_recipient_resolves_against_room_roster(self, adapter):
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(id="msg-uuid"))
+        )
+        adapter._link = mock_link
+        adapter._participants_cache["room-u"] = [
+            {"id": "human-id", "type": "User", "name": "Alice", "handle": "alice"}
+        ]
+
+        result = await adapter.send(
+            "room-u", "hello", metadata={"mentions": ["human-id"]}
+        )
+
         assert result.success is True
-        # Ensure the call passed mentions
-        call_kwargs = mock_link.rest.agent_api_messages.create_agent_chat_message.call_args[1]
-        mentions = call_kwargs["message"].mentions
-        assert len(mentions) >= 1
-        assert any(getattr(m, "id", None) == "human-id" for m in mentions)
+        mention = (
+            mock_link.rest.agent_api_messages.create_agent_chat_message.await_args
+            .kwargs["message"].mentions[0]
+        )
+        assert (mention.id, mention.handle) == ("human-id", "alice")
+
+    @pytest.mark.asyncio
+    async def test_unique_display_name_resolves_but_ambiguous_name_fails(
+        self, adapter
+    ):
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock(
+            return_value=SimpleNamespace(data=SimpleNamespace(id="msg-name"))
+        )
+        adapter._link = mock_link
+        adapter._participants_cache["room-n"] = [
+            {
+                "id": "alice-1",
+                "type": "User",
+                "name": "Alex Smith",
+                "handle": "alice",
+            },
+        ]
+        success = await adapter.send(
+            "room-n", "hello", metadata={"mentions": ["Alex Smith"]}
+        )
+        assert success.success is True
+
+        adapter._participants_cache["room-n"].append(
+            {
+                "id": "alice-2",
+                "type": "User",
+                "name": "Alex Smith",
+                "handle": "alice2",
+            }
+        )
+        failed = await adapter.send(
+            "room-n", "hello", metadata={"mentions": ["Alex Smith"]}
+        )
+        assert failed.success is False
+        assert "ambiguous" in failed.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_unknown_out_of_room_and_handleless_recipients_fail_locally(
+        self, adapter
+    ):
+        mock_link = MagicMock()
+        mock_link.rest.agent_api_messages.create_agent_chat_message = AsyncMock()
+        adapter._link = mock_link
+        adapter._participants_cache["room-e"] = [
+            {"id": "no-handle", "type": "User", "name": "No Handle", "handle": None}
+        ]
+
+        unknown = await adapter.send(
+            "room-e", "hello", metadata={"mentions": ["outside-room"]}
+        )
+        handleless = await adapter.send(
+            "room-e", "hello", metadata={"mentions": ["no-handle"]}
+        )
+
+        assert unknown.success is False
+        assert handleless.success is False
+        assert "outside-room" in unknown.error
+        assert "no-handle" in handleless.error
+        mock_link.rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_send_marshals_to_link_loop_when_called_from_another_loop(self, adapter):
@@ -672,9 +722,9 @@ class TestBandAdapterSend:
 
         mock_link.rest.agent_api_messages.create_agent_chat_message = _create
         adapter._link = mock_link
-        adapter._last_human_sender["room-x"] = {
-            "id": "user-x", "handle": "ux", "name": "User X",
-        }
+        adapter._participants_cache["room-x"] = [
+            {"id": "user-x", "handle": "ux", "name": "User X"}
+        ]
 
         # Run a dedicated "link" loop in its own thread and pin it on the adapter,
         # exactly as connect() would.
@@ -693,7 +743,11 @@ class TestBandAdapterSend:
         try:
             # We're on the default test loop, which is NOT link_loop.
             assert asyncio.get_running_loop() is not link_loop
-            result = await adapter.send("room-x", "hello from restore")
+            result = await adapter.send(
+                "room-x",
+                "hello from restore",
+                metadata={"mentions": ["ux"]},
+            )
         finally:
             link_loop.call_soon_threadsafe(link_loop.stop)
             t.join(5)
@@ -703,6 +757,65 @@ class TestBandAdapterSend:
         assert result.message_id == "cross-loop-id"
         # The REST call actually executed on the link's loop, not the caller's.
         assert send_loops == [link_loop]
+
+class TestExplicitSendLifecycle:
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
+        a._agent_id = "agent-self-id"
+        link = MagicMock()
+        link.rest.agent_api_messages.create_agent_chat_message = AsyncMock()
+        link.rest.agent_api_events.create_agent_chat_event = AsyncMock()
+        a._link = link
+        yield a
+        reset = getattr(_band_mod, "reset_turn_state", None)
+        if reset is not None:
+            reset()
+
+    @pytest.mark.asyncio
+    async def test_unaddressed_final_text_becomes_one_thought(self, adapter):
+        _band_mod.begin_turn("room-turn")
+
+        result = await adapter.send("room-turn", "I forgot to address this")
+
+        assert result.success is True
+        adapter._link.rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+        event_call = (
+            adapter._link.rest.agent_api_events.create_agent_chat_event.await_args
+        )
+        assert event_call.kwargs["event"].message_type.value == "thought"
+
+    @pytest.mark.asyncio
+    async def test_explicit_send_suppresses_host_final_copy(self, adapter):
+        _band_mod.begin_turn("room-turn")
+        _band_mod.note_deliberate_send("room-turn")
+
+        result = await adapter.send("room-turn", "host copy")
+
+        assert result.success is True
+        adapter._link.rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+        adapter._link.rest.agent_api_events.create_agent_chat_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_blank_unaddressed_final_posts_nothing(self, adapter):
+        _band_mod.begin_turn("room-turn")
+
+        result = await adapter.send("room-turn", " \n\t ")
+
+        assert result.success is True
+        adapter._link.rest.agent_api_messages.create_agent_chat_message.assert_not_awaited()
+        adapter._link.rest.agent_api_events.create_agent_chat_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_clears_open_turn_state(self, adapter):
+        _band_mod.begin_turn("room-turn")
+        adapter._consumer_task = None
+        adapter._link.disconnect = AsyncMock()
+
+        await adapter.disconnect()
+
+        assert _band_mod.deliberate_sends_this_turn("room-turn") is None
 
 
 # ---------------------------------------------------------------------------
@@ -726,8 +839,8 @@ class TestInboundSelfFilter:
 
     def _make_event(self, sender_id, sender_type, msg_id="msg-001", content="hello",
                     message_type="text", room_id="room-abc", mentioned=True):
-        # Default to mentioning the agent: every Band room is mention-gated, so
-        # the dispatch-mechanics tests need an addressed message to get through.
+        # Default to preserving mention metadata for dispatch-mechanics tests
+        # that do not care whether Band included it.
         mentions = (
             [SimpleNamespace(id="agent-self-id", handle=None)] if mentioned else []
         )
@@ -778,6 +891,18 @@ class TestInboundSelfFilter:
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_dispatched_message_opens_explicit_send_turn(self, adapter):
+        event = self._make_event(
+            sender_id="human-sender",
+            sender_type="User",
+            msg_id="turn-msg-id",
+        )
+
+        await adapter._handle_message_created(event)
+
+        assert _band_mod.deliberate_sends_this_turn("room-abc") == 0
+
+    @pytest.mark.asyncio
     async def test_dispatched_event_has_no_thread_id(self, adapter):
         event = self._make_event(
             sender_id="human-sender",
@@ -809,8 +934,10 @@ class TestInboundSelfFilter:
         adapter.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_group_message_without_mention_is_ignored(self, adapter):
-        # Multi-party room, no mention → ignored (mention is the only gate).
+    async def test_group_message_without_mention_is_dispatched(self, adapter):
+        # Band only delivers room messages the agent should see. The adapter must
+        # not require mention metadata again, because the delivery itself is the
+        # address signal.
         adapter._participants_cache["group-room"] = [
             {"id": "agent-self-id", "type": "Agent", "name": "Bot", "handle": "bot"},
             {"id": "user1", "type": "User", "name": "Alice", "handle": "alice"},
@@ -824,7 +951,7 @@ class TestInboundSelfFilter:
             sender_type="User",
             sender_name="Alice",
             chat_room_id="group-room",
-            metadata=SimpleNamespace(mentions=[]),  # No agent mention
+            metadata=SimpleNamespace(mentions=[]),  # No agent mention metadata
         )
         event = SimpleNamespace(
             type="message_created",
@@ -832,20 +959,17 @@ class TestInboundSelfFilter:
             payload=payload,
         )
         await adapter._handle_message_created(event)
-        adapter.handle_message.assert_not_called()
+        adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_two_participant_room_without_mention_is_ignored(self, adapter):
-        # room-abc is a 2-participant room. Band has no DMs, so it is
-        # mention-gated like any other room — no mention → ignored. Locks the
-        # over-respond bug fix.
+    async def test_two_participant_room_without_mention_is_dispatched(self, adapter):
         event = self._make_event(
             sender_id="human-sender",
             sender_type="User",
             mentioned=False,
         )
         await adapter._handle_message_created(event)
-        adapter.handle_message.assert_not_called()
+        adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_dispatched_source_chat_type_is_constant(self, adapter):
@@ -857,9 +981,7 @@ class TestInboundSelfFilter:
         assert evt.source.chat_type == "group"
 
     @pytest.mark.asyncio
-    async def test_active_session_without_mention_is_ignored(self, adapter):
-        # An active session does NOT bypass the mention gate: the platform routes
-        # by mention, so Hermes mirrors that — no active-session stickiness.
+    async def test_active_session_without_mention_is_dispatched(self, adapter):
         active_key = "agent:main:band:group:room-abc"
         adapter._session_store = _FakeSessionStore(active_keys=[active_key])
         event = self._make_event(
@@ -868,12 +990,12 @@ class TestInboundSelfFilter:
             mentioned=False,
         )
         await adapter._handle_message_created(event)
-        adapter.handle_message.assert_not_called()
+        adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_owner_command_dispatches_without_mention(self, adapter):
-        # A validated owner slash command is answered even with no @mention.
-        adapter._owner_uuid = "human-sender"
+    async def test_hub_command_dispatches_without_mention_or_owner_check(self, adapter):
+        adapter._hub_room_id = "room-abc"
+        adapter._owner_uuid = "different-user"
         event = self._make_event(
             sender_id="human-sender",
             sender_type="User",
@@ -903,6 +1025,34 @@ class TestHandleEvent:
         event = SimpleNamespace(type="room_added", room_id="new-room-id")
         await adapter._handle_event(event)
         adapter._link.subscribe_room.assert_called_once_with("new-room-id")
+
+    @pytest.mark.asyncio
+    async def test_added_room_message_without_mention_is_dispatched(self, adapter):
+        event = SimpleNamespace(type="room_added", room_id="new-room-id")
+        await adapter._handle_event(event)
+
+        adapter.handle_message = AsyncMock()
+        adapter._agent_id = "agent-self-id"
+        adapter._participants_cache["new-room-id"] = [
+            {"id": "agent-self-id", "type": "Agent", "name": "Bot", "handle": "bot"},
+            {"id": "human-1", "type": "User", "name": "Alice", "handle": "alice"},
+        ]
+        payload = SimpleNamespace(
+            id="msg-new-room",
+            content="hello in the new room",
+            message_type="text",
+            sender_id="human-1",
+            sender_type="User",
+            sender_name="Alice",
+            chat_room_id="new-room-id",
+            metadata=SimpleNamespace(mentions=[]),
+        )
+
+        await adapter._handle_message_created(
+            SimpleNamespace(type="message_created", room_id="new-room-id", payload=payload)
+        )
+
+        adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_room_removed_unsubscribes(self, adapter):
@@ -1253,8 +1403,8 @@ class TestRehydrationOnNextMessage:
             sender_type="User",
             sender_name="Alice",
             chat_room_id=room_id,
-            # Agent is @mentioned so the message clears the gate (every Band
-            # room is mention-gated) and reaches the rehydration path.
+            # Mention metadata may be present, but delivery — not this metadata —
+            # is what routes the turn to Hermes.
             metadata=SimpleNamespace(
                 mentions=[SimpleNamespace(id="agent-self-id", handle=None)]
             ),
@@ -1549,6 +1699,39 @@ class TestDurableSeedRehydration:
         assert "earlier note" in evt.channel_context
 
     @pytest.mark.asyncio
+    async def test_no_seed_api_fallback_excludes_unprocessed_backlog(self, adapter):
+        # Older gateways without durable seed support still must not present an
+        # actionable backlog message both as channel_context and as the live turn.
+        adapter._session_store = _FakeSessionStore()
+        adapter._rehydrate_rooms.add("rejoined-room")
+        adapter._link.rest.agent_api_messages.list_agent_messages = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[SimpleNamespace(id="backlog-1", metadata={"mentions": []})],
+                metadata=SimpleNamespace(next_cursor=None, has_more=False),
+            )
+        )
+        adapter._link.rest.agent_api_context.get_agent_chat_context = self._ctx(
+            [
+                SimpleNamespace(id="h1", message_type="text", content="earlier note",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+                SimpleNamespace(id="backlog-1", message_type="text",
+                                content="please answer this", sender_id="human-1",
+                                sender_type="User", sender_name="Alice", inserted_at=None),
+                SimpleNamespace(id="msg-r1", message_type="text", content="active turn",
+                                sender_id="human-1", sender_type="User",
+                                sender_name="Alice", inserted_at=None),
+            ]
+        )
+
+        await adapter._handle_message_created(self._event())
+
+        evt = adapter.handle_message.call_args[0][0]
+        assert "earlier note" in evt.channel_context
+        assert "please answer this" not in evt.channel_context
+        assert "active turn" not in evt.channel_context
+
+    @pytest.mark.asyncio
     async def test_context_fetch_failure_still_delivers_message(self, adapter):
         adapter._session_store = _SeedingSessionStore()
         adapter._rehydrate_rooms.add("rejoined-room")
@@ -1660,10 +1843,10 @@ class TestDurableSeedRehydration:
         ]
 
     @pytest.mark.asyncio
-    async def test_unaddressed_actionable_message_is_kept_in_seed(self, adapter):
-        # Only *mentions* are excluded from the seed (they get answered). An
-        # unprocessed message that does NOT mention the agent is context, not an
-        # answer — it must stay in the seeded history, not be over-excluded.
+    async def test_unmentioned_unprocessed_message_is_excluded_from_seed(self, adapter):
+        # Delivery, not mention metadata, decides what Hermes answers. Every
+        # unprocessed message returned by the backlog endpoint is actionable and
+        # must be excluded from the seed to avoid double-answering it.
         store = _SeedingSessionStore()
         adapter._session_store = store
         adapter._rehydrate_rooms.add("rejoined-room")
@@ -1690,8 +1873,11 @@ class TestDurableSeedRehydration:
 
         await adapter._handle_message_created(self._event())
 
-        # The mention is excluded (it'll be answered); the un-addressed chatter is kept.
-        assert [r["content"] for r in store.atomic_seeded] == ["[Bob] background chatter"]
+        # Both backlog rows are excluded; with no seedable context left, no
+        # durable write or blob fallback is needed.
+        assert adapter._session_store.atomic_seeded is None
+        evt = adapter.handle_message.call_args[0][0]
+        assert evt.channel_context is None
 
     @pytest.mark.asyncio
     async def test_fetch_room_context_follows_pagination(self, adapter):
@@ -2235,14 +2421,13 @@ class TestCatchUpDrain:
         adapter._link.mark_processed.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_drain_dropped_message_is_made_terminal(self, adapter):
-        # A non-mention message is dropped by gating; /next would re-offer it,
-        # so the drain marks it processed itself.
-        dropped = _platform_msg("d1", mentions_agent=False)
-        adapter._link.get_next_message = AsyncMock(side_effect=[dropped, None])
+    async def test_drain_unmentioned_message_is_forwarded(self, adapter):
+        # Delivery is the gate; lack of mention metadata is not a drop reason.
+        msg = _platform_msg("d1", mentions_agent=False)
+        adapter._link.get_next_message = AsyncMock(side_effect=[msg, None])
         await adapter._drain_room("room-abc")
-        adapter.handle_message.assert_not_called()
-        adapter._link.mark_processed.assert_awaited_with("room-abc", "d1")
+        adapter.handle_message.assert_called_once()
+        adapter._link.mark_processed.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_drain_reoffered_id_is_force_acked_not_respun(self, adapter):
@@ -2431,26 +2616,6 @@ class TestInboundDedup:
         assert adapter.handle_message.await_count == 1
 
 
-class TestMentionParsingDictMetadata:
-    """_is_agent_mentioned must read caught-up dict metadata, not just objects."""
-
-    def test_dict_metadata_mention_by_id(self, monkeypatch):
-        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
-        a._agent_id = "agent-self-id"
-        payload = SimpleNamespace(metadata={"mentions": [{"id": "agent-self-id"}]})
-        assert a._is_agent_mentioned(payload) is True
-
-    def test_dict_metadata_mention_by_handle(self, monkeypatch):
-        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
-        a._handle = "bot"
-        payload = SimpleNamespace(metadata={"mentions": [{"handle": "bot"}]})
-        assert a._is_agent_mentioned(payload) is True
-
-    def test_dict_metadata_no_mention(self, monkeypatch):
-        a = _make_adapter(monkeypatch, agent_id="agent-self-id")
-        a._agent_id = "agent-self-id"
-        payload = SimpleNamespace(metadata={"mentions": [{"id": "someone-else"}]})
-        assert a._is_agent_mentioned(payload) is False
 
 
 # ---------------------------------------------------------------------------
@@ -3013,37 +3178,32 @@ class TestStripSelfMention:
         assert adapter._strip_self_mention("") == ""
 
     @pytest.mark.asyncio
-    async def test_addressed_command_dispatches(self, monkeypatch):
-        """An @mentioned slash command from the owner reaches the gateway."""
-        monkeypatch.delenv("BAND_HUB_ROOM", raising=False)
+    async def test_hub_command_strips_self_mention_before_dispatch(self, monkeypatch):
         a = _make_adapter(monkeypatch, agent_id="agent-self-id")
         a._agent_id = "agent-self-id"
-        a._owner_uuid = "owner-1"
-        a.handle_message = AsyncMock()
-        a.send = AsyncMock()
-        a._participants_cache["chat-room"] = [
-            {"id": "agent-self-id", "type": "Agent", "name": "Bot", "handle": "bot"},
-            {"id": "owner-1", "type": "User", "name": "Owner", "handle": "owner"},
+        a._hub_room_id = "hub-room"
+        a._participants_cache["hub-room"] = [
+            {"id": "any-band-user", "type": "User", "name": "User", "handle": "user"}
         ]
+        a.handle_message = AsyncMock()
         payload = SimpleNamespace(
             id="m1",
             content="@[[agent-self-id]] /help",
             message_type="text",
-            sender_id="owner-1",
+            sender_id="any-band-user",
             sender_type="User",
-            sender_name="Owner",
-            chat_room_id="chat-room",
+            sender_name="User",
+            chat_room_id="hub-room",
             metadata=SimpleNamespace(mentions=[]),
         )
         await a._handle_message_created(
-            SimpleNamespace(type="message_created", room_id="chat-room", payload=payload)
+            SimpleNamespace(type="message_created", room_id="hub-room", payload=payload)
         )
         a.handle_message.assert_called_once()
-        # The relayed text is the bare command, so the gateway dispatches it.
         assert a.handle_message.call_args.args[0].text == "/help"
 
 
-class TestOwnerCommandGate:
+class TestHubCommandGate:
 
     @pytest.fixture
     def adapter(self, monkeypatch):
@@ -3052,16 +3212,15 @@ class TestOwnerCommandGate:
         a._agent_id = "agent-self-id"
         a._owner_uuid = "owner-1"
         a._hub_room_id = "hub-room"
-        a.handle_message = AsyncMock()
-        a.send = AsyncMock()
+        a._link = _ack_link()
         a._participants_cache["hub-room"] = [
-            {"id": "agent-self-id", "type": "Agent", "name": "Bot", "handle": "bot"},
-            {"id": "owner-1", "type": "User", "name": "Owner", "handle": "owner"},
+            {"id": "any-band-user", "type": "User", "name": "User", "handle": "user"}
         ]
         a._participants_cache["chat-room"] = [
-            {"id": "agent-self-id", "type": "Agent", "name": "Bot", "handle": "bot"},
-            {"id": "human-2", "type": "User", "name": "Bob", "handle": "bob"},
+            {"id": "human-2", "type": "User", "name": "Human", "handle": "human"}
         ]
+        a.handle_message = AsyncMock()
+        a.send = AsyncMock()
         return a
 
     @staticmethod
@@ -3083,87 +3242,67 @@ class TestOwnerCommandGate:
         return SimpleNamespace(type="message_created", room_id=room_id, payload=payload)
 
     @pytest.mark.asyncio
-    async def test_owner_command_in_hub_relayed(self, adapter):
-        await adapter._handle_message_created(self._event("hub-room", "owner-1", "/help"))
+    async def test_command_in_hub_relayed_without_sender_check(self, adapter):
+        await adapter._handle_message_created(
+            self._event("hub-room", "not-the-owner", "/help")
+        )
         adapter.handle_message.assert_called_once()
         adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_owner_command_outside_hub_relayed(self, adapter):
-        await adapter._handle_message_created(self._event("chat-room", "owner-1", "/help"))
-        adapter.handle_message.assert_called_once()
+    async def test_command_outside_hub_is_acked_and_not_forwarded(self, adapter):
+        await adapter._handle_message_created(
+            self._event("chat-room", "owner-1", "/help")
+        )
+        adapter.handle_message.assert_not_called()
         adapter.send.assert_not_called()
+        adapter._link.mark_processed.assert_awaited_once_with(
+            "chat-room", "msg-gate-1"
+        )
 
     @pytest.mark.asyncio
-    async def test_owner_command_works_without_hub(self, adapter):
+    async def test_command_rejected_when_hub_is_unresolved(self, adapter):
         adapter._hub_room_id = None
-        await adapter._handle_message_created(self._event("chat-room", "owner-1", "/help"))
-        adapter.handle_message.assert_called_once()
-        adapter.send.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_non_owner_command_dropped_with_notice(self, adapter):
-        await adapter._handle_message_created(self._event("chat-room", "human-2", "/help"))
-        adapter.handle_message.assert_not_called()
-        adapter.send.assert_awaited_once()
-        args = adapter.send.await_args.args
-        assert args[0] == "chat-room"
-        assert "owner" in args[1]
-
-    @pytest.mark.asyncio
-    async def test_notice_sent_only_once_per_room(self, adapter):
-        await adapter._handle_message_created(self._event("chat-room", "human-2", "/help"))
         await adapter._handle_message_created(
-            self._event("chat-room", "human-2", "/new", msg_id="msg-gate-2")
-        )
-        adapter.handle_message.assert_not_called()
-        assert adapter.send.await_count == 1
-
-    @pytest.mark.asyncio
-    async def test_non_owner_command_in_hub_dropped(self, adapter):
-        await adapter._handle_message_created(self._event("hub-room", "intruder-9", "/new"))
-        adapter.handle_message.assert_not_called()
-        adapter.send.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_agent_sender_command_dropped_silently(self, adapter):
-        await adapter._handle_message_created(
-            self._event("chat-room", "other-agent-7", "/help", sender_type="Agent")
+            self._event("chat-room", "owner-1", "/help")
         )
         adapter.handle_message.assert_not_called()
         adapter.send.assert_not_called()
+        adapter._link.mark_processed.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_path_like_text_relayed_as_chat(self, adapter):
-        # Path-like text isn't a command, so it's never dropped by the command
-        # gate. @mentioned here so it also clears the normal mention gate and
-        # reaches the agent as plain chat.
-        await adapter._handle_message_created(
-            self._event("chat-room", "human-2", "/usr/bin/ls is missing", mentioned=True)
-        )
-        adapter.handle_message.assert_called_once()
-        adapter.send.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_fail_closed_without_owner(self, adapter):
+    async def test_hub_command_does_not_depend_on_owner_resolution(self, adapter):
         adapter._owner_uuid = None
-        await adapter._handle_message_created(self._event("hub-room", "owner-1", "/help"))
-        adapter.handle_message.assert_not_called()
-        adapter.send.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_plain_chat_in_hub_requires_mention(self, adapter):
-        # The hub is no longer a gating exception: un-mentioned plain chat is
-        # ignored there like in any other room (the owner must @mention to talk).
-        await adapter._handle_message_created(self._event("hub-room", "owner-1", "hello"))
-        adapter.handle_message.assert_not_called()
+        await adapter._handle_message_created(
+            self._event("hub-room", "any-band-user", "/new")
+        )
+        adapter.handle_message.assert_called_once()
         adapter.send.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_mentioned_chat_in_hub_relayed(self, adapter):
-        # With an @mention, plain chat in the hub reaches the agent.
+    async def test_path_like_text_outside_hub_is_plain_chat(self, adapter):
         await adapter._handle_message_created(
-            self._event("hub-room", "owner-1", "hello", mentioned=True)
+            self._event("chat-room", "human-2", "/usr/bin/ls is missing")
+        )
+        adapter.handle_message.assert_called_once()
+        adapter.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_plain_text_outside_hub_is_forwarded_without_mention_metadata(
+        self, adapter
+    ):
+        await adapter._handle_message_created(
+            self._event("chat-room", "human-2", "hello")
+        )
+        adapter.handle_message.assert_called_once()
+        adapter.send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_plain_text_in_hub_is_forwarded_without_mention_metadata(
+        self, adapter
+    ):
+        await adapter._handle_message_created(
+            self._event("hub-room", "any-band-user", "hello")
         )
         adapter.handle_message.assert_called_once()
         adapter.send.assert_not_called()
@@ -3327,8 +3466,7 @@ class TestHubFailover:
         a._hub_room_id = "old-hub"
         a._hub_failover_threshold = 3
         a._hub_failover_max_per_connect = 5
-        # Last human sender so send()'s mention build always succeeds.
-        a._last_human_sender["old-hub"] = {"id": "owner-1", "handle": "nir", "name": "Nir"}
+        a._build_mentions = AsyncMock(return_value=([MagicMock()], None))
         # Record .env persistence instead of writing the operator's real file.
         saved = {}
         import hermes_cli.config as _hcfg
@@ -3402,7 +3540,6 @@ class TestHubFailover:
             side_effect=RuntimeError("boom")
         )
         adapter._link = link
-        adapter._last_human_sender["other-room"] = {"id": "u", "handle": "u", "name": "U"}
 
         await adapter.send("other-room", "hi")
         assert adapter._hub_send_failures == 0
@@ -3554,9 +3691,9 @@ class TestRendererCapabilities:
         delivery = pytest.importorskip("gateway.delivery")
 
         adapter = _make_adapter(monkeypatch)
-        adapter._last_human_sender["room-cron"] = {
-            "id": "user-c", "handle": "uc", "name": "User C",
-        }
+        adapter._participants_cache["room-cron"] = [
+            {"id": "user-c", "handle": "uc", "name": "User C"}
+        ]
         posted: list = []
 
         async def _create(*args, **kwargs):
@@ -3580,7 +3717,11 @@ class TestRendererCapabilities:
         long_output = "band-cron-line\n" * 800  # ~12000 chars, well over the cap
         assert len(long_output) > delivery.MAX_PLATFORM_OUTPUT
 
-        result = await router._deliver_to_platform(target, long_output, {"job_id": "job-1"})
+        result = await router._deliver_to_platform(
+            target,
+            long_output,
+            {"job_id": "job-1", "mentions": ["@uc"]},
+        )
 
         assert result.success is True
         # Chunked by the adapter, not truncated by the host: every line survived
@@ -3592,7 +3733,11 @@ class TestRendererCapabilities:
         # Negative control: clear the flag and the same host path truncates.
         posted.clear()
         adapter.splits_long_messages = False
-        await router._deliver_to_platform(target, long_output, {"job_id": "job-1"})
+        await router._deliver_to_platform(
+            target,
+            long_output,
+            {"job_id": "job-1", "mentions": ["@uc"]},
+        )
         assert len(posted) == 1
         assert "full output saved to" in posted[0]
 
@@ -3815,11 +3960,13 @@ class TestPostChunks:
         link = MagicMock()
         link.rest = _rest_stub()
         adapter._link = link
-        adapter._last_human_sender["room-1"] = {
-            "id": "human-1", "handle": "alice", "name": "Alice",
-        }
+        adapter._participants_cache["room-1"] = [
+            {"id": "human-1", "handle": "alice", "name": "Alice"}
+        ]
 
-        result = await adapter._send_on_link("room-1", "x" * 9000)
+        result = await adapter._send_on_link(
+            "room-1", "x" * 9000, metadata={"mentions": ["@alice"]}
+        )
 
         assert result.success is True
         assert result.message_id in adapter._sent_ids
@@ -3890,7 +4037,9 @@ class TestStandaloneSend:
         rest = _rest_stub([_participant("human-1", "Alice", "alice")])
         seen = self._patch_rest(env, rest)
 
-        result = await _standalone_send(_make_config(), "room-explicit", "cron output")
+        result = await _standalone_send(
+            _make_config(), "room-explicit", "cron output", mentions=["@alice"]
+        )
 
         assert result == {
             "success": True,
@@ -3911,7 +4060,9 @@ class TestStandaloneSend:
         rest = _rest_stub([_participant("human-1", "Alice", "alice")])
         self._patch_rest(env, rest)
 
-        result = await _standalone_send(_make_config(), "", "hello")
+        result = await _standalone_send(
+            _make_config(), "", "hello", mentions=["@alice"]
+        )
 
         assert result["success"] is True
         assert result["chat_id"] == "room-home"
@@ -3959,7 +4110,9 @@ class TestStandaloneSend:
             {"agent_id": "agent-extra", "api_key": "key-extra", "base_url": "band.internal"}
         )
 
-        result = await _standalone_send(cfg, "room-1", "hi")
+        result = await _standalone_send(
+            cfg, "room-1", "hi", mentions=["@alice"]
+        )
 
         assert result["success"] is True
         assert seen["api_key"] == "key-extra"
@@ -3969,16 +4122,19 @@ class TestStandaloneSend:
     # ── parity with the live _send_on_link path ───────────────────────────
 
     @pytest.mark.asyncio
-    async def test_agent_itself_is_never_mentioned(self, env):
+    async def test_only_explicit_recipient_is_mentioned(self, env):
         rest = _rest_stub(
             [
                 _participant("agent-self", "Bot", "bot", ptype="Agent"),
                 _participant("human-1", "Alice", "alice"),
+                _participant("human-2", "Bob", "bob"),
             ]
         )
         self._patch_rest(env, rest)
 
-        result = await _standalone_send(_make_config(), "room-1", "hi")
+        result = await _standalone_send(
+            _make_config(), "room-1", "hi", mentions=["@alice"]
+        )
 
         assert result["success"] is True
         assert _mention_tuples(rest.agent_api_messages.create_agent_chat_message) == [
@@ -3995,7 +4151,9 @@ class TestStandaloneSend:
         )
         assert len(expected_chunks) >= 2  # guard: the fixture must actually chunk
 
-        result = await _standalone_send(_make_config(), "room-1", long_content)
+        result = await _standalone_send(
+            _make_config(), "room-1", long_content, mentions=["@alice"]
+        )
 
         create = rest.agent_api_messages.create_agent_chat_message
         assert [c.kwargs["message"].content for c in create.await_args_list] == expected_chunks
@@ -4007,34 +4165,34 @@ class TestStandaloneSend:
         assert result["message_id"] == f"std-msg-{len(expected_chunks)}"
 
     @pytest.mark.asyncio
-    async def test_mentions_match_the_live_path_for_a_room_with_no_cached_sender(self, env):
-        """Both paths take _mention_items' all-non-agent-participants branch.
-
-        The standalone path cannot reach ``_build_mentions``' preferred
-        last-human-sender (that cache lives on a connected adapter), so parity is
-        against the live path's behaviour for a room it has not heard from.
-        """
+    async def test_explicit_mentions_match_live_adapter_resolution(self, env):
         participants = [
-            _participant("agent-self", "Bot", "bot", ptype="Agent"),
             _participant("human-1", "Alice", "alice"),
             _participant("human-2", "Bob", "bob"),
         ]
-
         standalone_rest = _rest_stub(participants)
         self._patch_rest(env, standalone_rest)
-        await _standalone_send(_make_config(), "room-parity", "same text")
+        await _standalone_send(
+            _make_config(),
+            "room-parity",
+            "same text",
+            mentions=["@bob"],
+        )
 
         adapter = _make_adapter(env, agent_id="agent-self")
-        adapter._agent_id = "agent-self"
         live_link = MagicMock()
         live_link.rest = _rest_stub(participants)
         adapter._link = live_link
-        assert not adapter._last_human_sender  # cold room, no cached sender
-        live_result = await adapter._send_on_link("room-parity", "same text")
+        live_result = await adapter._send_on_link(
+            "room-parity",
+            "same text",
+            metadata={"mentions": ["@bob"]},
+        )
 
         assert live_result.success is True
-        assert _mention_tuples(standalone_rest.agent_api_messages.create_agent_chat_message) \
-            == _mention_tuples(live_link.rest.agent_api_messages.create_agent_chat_message)
+        assert _mention_tuples(
+            standalone_rest.agent_api_messages.create_agent_chat_message
+        ) == _mention_tuples(live_link.rest.agent_api_messages.create_agent_chat_message)
 
     # ── actionable failures ───────────────────────────────────────────────
 
@@ -4083,14 +4241,13 @@ class TestStandaloneSend:
         rest.agent_api_messages.create_agent_chat_message.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_no_mentionable_recipient_fails_without_posting(self, env):
-        # Agent-only room: nothing to mention once self is excluded.
-        rest = _rest_stub([_participant("agent-self", "Bot", "bot", ptype="Agent")])
+    async def test_missing_explicit_mentions_fails_without_posting(self, env):
+        rest = _rest_stub([_participant("human-1", "Alice", "alice")])
         self._patch_rest(env, rest)
 
         result = await _standalone_send(_make_config(), "room-1", "hi")
 
-        assert "mention" in result["error"].lower()
+        assert "mentions" in result["error"].lower()
         assert "success" not in result
         rest.agent_api_messages.create_agent_chat_message.assert_not_called()
 
@@ -4102,7 +4259,9 @@ class TestStandaloneSend:
         )
         seen = self._patch_rest(env, rest)
 
-        result = await _standalone_send(_make_config(), "room-1", "hi")
+        result = await _standalone_send(
+            _make_config(), "room-1", "hi", mentions=["@alice"]
+        )
 
         assert "participants 503" in result["error"]
         rest.agent_api_messages.create_agent_chat_message.assert_not_called()
@@ -4116,7 +4275,9 @@ class TestStandaloneSend:
         )
         seen = self._patch_rest(env, rest)
 
-        result = await _standalone_send(_make_config(), "room-1", "hi")
+        result = await _standalone_send(
+            _make_config(), "room-1", "hi", mentions=["@alice"]
+        )
 
         assert "network failure" in result["error"]
         assert "success" not in result
@@ -4129,7 +4290,9 @@ class TestStandaloneSend:
 
         env.setattr(_band_mod, "_standalone_rest", _boom)
 
-        result = await _standalone_send(_make_config(), "room-1", "hi")
+        result = await _standalone_send(
+            _make_config(), "room-1", "hi", mentions=["@alice"]
+        )
 
         assert "no client" in result["error"]
 
@@ -4157,6 +4320,7 @@ class TestStandaloneSend:
             thread_id="ignored",
             media_files=["/tmp/nope.png"],
             force_document=True,
+            mentions=["@alice"],
         )
 
         assert result["success"] is True
@@ -4227,9 +4391,7 @@ class TestSendLogging:
         link = MagicMock()
         link.rest = _rest_stub()
         adapter._link = link
-        adapter._last_human_sender["room-1"] = {
-            "id": "human-1", "handle": "alice", "name": "Alice",
-        }
+        adapter._build_mentions = AsyncMock(return_value=([MagicMock()], None))
         return adapter
 
     @staticmethod
@@ -4390,22 +4552,19 @@ class TestStandaloneSendLogging:
         )
 
     @pytest.mark.asyncio
-    async def test_no_mentionable_recipient_is_logged_with_the_count(
-        self, monkeypatch, caplog
-    ):
+    async def test_missing_explicit_recipients_is_logged(self, monkeypatch, caplog):
         monkeypatch.setenv("BAND_AGENT_ID", "agent-self")
         monkeypatch.setenv("BAND_API_KEY", "secret-key")
-        # Only the agent itself is in the room, so nobody can be @mentioned.
-        rest = _rest_stub([_participant("agent-self", "Bot", "bot", ptype="Agent")])
-        monkeypatch.setattr(_band_mod, "_standalone_rest", lambda *a, **k: rest)
 
         with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
-            result = await _standalone_send(_make_config(), "room-1", "cron output")
+            result = await _standalone_send(
+                _make_config(), "room-1", "cron output"
+            )
 
         assert "error" in result
-        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        errors = [record for record in caplog.records if record.levelno == logging.ERROR]
         assert len(errors) == 1
-        assert "1 participant(s)" in errors[0].getMessage()
+        assert "no explicit recipients" in errors[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_delivery_reports_the_message_id(self, monkeypatch, caplog):
@@ -4416,7 +4575,10 @@ class TestStandaloneSendLogging:
 
         with caplog.at_level(logging.DEBUG, logger=_ADAPTER_LOGGER):
             result = await _standalone_send(
-                _make_config(), "room-1", f"cron output: {SECRET_BODY}"
+                _make_config(),
+                "room-1",
+                f"cron output: {SECRET_BODY}",
+                mentions=["@alice"],
             )
 
         assert result["success"] is True
@@ -4704,3 +4866,363 @@ class TestWorkingIndicatorLogging:
             await adapter.stop_typing("room-never-typed")
 
         assert caplog.records == []
+
+
+class TestLinkLivenessProbe:
+    """``_link_supervisor_stopped`` reads band-sdk internals, so its contract is
+    tri-state: stopped, still running, or *unknown*.
+
+    Unknown is the load-bearing case. The probe reaches through
+    ``link._ws.client`` into attributes the plugin does not own, and the cost of
+    misreading a moved attribute as "dead" is tearing down healthy links on a
+    timer. Every test here that returns None is asserting that we decline to
+    guess.
+    """
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        return _make_adapter(monkeypatch)
+
+    @staticmethod
+    def _link(client):
+        """A link whose ``_ws.client`` is ``client`` (None ⇒ no ws at all)."""
+        link = MagicMock()
+        link._ws = None if client is None else SimpleNamespace(client=client)
+        return link
+
+    def test_no_link_is_unknown(self, adapter):
+        adapter._link = None
+        assert adapter._link_supervisor_stopped() is None
+
+    def test_no_websocket_is_unknown(self, adapter):
+        adapter._link = self._link(None)
+        assert adapter._link_supervisor_stopped() is None
+
+    @pytest.mark.asyncio
+    async def test_a_running_supervisor_task_is_not_stopped(self, adapter):
+        task = asyncio.create_task(asyncio.sleep(999))
+        try:
+            adapter._link = self._link(SimpleNamespace(_supervisor_task=task))
+            assert adapter._link_supervisor_stopped() is False
+        finally:
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_a_finished_supervisor_task_is_stopped(self, adapter):
+        # This is the #43 shape: the supervisor loop broke on a clean close and
+        # returned, so the task completes while everything else looks healthy.
+        task = asyncio.create_task(asyncio.sleep(0))
+        await task
+        adapter._link = self._link(SimpleNamespace(_supervisor_task=task))
+        assert adapter._link_supervisor_stopped() is True
+
+    def test_state_name_is_the_fallback_when_the_task_is_gone(self, adapter):
+        # An SDK that stops exposing _supervisor_task must not silently disable
+        # the protection while _state is still readable.
+        adapter._link = self._link(SimpleNamespace(_state=SimpleNamespace(name="CLOSED")))
+        assert adapter._link_supervisor_stopped() is True
+
+        adapter._link = self._link(
+            SimpleNamespace(_state=SimpleNamespace(name="CONNECTED"))
+        )
+        assert adapter._link_supervisor_stopped() is False
+
+    def test_neither_accessor_is_unknown_not_dead(self, adapter):
+        # The whole SDK surface moved. Refuse to answer rather than tear down a
+        # link that may well be healthy.
+        adapter._link = self._link(SimpleNamespace())
+        assert adapter._link_supervisor_stopped() is None
+
+    def test_a_non_task_supervisor_attr_falls_through_to_state(self, adapter):
+        # Guards the isinstance check: a MagicMock's .done() is truthy, so
+        # duck-typing here would report every link as stopped.
+        adapter._link = self._link(
+            SimpleNamespace(_supervisor_task=MagicMock(), _state=SimpleNamespace(name="CONNECTED"))
+        )
+        assert adapter._link_supervisor_stopped() is False
+
+
+class TestLinkDeathEscalation:
+    """A link that stops reconnecting must become a retryable fatal error.
+
+    Before this existed, a clean websocket close (1000/1001) disabled reconnect
+    four layers down and *nothing* noticed: the consumer stayed parked on the
+    link's event queue rather than raising, ``BandLink.is_connected`` kept
+    returning True, and outbound REST sends kept succeeding. The adapter was
+    deaf and every available signal said it was fine — four production
+    occurrences, the worst 34 hours.
+
+    Escalation is deliberately delegated to the runner's fatal-error path
+    (the same one consumer death uses) rather than reconnecting here, so these
+    tests assert the handoff, not a reconnect.
+    """
+
+    @pytest.fixture
+    def adapter(self, monkeypatch):
+        a = _make_adapter(monkeypatch)
+        # The sampler's cadence is irrelevant to its logic; drive it fast.
+        monkeypatch.setattr(_band_mod, "_LINK_HEALTH_POLL_SECONDS", 0.001)
+        a._running = True
+        a._link = MagicMock()
+        return a
+
+    @staticmethod
+    async def _run_watch(adapter, timeout=1.0):
+        """Run the sampler to completion, which it only reaches by escalating."""
+        await asyncio.wait_for(adapter._watch_link_health(), timeout=timeout)
+
+    @staticmethod
+    async def _poll_a_while(adapter, seconds=0.05):
+        """Let the sampler take many polls, then stop it.
+
+        Deliberately not ``wait_for(..., timeout=)``: the sampler absorbs
+        cancellation by design, so a timeout there is indistinguishable from a
+        clean exit and the assertion would pass for the wrong reason. Run it as
+        its own task and inspect what it did.
+        """
+        task = asyncio.create_task(adapter._watch_link_health())
+        await asyncio.sleep(seconds)
+        exited_on_its_own = task.done()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return exited_on_its_own
+
+    @pytest.mark.asyncio
+    async def test_a_dead_link_is_reported_to_the_runner(self, adapter):
+        notified = []
+        adapter._link_supervisor_stopped = lambda: True
+        adapter._notify_fatal_error = AsyncMock(
+            side_effect=lambda: notified.append(adapter.fatal_error_code)
+        )
+
+        await self._run_watch(adapter)
+
+        # Retryable, so the runner queues a reconnect instead of giving up.
+        assert adapter.fatal_error_code == "link_died"
+        assert adapter.fatal_error_retryable is True
+        assert adapter.has_fatal_error
+        # The error must be *set* before the handler runs — the handler reads it.
+        assert notified == ["link_died"]
+
+    @pytest.mark.asyncio
+    async def test_a_dead_link_logs_at_error(self, adapter, caplog):
+        # #43's other half: the give-up decision is logged at INFO by the
+        # websocket client, so no amount of WARNING-level alerting could ever
+        # catch this. The escalation has to be the thing that raises the level.
+        adapter._link_supervisor_stopped = lambda: True
+        adapter._notify_fatal_error = AsyncMock()
+
+        with caplog.at_level(logging.ERROR, logger=_ADAPTER_LOGGER):
+            await self._run_watch(adapter)
+
+        assert [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_probe_never_escalates(self, adapter):
+        # The safety property: an SDK whose internals moved degrades to "no
+        # protection", never to "tear the link down on a timer".
+        adapter._link_supervisor_stopped = lambda: None
+        adapter._notify_fatal_error = AsyncMock()
+
+        assert await self._poll_a_while(adapter) is False
+        assert not adapter.has_fatal_error
+        adapter._notify_fatal_error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_probe_warns_once(self, adapter, caplog):
+        adapter._link_supervisor_stopped = lambda: None
+
+        with caplog.at_level(logging.WARNING, logger=_ADAPTER_LOGGER):
+            await self._poll_a_while(adapter)
+
+        blind = [r for r in caplog.records if "Cannot determine" in r.getMessage()]
+        assert len(blind) == 1, "the probe polls on a timer; it must not spam"
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_link_is_left_alone(self, adapter):
+        adapter._link_supervisor_stopped = lambda: False
+        adapter._notify_fatal_error = AsyncMock()
+
+        assert await self._poll_a_while(adapter) is False
+        assert not adapter.has_fatal_error
+        adapter._notify_fatal_error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_teardown_in_progress_is_not_a_dead_link(self, adapter):
+        # disconnect() drops the link and clears _running. Sampling that as
+        # "died" would report a fatal error for every ordinary shutdown.
+        adapter._running = False
+        adapter._link_supervisor_stopped = lambda: True
+        adapter._notify_fatal_error = AsyncMock()
+
+        await self._run_watch(adapter)
+
+        assert not adapter.has_fatal_error
+        adapter._notify_fatal_error.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_link_is_not_a_dead_link(self, adapter):
+        adapter._link = None
+        adapter._link_supervisor_stopped = lambda: True
+        adapter._notify_fatal_error = AsyncMock()
+
+        await self._run_watch(adapter)
+
+        assert not adapter.has_fatal_error
+        adapter._notify_fatal_error.assert_not_called()
+
+
+class TestLinkHealthWatchLifecycle:
+    """The sampler is wired into connect/disconnect, not merely defined.
+
+    ``test_connect_arms_the_watch_end_to_end`` is the regression that matters:
+    it goes through the real ``connect()`` and asserts a dead supervisor
+    escalates, so it fails on any build where the sampler exists but nothing
+    starts it. The narrower tests below say *why* it broke.
+    """
+
+    @staticmethod
+    def _patch_locks(monkeypatch):
+        monkeypatch.setattr(
+            "gateway.status.acquire_scoped_lock",
+            lambda scope, identity, metadata=None: (True, None),
+        )
+        monkeypatch.setattr(
+            "gateway.status.release_scoped_lock",
+            lambda scope, identity: None,
+        )
+
+    @classmethod
+    def _fake_link(cls, client=None):
+        """A connectable link whose ``_ws.client`` is the given fake client."""
+        link = MagicMock()
+        link.connect = AsyncMock()
+        link.disconnect = AsyncMock()
+        link.subscribe_agent_rooms = AsyncMock()
+        link.subscribe_room = AsyncMock()
+        link._ws = SimpleNamespace(client=client)
+        link.rest.agent_api_identity.get_agent_me = AsyncMock(
+            return_value=SimpleNamespace(
+                data=SimpleNamespace(
+                    id="resolved-agent-id",
+                    handle="bot-handle",
+                    owner_uuid="owner-uuid-abc",
+                )
+            )
+        )
+        link.rest.agent_api_chats.list_agent_chats = AsyncMock(
+            return_value=SimpleNamespace(
+                data=[], metadata=SimpleNamespace(total_pages=1)
+            )
+        )
+        link.__aiter__ = lambda self: self
+        link.__anext__ = AsyncMock(side_effect=StopAsyncIteration)
+        return link
+
+    @pytest.mark.asyncio
+    async def test_connect_arms_the_watch_end_to_end(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        self._patch_locks(monkeypatch)
+        # raising=False so this test's only failure mode is the behavioural one
+        # below. Requiring the constant would make a build that never samples
+        # fail with AttributeError on a test *knob*, which says nothing about
+        # whether a dead link gets noticed.
+        monkeypatch.setattr(
+            _band_mod, "_LINK_HEALTH_POLL_SECONDS", 0.001, raising=False
+        )
+
+        # A supervisor task that has already finished — the #43 condition,
+        # present from the moment we connect.
+        finished = asyncio.create_task(asyncio.sleep(0))
+        await finished
+        link = self._fake_link(SimpleNamespace(_supervisor_task=finished))
+        monkeypatch.setattr(_band_mod, "BandLink", lambda *a, **kw: link)
+
+        escalated = asyncio.Event()
+        monkeypatch.setattr(
+            adapter, "_notify_fatal_error", AsyncMock(side_effect=escalated.set)
+        )
+
+        assert await adapter.connect() is True
+        try:
+            await asyncio.wait_for(escalated.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pytest.fail(
+                "connect() left the link unsupervised: a websocket that had "
+                "already stopped reconnecting was never escalated"
+            )
+        assert adapter.fatal_error_code == "link_died"
+
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_starts_the_watch_task(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        self._patch_locks(monkeypatch)
+        link = self._fake_link(SimpleNamespace(_supervisor_task=None))
+        monkeypatch.setattr(_band_mod, "BandLink", lambda *a, **kw: link)
+
+        assert await adapter.connect() is True
+        assert adapter._link_health_task is not None
+        assert not adapter._link_health_task.done()
+
+        await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_the_watch_task(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        task = asyncio.create_task(asyncio.sleep(999))
+        adapter._link_health_task = task
+        adapter._link = MagicMock()
+        adapter._link.disconnect = AsyncMock()
+
+        await adapter.disconnect()
+
+        assert task.cancelled() or task.done()
+        assert adapter._link_health_task is None
+
+    @pytest.mark.asyncio
+    async def test_starting_the_watch_twice_keeps_one_task(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        monkeypatch.setattr(adapter, "_link_supervisor_stopped", lambda: False)
+        adapter._start_link_health_watch()
+        first = adapter._link_health_task
+        adapter._start_link_health_watch()
+        try:
+            assert adapter._link_health_task is first
+        finally:
+            first.cancel()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_from_inside_the_watch_does_not_deadlock(
+        self, monkeypatch
+    ):
+        # The escalation path is watchdog -> runner's fatal handler ->
+        # adapter.disconnect(), so disconnect() can be reached *from* the task
+        # it cancels. Awaiting the current task there would hang forever (or
+        # raise), turning the recovery into a wedge.
+        adapter = _make_adapter(monkeypatch)
+        monkeypatch.setattr(_band_mod, "_LINK_HEALTH_POLL_SECONDS", 0.001)
+        self._patch_locks(monkeypatch)
+        adapter._running = True
+        link = MagicMock()
+        link.disconnect = AsyncMock()
+        adapter._link = link
+        monkeypatch.setattr(adapter, "_link_supervisor_stopped", lambda: True)
+        monkeypatch.setattr(
+            adapter, "_notify_fatal_error", AsyncMock(side_effect=adapter.disconnect)
+        )
+
+        adapter._start_link_health_watch()
+        watch = adapter._link_health_task
+        done, _ = await asyncio.wait([watch], timeout=2.0)
+
+        assert watch in done, (
+            "disconnect() called from inside the watchdog never returned — the "
+            "recovery path wedged on awaiting its own task"
+        )
+        # Held separately: disconnect() clears adapter._link on its way out.
+        link.disconnect.assert_awaited_once()

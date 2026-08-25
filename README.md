@@ -38,10 +38,9 @@ this repo (the plugin) →  install steps, the band adapter + toolset, the add-b
 Band (the platform)    →  credentials, agent registration, access control
 ```
 
-- **Band manages access.** A message reaches the agent only if Band delivered it (someone
-  messaged the agent or added it to a room), so the adapter trusts Band's own ACL as the gate
-  (`enforces_own_access_policy`). A fresh install with just an agent id + API key is reachable
-  out of the box; narrow it later with [`BAND_ALLOWED_USERS`](#optional).
+- **Band manages access.** A message reaches the agent only if Band delivered it, so the adapter
+  trusts Band as the sole message-intake authorization boundary (`enforces_own_access_policy`).
+  A fresh install with just an agent id + API key is reachable without a Hermes sender allowlist.
 - **First connect is the installation.** On the first successful connect the adapter resolves
   the owner, creates the **Hermes Agent Hub** room, wires it as the Band main channel, persists
   `BAND_HUB_ROOM`, and greets the owner in-band. See [The Hub](#the-hub-main-channel--command-surface).
@@ -57,7 +56,7 @@ gateway runs** and paste the key when prompted:
 curl -fsSL https://app.band.ai/add/hermes.sh | bash
 ```
 
-**One run → one @mention → a connected agent.** The snippet registers a Band agent from your
+**One run → one connected agent.** The snippet registers a Band agent from your
 key (**the key never reaches the LLM** — a script reads it, then drops it), installs the `band`
 plugin into the gateway's Python, and hands off to the `add-band` setup skill, which enables the
 plugin, restarts the gateway, bootstraps the hub, and sends you the agent's first message. Then
@@ -279,9 +278,10 @@ grep -E '\[band\] Connected as agent|\[band\] Hub ready: room|✓ band connected
 grep BAND_HUB_ROOM ~/.hermes/.env   # a non-empty UUID = hub created
 ```
 
-Then open the auto-created **"Hermes Agent Hub"** room in Band and **@mention the agent** — Band
-has no DMs, so an un-mentioned message is ignored by design. A reply means you're live. If you see
-`[band] Owner unresolved — hub disabled`, set `BAND_OWNER_ID=<your-uuid>` and restart.
+Then open the auto-created **"Hermes Agent Hub"** room in Band and send a message — Band has no
+DMs, so any message delivered to a room the agent is in reaches it, no @mention needed. A reply
+means you're live. If you see `[band] Owner unresolved — hub disabled`, set
+`BAND_OWNER_ID=<your-uuid>` and restart.
 
 ## Configuration
 
@@ -297,11 +297,9 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
 | Variable | Description |
 | --- | --- |
 | `BAND_BASE_URL` | Band host base URL (default `https://app.band.ai`). WS + REST URLs are derived from this host. |
-| `BAND_ALLOWED_USERS` | Comma-separated Band user IDs allowed to talk to the agent. **Optional** — Band's own ACL is trusted by default; set this only to narrow access below what Band already permits. |
-| `BAND_ALLOW_ALL` | Explicitly allow anyone in a room to talk to the agent. Redundant with the default Band-ACL trust; mainly useful to override a `BAND_ALLOWED_USERS` restriction. |
 | `BAND_TOOL_OWNERS` | Comma-separated `platform:user_id` identities allowed to drive Band actions (e.g. `telegram:<tg-id>`). The resolved Band owner is always authorized from Band rooms; this allowlist grants others. |
 | `BAND_GROUP_SESSIONS_PER_USER` | Split a group room into a separate session per participant (`true`) or keep one shared session for the whole room (`false`). Default `false`. |
-| `BAND_OWNER_ID` | Owner UUID override. Normally resolved from the agent identity on connect; anchors the hub and the owner-only gates. |
+| `BAND_OWNER_ID` | Owner UUID override. Normally resolved from the agent identity on connect; anchors the private hub and owner-directed operational messages. |
 | `BAND_HUB_ROOM` | Hub room UUID. Auto-created and persisted on first connect; set it to pin an existing room. |
 | `BAND_HOME_ROOM` | Main-channel override for cron / notification delivery (also set by `/sethome` from a Band room). Defaults to the hub. |
 | `BAND_HUB_FAILOVER_THRESHOLD` | Consecutive failed hub sends before failing over to a fresh hub room (default `3`). A successful hub send resets the count. See [Hub failover](#hub-failover). |
@@ -327,23 +325,21 @@ the default is the private one and widening it is a deliberate act.
 
 ### Behavior
 
-- **Inbound**: subscribes to the agent's rooms and consumes `message_created` events. Band has
-  no DMs — every room, including the hub, is a mention-gated group room, so a message reaches the
-  agent only when it **@mentions** the agent. Band routes by mention (both `/next` and the live
-  stream deliver only mention text), so the adapter mirrors that contract — no hub bypass, no
-  active-session stickiness. The one exception is a validated owner slash command, which reaches
-  the agent in any room without a mention.
+- **Inbound**: subscribes to the agent's rooms (including new `room_added` rooms) and consumes
+  `message_created` events. Band has no DMs — every room, including the hub, is a group room.
+  Delivery is the addressing and authorization signal: every non-self text message Band routes
+  to the agent is answered without a second sender or mention-metadata check. Slash commands are
+  accepted only in the private Hermes Hub.
 - **Self-filter**: the adapter skips its own agent messages by sender, with a sent-message-id
   backstop in addition to the SDK's own filtering.
-- **Outbound**: posts via the REST client, chunking long messages. Each reply @mentions the
-  room's last human sender (falling back to all non-agent participants).
-- **Outbound without a gateway**: the plugin also registers a `standalone_sender_fn`, so a
-  `deliver: band` cron job delivers even when it fires in a process that holds no gateway runner —
-  a forced `hermes cron run <id>` is the everyday case. That path has no link and no caches, so it
-  resolves everything from the environment (`BAND_AGENT_ID`, `BAND_API_KEY`, `BAND_BASE_URL`, and
-  the target room from `BAND_HOME_ROOM` → `BAND_HUB_ROOM`) and mentions all non-agent participants
-  — the same branch the live path takes for a room it has not yet heard a human speak in. Chunking
-  and the mandatory per-chunk @mention are shared code with the live send, so the two cannot drift.
+- **Outbound**: the model sends through `band_send_message` and must choose explicit `mentions`
+  (handles preferred; participant UUIDs supported as a fallback). Recipients resolve only against
+  the target-room roster. Missing, unknown, out-of-room, ambiguous, or handle-less recipients fail
+  before any message POST; there is no last-sender, owner, or room-wide fallback.
+- **Unsent final text**: if the model finishes without an explicit send, its final prose is posted
+  once as a non-notifying thought. A successful explicit send suppresses the host's duplicate copy.
+- **Outbound without a gateway**: the `standalone_sender_fn` retains the same explicit-recipient
+  contract and chunking behavior; it never broadcasts to room participants.
 
 ### The Hub (main channel + command surface)
 
@@ -358,17 +354,19 @@ idempotent:
 
 Existing rooms are **never adopted** — a fresh install with no pinned id always gets its own
 dedicated room, so the hub can't collide with an unrelated owner↔agent conversation.
+Because this room authorizes slash commands, `band_add_participant` and
+`band_remove_participant` refuse to change its membership.
+
 
 The resolved hub id is written back to `BAND_HUB_ROOM` (Hermes `.env`) and the hub is wired as the
 Band **home channel** — the default target for cron jobs (`deliver=band`) and gateway
 notifications. An explicit `BAND_HOME_ROOM` (or running `/sethome` in another Band room) overrides
 that default.
 
-**Slash-command gate.** Slash commands (`/help`, `/new`, …) are accepted only from the **owner**
-— in *any* Band room, the hub included. A command-shaped message from anyone else is dropped
-before it reaches the gateway: human senders get a one-time per-room notice; other agents are
-dropped silently (a notice would invite bot↔bot ping-pong). The gate is **fail-closed**: if no
-owner can be resolved, Band slash commands are refused everywhere. File-path-like text
+**Slash-command gate.** Slash commands (`/help`, `/new`, …) are accepted only in the private
+Hermes Hub. The hub itself is the authorization boundary, so sender IDs are not rechecked there.
+Command-shaped text in every other room is consumed and acknowledged without a denial message;
+this prevents `/next` redelivery and avoids command/reply loops. File-path-like text
 (`/usr/bin/ls`) is not treated as a command and flows through as plain chat.
 
 #### Hub failover
@@ -408,7 +406,7 @@ The tools split into two tiers:
 | `band_create_room` | A | Yes | Create a room. Composite: pass `person` (+ optional `message`, `role`) to resolve, create, add, and message someone in one call. Returns `{room_id, added, sent}`. No `title` arg — the server derives it. |
 | `band_find_room` | A | No (read-only) | Find existing rooms by `query` (matches title/id) → `[{room_id, title}]`. |
 | `band_find_contact` | A | No (read-only) | Resolve a name/handle to a participant UUID over peers + contacts. |
-| `band_send_message` | B | Yes | Send `content` to a room (defaults to the current room; pass `room_id` to target another). Chunks long messages at 4000 chars. **Mentions are mandatory** — pass `mention_ids` or the room's participants are mentioned. |
+| `band_send_message` | B | Yes | Send `content` with required explicit `mentions` (handles preferred; UUID fallback). Defaults to the current room; pass `room_id` to target another. |
 | `band_add_participant` | B | Yes | Add a participant (`participant_id`, optional `role`) to the room. |
 | `band_remove_participant` | B | Yes | Remove a participant from the room. |
 | `band_get_participants` | B | No (read-only) | List the room's participants → `[{id, handle, name, type}]`. |
@@ -471,9 +469,9 @@ whatever the agent didn't mark `processed` is still owed to it, across any outag
   drains each known room's backlog via `/next` (`get_agent_next_message`), re-picking anything
   stuck `processing` from a prior crash (`get_stale_processing_messages`) first. Each drained
   message flows through the **same** gate/normalize path as a live one.
-- **Dedup.** `/next` and the live WS stream both deliver only @mention text, so they cover the same
-  set. An in-memory `_seen_inbound_ids` guards the narrow window where a message is both
-  live-delivered and in the backlog at reconnect; it is intentionally not persisted.
+- **Dedup.** `/next` and the live WS stream can overlap around reconnect; an in-memory
+  `_seen_inbound_ids` guards the narrow window where a message is both live-delivered and in
+  the backlog. It is intentionally not persisted.
 - **Known edge — coalesced bursts.** The gateway's busy-text debounce merges rapid same-sender
   messages into one turn, keeping only the latest id. Earlier ids in the burst aren't individually
   acked, so a reconnect can re-offer them via `/next`; they re-process and self-heal once the room
@@ -510,15 +508,13 @@ whatever the agent didn't mark `processed` is still owed to it, across any outag
 
 - **Memory deferred.** Memory preload/write-through lands in a later pass (the extension point is
   marked `# TODO (<pass>):` in the adapter).
-- **Out-of-process delivery is text-only.** The `standalone_sender_fn` accepts `media_files` /
-  `force_document` for signature parity but ignores them, and it cannot prefer a room's last human
-  sender (that cache lives on a connected adapter) — it mentions all non-agent participants.
+- **Standalone delivery is text-only and requires recipients.** Media arguments are ignored;
+  missing recipient metadata fails locally, and the sender never infers the owner or room roster.
 - **No per-message retry cap on failure.** A turn that errors is marked `failed`, which the server
   may re-offer on a later `/next` drain. There is no attempt-count ceiling yet, so a
   persistently-failing message can re-deliver across reconnects.
-- **Mentions are mandatory on send.** The Band API rejects messages with no mentions, so every
-  reply mentions at least one recipient. If no mentionable recipient is known for a room, the send
-  is dropped.
+- **Mentions are mandatory and explicit.** Every chat message needs at least one validated
+  delivery recipient. Missing or invalid recipients fail before the Band API call.
 - **Rooms, not threads.** Band has no thread primitive; `thread_id` is always `None` and `reply_to`
   is ignored on send.
 - **Message length.** No confirmed Band per-message limit exists in the SDK / REST types, so a

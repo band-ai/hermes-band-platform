@@ -21,7 +21,8 @@ Design anchors (see ``Drafts/hermes-band-tools-events-buildplan.md``):
     adding/removing/messaging are the agent's own outbound actions; Band itself
     is the ACL (it admits participants and enforces member/admin/owner roles
     server-side), so Hermes does not re-gate them — they are loose by default.
-    The one owner-only surface is Hermes slash commands, gated in ``adapter.py``.
+    Slash commands are a separate control surface accepted only in the private
+    Hermes Hub.
     Optional tightening: set ``BAND_TOOL_OWNERS`` (``platform:user_id`` list) to
     restrict these tools to specific callers (the resolved Band owner always
     passes).  Read-only tools (find/get) are never gated.
@@ -48,8 +49,11 @@ from tools.registry import tool_error, tool_result
 from .adapter import (
     DEFAULT_REQUEST_OPTIONS,
     _derive_urls,
-    _mention_items,
+    _mention_error,
+    _resolve_mentions,
+    align_mentions_to_content,
     _short_id,
+    note_deliberate_send,
     check_band_requirements,
 )
 
@@ -317,15 +321,39 @@ def _home_room() -> Optional[str]:
         or None
     )
 
+def _hub_room() -> Optional[str]:
+    """Resolve the private command hub, never a separate home override."""
+    try:
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        adapter = runner.adapters.get(Platform("band")) if runner else None
+        hub = getattr(adapter, "_hub_room_id", None) if adapter is not None else None
+        if hub:
+            return str(hub)
+    except Exception:
+        pass
+    return os.getenv("BAND_HUB_ROOM", "").strip() or None
+
+
+def _guard_private_hub_membership(room_id: str) -> None:
+    """Keep the owner↔agent hub private because it authorizes slash commands."""
+    if room_id and room_id == _hub_room():
+        raise _ToolError(
+            "The private Hermes Hub membership cannot be changed; it is the "
+            "slash-command authorization boundary."
+        )
+
 
 def _authorize_band_action() -> None:
     """Authorize a mutating Band action.
 
     Policy: outbound Band actions are **loose** by default. Band itself owns
     access control — it decides who is admitted to a room and enforces role
-    permissions (member/admin/owner) server-side — so Hermes does not re-gate
-    the agent's own outbound actions. The one owner-only surface is Hermes
-    slash commands, gated separately in ``adapter.py``.
+    permissions (member/admin/owner) server-side, so Hermes does not re-gate
+    the agent's own outbound actions.
+    Slash commands are a separate control surface accepted only in the private
+    Hermes Hub.
 
     Optional tightening: set ``BAND_TOOL_OWNERS`` (comma-separated
     ``platform:user_id`` identities) to restrict Band actions to specific
@@ -435,31 +463,22 @@ async def _find_participant(rest: Any, query: str) -> Optional[Dict[str, Any]]:
 
 
 async def _mentions_for(
-    rest: Any, room_id: str, mention_ids: Optional[List[str]]
+    rest: Any, room_id: str, entries: Optional[List[Any]]
 ) -> List[Any]:
-    """Build the mandatory mention list for a send (Band requires ≥1).
-
-    If ``mention_ids`` is given, build one mention per id (handle resolved from
-    the room participants when cheap). Otherwise mention every non-agent
-    participant in the room. Raises ``_ToolError`` if the result is empty.
-    """
+    """Resolve explicit recipients against the target-room roster."""
     if not _load_sdk():
         raise _ToolUnavailable("Band not available (band-sdk not installed)")
-
-    # Fetch participants once for handle resolution / fallback mentions, then
-    # delegate to the shared builder (same semantics as the adapter's send).
-    participants = await _list_participants(rest, room_id)
-    # Resolve the running agent's id so the fallback never @mentions ourselves
-    # (irrelevant when explicit mention_ids are given).
-    agent_id = None if mention_ids else await _agent_id_or_none(rest)
-    items = _mention_items(participants, agent_id=agent_id, explicit_ids=mention_ids)
-
-    if not items:
+    if not entries:
         raise _ToolError(
-            "Band requires at least one @mention; no mentionable recipient was found "
-            "(pass mention_ids or add a participant to the room first)"
+            "Band messages require explicit `mentions`; pass at least one room "
+            "participant handle (for example `@alice`). Nothing was sent."
         )
-    return items
+    participants = await _list_participants(rest, room_id)
+    agent_id = await _agent_id_or_none(rest)
+    plan = _resolve_mentions(participants, entries, agent_id=agent_id)
+    if error := _mention_error(plan, participants):
+        raise _ToolError(error)
+    return plan.items
 
 
 async def _list_participants(rest: Any, room_id: str) -> List[Dict[str, Any]]:
@@ -570,6 +589,7 @@ async def _handle_create_room(args: dict, **kwargs) -> str:
                     id=resolved["id"], handle=resolved.get("handle"), name=resolved.get("name")
                 )
             ]
+            mentions = align_mentions_to_content(message, mentions)
             chunks = BasePlatformAdapter.truncate_message(message, _MAX_MESSAGE_LENGTH)
             sent_id: Optional[str] = None
             for chunk in chunks:
@@ -676,25 +696,21 @@ async def _handle_send_message(args: dict, **kwargs) -> str:
         if not _load_sdk():
             raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
-        # Send may fall back to the owner's hub when no room is in context, so
-        # the agent can reach its owner from anywhere.
-        room_id, fell_back_to_home = _resolve_room_for_send(args)
+        # Room targeting is independent from recipient routing: current room,
+        # explicit room, or configured home may select the room, but never a
+        # delivery recipient.
+        room_id, _fell_back_to_home = _resolve_room_for_send(args)
 
         content = str(args.get("content") or "")
         if not content.strip():
             return tool_error("content is required")
 
-        mention_ids = args.get("mention_ids")
-        if mention_ids is not None and not isinstance(mention_ids, list):
-            mention_ids = [mention_ids]
-        # When reaching the owner via the hub fallback with no explicit mentions,
-        # @mention the owner specifically so "message me" always pings the owner.
-        if mention_ids is None and fell_back_to_home:
-            owner = _owner_identity()
-            if owner:
-                mention_ids = [owner]
-        mentions = await _mentions_for(rest, room_id, mention_ids)
+        entries = args.get("mentions")
+        if entries is not None and not isinstance(entries, list):
+            entries = [entries]
+        mentions = await _mentions_for(rest, room_id, entries)
 
+        mentions = align_mentions_to_content(content, mentions)
         chunks = BasePlatformAdapter.truncate_message(content, _MAX_MESSAGE_LENGTH)
         last_id: Optional[str] = None
         for chunk in chunks:
@@ -704,6 +720,8 @@ async def _handle_send_message(args: dict, **kwargs) -> str:
                 request_options=DEFAULT_REQUEST_OPTIONS,
             )
             last_id = getattr(getattr(resp, "data", None), "id", None) or last_id
+
+        note_deliberate_send(room_id)
 
         logger.info(
             "[band.tools] Sent message to room %s (chunks=%d)", _short_id(room_id), len(chunks)
@@ -722,6 +740,7 @@ async def _handle_add_participant(args: dict, **kwargs) -> str:
         rest = await _rest()
         room_id = _resolve_room(args)
 
+        _guard_private_hub_membership(room_id)
         participant_id = str(args.get("participant_id") or "").strip()
         if not participant_id:
             return tool_error("participant_id is required")
@@ -752,6 +771,7 @@ async def _handle_remove_participant(args: dict, **kwargs) -> str:
             raise _ToolUnavailable("Band not available (band-sdk not installed)")
         rest = await _rest()
         room_id = _resolve_room(args)
+        _guard_private_hub_membership(room_id)
 
         participant_id = str(args.get("participant_id") or "").strip()
         if not participant_id:
@@ -876,25 +896,27 @@ BAND_FIND_CONTACT_SCHEMA = {
 BAND_SEND_MESSAGE_SCHEMA = {
     "name": "band_send_message",
     "description": (
-        "Send a message to a Band room. Band requires at least one @mention per message: pass "
-        "`mention_ids` to choose recipients, otherwise all non-agent participants are mentioned. "
-        "Targets the current Band room by default; pass `room_id` to target another. To message "
-        "your owner ('me' / 'the owner') from anywhere — including a non-Band session — omit "
-        "`room_id`: with no current Band room the message goes to your owner's hub (home channel) "
-        "and @mentions the owner."
+        "Send a message to a Band room with explicit recipients. `mentions` is required and "
+        "accepts Band handles (preferred), participant UUIDs, or an unambiguous display name. "
+        "Every recipient is resolved against the target-room roster; unknown, out-of-room, "
+        "ambiguous, or handle-less recipients fail before any message is posted. Targets the "
+        "current Band room by default; pass `room_id` to target another."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "content": {"type": "string", "description": "Message text to send."},
-            "mention_ids": {
+            "mentions": {
                 "type": "array",
                 "items": _STRING,
-                "description": "Participant UUIDs to @mention. If omitted, all non-agent participants are mentioned.",
+                "description": (
+                    "Required recipients. Prefer Band handles such as `@alice`; participant "
+                    "UUIDs are supported as a compatibility fallback."
+                ),
             },
             "room_id": _ROOM_ID_PROP,
         },
-        "required": ["content"],
+        "required": ["content", "mentions"],
     },
 }
 

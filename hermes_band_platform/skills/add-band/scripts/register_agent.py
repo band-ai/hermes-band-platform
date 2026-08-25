@@ -77,15 +77,27 @@ def _extract_credentials(data: dict[str, Any]) -> tuple[str, str]:
     return str(agent_id).strip(), str(api_key).strip()
 
 
-def _save_credentials(agent_id: str, api_key: str) -> None:
+def _resolve_env_writer():
+    """Return Hermes's ``save_env_value``, or raise naming the resolver.
+
+    Kept separate from :func:`_save_credentials` so registration can prove the
+    interpreter *before* the POST — see the pre-flight call in
+    :func:`register_agent`.
+    """
     try:
         from hermes_cli.config import save_env_value
-    except Exception as exc:  # pragma: no cover - environment failure path
+    except Exception as exc:
         raise RuntimeError(
-            "Could not import hermes_cli.config.save_env_value from this Python. "
-            "Run this helper with the Hermes gateway Python."
+            "Could not import hermes_cli.config.save_env_value from this Python "
+            f"({sys.executable}). Run this helper with the Hermes gateway Python: "
+            "scripts/gateway_python.py --print resolves it."
         ) from exc
 
+    return save_env_value
+
+
+def _save_credentials(agent_id: str, api_key: str) -> None:
+    save_env_value = _resolve_env_writer()
     save_env_value("BAND_AGENT_ID", agent_id)
     save_env_value("BAND_API_KEY", api_key)
 
@@ -112,6 +124,13 @@ def register_agent(force: bool = False) -> dict[str, Any]:
     ).strip()
     if not user_key:
         raise RuntimeError("a Band API key is required (set BAND_API_KEY or BAND_USER_API_KEY)")
+
+    # Registration is irreversible: Band returns the agent key exactly once, in
+    # the creation response. So prove this interpreter can persist it before the
+    # POST — the shebang is ``python3``, which on a typical host resolves to a
+    # system interpreter with no ``hermes_cli``. Checked afterwards, that mints an
+    # agent whose key is then discarded, and the retry collides on the name.
+    _resolve_env_writer()
 
     base_url = os.environ.get("BAND_BASE_URL", "https://app.band.ai").rstrip("/")
     name = os.environ.get("BAND_AGENT_NAME", "Hermes Agent")

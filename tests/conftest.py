@@ -82,10 +82,12 @@ def _install_band_mock() -> MagicMock:
             self.mentions = mentions
 
     class _FakeChatMessageRequestMentionsItem:
-        def __init__(self, id, handle=None, name=None):
+        def __init__(self, id, handle=None, name=None, **extra):
             self.id = id
             self.handle = handle
             self.name = name
+            for key, value in extra.items():
+                setattr(self, key, value)
 
     class _FakeParticipantRequest:
         def __init__(self, participant_id, role=None):

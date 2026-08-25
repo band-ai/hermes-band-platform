@@ -256,8 +256,8 @@ def test_verify_install_access_policy_check_reads_config(monkeypatch):
     store["config"] = {}  # no policy anywhere, BAND_ALLOW_ALL unset
     assert module._access_policy_allowlist() is False
 
-    store["env"] = {"BAND_ALLOW_ALL": "true"}  # the env override authorizes too
-    assert module._access_policy_allowlist() is True
+    store["env"] = {"BAND_ALLOW_ALL": "true"}
+    assert module._access_policy_allowlist() is False
 
 
 def test_verify_install_detects_bundled_conversations_skill():
@@ -316,6 +316,9 @@ def test_register_agent_reads_user_key_from_band_api_key(monkeypatch):
     monkeypatch.setattr(
         module, "_save_credentials", lambda agent_id, api_key: captured.update(saved=(agent_id, api_key))
     )
+    # Stub the pre-flight so this test asserts registration, not whether the
+    # host happens to be installed in the environment running the suite.
+    monkeypatch.setattr(module, "_resolve_env_writer", lambda: None)
 
     class _Resp:
         status = 200
@@ -358,6 +361,78 @@ def test_register_agent_short_circuits_when_already_registered(monkeypatch):
         "agent_id": "existing-agent",
         "saved": [],
     }
+
+def test_register_agent_checks_the_env_writer_before_posting(monkeypatch):
+    """A wrong interpreter must fail before Band mints anything.
+
+    Band returns the agent key only in the creation response. Checked after the
+    POST, an unusable interpreter leaves a registered agent whose key was
+    discarded — unrecoverable, and the retry collides on the taken name.
+    """
+    module = _load_script("register_agent.py")
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
+    monkeypatch.setenv("BAND_USER_API_KEY", "user-key")
+
+    # Break the writer at the import, the one seam every version shares, so this
+    # asserts ordering rather than the presence of a particular helper.
+    monkeypatch.setitem(sys.modules, "hermes_cli", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", SimpleNamespace())
+
+    posted: list[object] = []
+
+    class _Resp:
+        status = 200
+
+        def read(self):
+            return b'{"agent": {"id": "a1"}, "credentials": {"api_key": "agent-key"}}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _record(request, *a, **k):
+        posted.append(request)
+        return _Resp()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", _record)
+
+    with pytest.raises(RuntimeError, match="save_env_value"):
+        module.register_agent()
+
+    assert posted == [], "an agent was registered before the writer was checked"
+
+
+def test_register_agent_preflight_runs_after_the_user_key_check(monkeypatch):
+    """Ordering: a missing key still reports the key, not the interpreter."""
+    module = _load_script("register_agent.py")
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
+    monkeypatch.delenv("BAND_USER_API_KEY", raising=False)
+    monkeypatch.delenv("BAND_API_KEY", raising=False)
+
+    def _no_writer():
+        raise AssertionError("the env-writer probe ran before the user-key check")
+
+    monkeypatch.setattr(module, "_resolve_env_writer", _no_writer)
+
+    with pytest.raises(RuntimeError, match="Band API key is required"):
+        module.register_agent()
+
+
+def test_register_agent_env_writer_error_names_the_resolver(monkeypatch):
+    """The message has to say how to get the right interpreter.
+
+    ``hermes_cli`` is stubbed rather than assumed absent, so the assertion holds
+    in a developer environment that happens to have hermes-agent installed.
+    """
+    module = _load_script("register_agent.py")
+    monkeypatch.setitem(sys.modules, "hermes_cli", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", SimpleNamespace())
+
+    with pytest.raises(RuntimeError, match="gateway_python.py"):
+        module._resolve_env_writer()
+
 
 def test_register_agent_headers_use_browser_like_fingerprint(monkeypatch):
     module = _load_script("register_agent.py")
@@ -1262,16 +1337,14 @@ def test_verify_roundtrip_url_derivation_matches_the_adapter():
 
 
 @pytest.mark.asyncio
-async def test_verify_roundtrip_mentions_match_the_adapter(monkeypatch):
-    """The inlined mention builder must stay equivalent to `_mention_items`."""
+async def test_verify_roundtrip_targets_only_the_configured_owner(monkeypatch):
     module = _load_script("verify_roundtrip.py")
-    from hermes_band_platform.adapter import _mention_items
+    from hermes_band_platform.adapter import _resolve_mentions
 
     peers = [
         SimpleNamespace(id="u1", handle="owner", name="Owner", type="User"),
+        SimpleNamespace(id="u2", handle="bystander", name="Bystander", type="User"),
         SimpleNamespace(id="bot", handle="agent", name="Agent", type="Agent"),
-        SimpleNamespace(id="self", handle="me", name="Me", type="User"),
-        SimpleNamespace(id=None, handle="ghost", name="Ghost", type="User"),
     ]
 
     class _Rest:
@@ -1280,19 +1353,22 @@ async def test_verify_roundtrip_mentions_match_the_adapter(monkeypatch):
             async def list_agent_chat_participants(chat_id, request_options=None):
                 return SimpleNamespace(data=peers)
 
-    monkeypatch.setattr(module, "_env_value", lambda name: "self" if name == "BAND_AGENT_ID" else "")
-
-    inlined = await module._mentions_for(_Rest(), "room-1")
-    expected = _mention_items(
-        [
-            {"id": p.id, "handle": p.handle, "name": p.name, "type": p.type}
-            for p in peers
-        ],
-        agent_id="self",
-        explicit_ids=None,
+    monkeypatch.setattr(
+        module,
+        "_env_value",
+        lambda name: "u1" if name == "BAND_OWNER_ID" else "",
     )
 
-    assert [(m.id, m.handle, m.name) for m in inlined] == [
-        (m.id, m.handle, m.name) for m in expected
+    inlined = await module._mentions_for(_Rest(), "room-1")
+    expected = _resolve_mentions(
+        [
+            {"id": peer.id, "handle": peer.handle, "name": peer.name, "type": peer.type}
+            for peer in peers
+        ],
+        ["u1"],
+    )
+
+    assert [(mention.id, mention.handle) for mention in inlined] == [
+        (mention.id, mention.handle) for mention in expected.items
     ]
-    assert [m.id for m in inlined] == ["u1"]  # not the agent, not self, not id-less
+    assert [mention.id for mention in inlined] == ["u1"]

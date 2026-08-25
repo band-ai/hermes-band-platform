@@ -13,7 +13,7 @@ metadata:
 
 Connect a Hermes agent to Band from install through verification. This skill sets up the Hermes side and can optionally mint a Band external agent when the user provides a temporary user API key, but it does not keep user-level credentials after registration.
 
-Band rooms are mention-gated and Band owns access control. The plugin creates a private Hermes Hub room on first gateway connect and stores only agent-scoped credentials in Hermes.
+Band owns access control and delivery. The plugin creates a private Hermes Hub room on first gateway connect and stores only agent-scoped credentials in Hermes.
 
 ## When to Use
 
@@ -185,7 +185,6 @@ re-installs or re-registers what's already in place.
    "$HERMES_PY" scripts/ensure_access_policy.py   # writes platforms.band.extra.{group,dm}_policy=allowlist; idempotent
    ```
    - Restart the gateway after a change for it to take effect.
-   - Quick alternative for an immediate unblock without editing config: `hermes config set BAND_ALLOW_ALL true` (broader — trusts every sender Band delivers; the `allowlist` policy is the precise equivalent of Band's ACL).
 
 7. Restart the gateway.
    - Use the user's normal Hermes gateway restart command.
@@ -208,7 +207,7 @@ re-installs or re-registers what's already in place.
    ```
    - A successful send exercises auth + room + the exact REST path real replies use. If this fails after `verify_gateway.py` passed, the problem is mentions/room state, not the socket.
    - `--await-reply` additionally posts the check, then waits for the owner to @mention back — proving inbound delivery too. Use it when you want the user to confirm live.
-   - This is also the proof that **"send a message to me" works**: the agent reaches its owner by calling `band_send_message` with no `room_id` (it falls back to the owner's hub/home and @mentions the owner), which is the same path the round-trip exercises.
+   - This also proves owner routing: selecting the hub/home room does not infer a recipient; the roundtrip explicitly mentions the configured owner's hub handle.
 
 10. **Close the loop — offer the first real room.** The hub is a private owner↔agent control room; the user's actual goal is usually a room with other people. Don't stop at the hub:
    - Offer: *"You're live in the Hub. Want me to create your first room? Tell me who to add."*
@@ -250,4 +249,4 @@ re-installs or re-registers what's already in place.
 - `scripts/ensure_home_channel.py` persists the hub as the home (main) channel (`BAND_HOME_ROOM`). Idempotent and safe to run anytime after the hub exists — use it to repair an agent that complains it has "no home".
 - `scripts/verify_gateway.py` reports `BAND_HUB_ROOM`, recent Band gateway success signals, and known failure signals.
 - `scripts/verify_roundtrip.py` proves the agent can actually post to the hub (and, with `--await-reply`, that the owner's @mention reaches it) — the step that turns "connected" into "working".
-- The user confirms the Hermes Agent Hub room exists in Band and an @mention test message round-trips.
+- The user confirms the Hermes Agent Hub room exists in Band and a test message round-trips.

@@ -28,7 +28,7 @@ Do not use this skill for ordinary Band chat troubleshooting after setup; inspec
 - Hermes is installed and its gateway runs in a Python **3.11 or newer** environment (the Band SDK's floor).
 - You can run shell commands as the user who owns the Hermes install.
 - The user can provide either:
-  - Band agent credentials from `app.band.ai/agents/new`: `BAND_AGENT_ID` and `BAND_API_KEY`, or
+  - Band agent credentials from the Agents page's **Connect remote agent** button (`app.band.ai/agents/create`): `BAND_AGENT_ID` and `BAND_API_KEY`, or
   - a short-lived user API key in `BAND_USER_API_KEY` for automated Enterprise registration.
 
 This skill installs the plugin and the Band SDK as part of the procedure — they need not be present beforehand.
@@ -175,7 +175,7 @@ re-installs or re-registers what's already in place.
 
 5. Ensure agent credentials are present (`BAND_AGENT_ID` + `BAND_API_KEY` in Hermes's `.env`). `scripts/verify_install.py` reports whether they are.
    - Already saved (e.g. the bootstrapper registered the agent before handing off): continue.
-   - Pre-created agent: have the user create one at `app.band.ai/agents/new` and save `BAND_AGENT_ID` + `BAND_API_KEY` with Hermes's env writer.
+   - Pre-created agent: have the user click **Connect remote agent** on the Band Agents page (`app.band.ai/agents/create`), create the agent, and save `BAND_AGENT_ID` + `BAND_API_KEY` with Hermes's env writer.
    - Auto-register from a user key — a **script step, not an LLM step**. Until the SDK CLI is published, use the bundled `scripts/register_agent.py` helper. With `BAND_USER_API_KEY` set in a plain shell, the helper reads it from the environment, mints the agent, and saves agent-scoped creds through Hermes's env writer; it never prints or persists the *user* key:
      ```bash
      "$HERMES_PY" scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY through Hermes env writer

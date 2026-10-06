@@ -262,7 +262,8 @@ unset BAND_USER_API_KEY
 > `band.cli.register_agent` is published — keeping the same `User-Agent`/`Accept`/`Accept-Language`
 > headers.
 
-**Pre-created agent (manual)** — make one at `app.band.ai/agents/new`, then set:
+**Pre-created agent (manual)** — on the Band **Agents** page, click **Connect remote agent**
+(`app.band.ai/agents/create`) and create the agent, then set:
 
 ```bash
 BAND_AGENT_ID=<agent-uuid>

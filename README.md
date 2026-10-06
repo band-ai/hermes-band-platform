@@ -299,9 +299,9 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
 | `BAND_BASE_URL` | Band host base URL (default `https://app.band.ai`). WS + REST URLs are derived from this host. |
 | `BAND_ALLOWED_USERS` | Comma-separated Band user IDs allowed to talk to the agent. **Optional** — Band's own ACL is trusted by default; set this only to narrow access below what Band already permits. |
 | `BAND_ALLOW_ALL` | Explicitly allow anyone in a room to talk to the agent. Redundant with the default Band-ACL trust; mainly useful to override a `BAND_ALLOWED_USERS` restriction. |
-| `BAND_TOOL_OWNERS` | Comma-separated `platform:user_id` identities allowed to drive Band actions (e.g. `telegram:<tg-id>`). The resolved Band owner is always authorized from Band rooms; this allowlist grants others. |
+| `BAND_TOOL_OWNERS` | **Optional.** Comma-separated `platform:user_id` identities (e.g. `telegram:<tg-id>`) that may drive the mutating Band tools. Unset (the default), the tools are loose: any caller passes and Band enforces room roles server-side. Set, everyone else is refused, except the resolved Band owner calling from a Band room. |
 | `BAND_GROUP_SESSIONS_PER_USER` | Split a group room into a separate session per participant (`true`) or keep one shared session for the whole room (`false`). Default `false`. |
-| `BAND_OWNER_ID` | Owner UUID override. Normally resolved from the agent identity on connect; anchors the hub and the owner-only gates. |
+| `BAND_OWNER_ID` | Owner UUID override. Normally resolved from the agent identity on connect; anchors the hub, the owner-only slash-command gate, and the owner bypass when `BAND_TOOL_OWNERS` is set. |
 | `BAND_HUB_ROOM` | Hub room UUID. Auto-created and persisted on first connect; set it to pin an existing room. |
 | `BAND_HOME_ROOM` | Main-channel override for cron / notification delivery (also set by `/sethome` from a Band room). Defaults to the hub. |
 | `BAND_HUB_FAILOVER_THRESHOLD` | Consecutive failed hub sends before failing over to a fresh hub room (default `3`). A successful hub send resets the count. See [Hub failover](#hub-failover). |
@@ -403,7 +403,7 @@ The tools split into two tiers:
   and accept an optional explicit `room_id` that always wins. From a non-Band session
   (Telegram/CLI) `room_id` is required — supply it from `band_create_room` or `band_find_room`.
 
-| Tool | Tier | Owner-gated | Description |
+| Tool | Tier | Restricted by `BAND_TOOL_OWNERS` | Description |
 | --- | --- | --- | --- |
 | `band_create_room` | A | Yes | Create a room. Composite: pass `person` (+ optional `message`, `role`) to resolve, create, add, and message someone in one call. Returns `{room_id, added, sent}`. No `title` arg — the server derives it. |
 | `band_find_room` | A | No (read-only) | Find existing rooms by `query` (matches title/id) → `[{room_id, title}]`. |
@@ -414,20 +414,25 @@ The tools split into two tiers:
 | `band_get_participants` | B | No (read-only) | List the room's participants → `[{id, handle, name, type}]`. |
 
 <details>
-<summary><b>Owner gating</b> — who can drive the mutating tools</summary>
+<summary><b>Tool access</b>: who can drive the mutating tools</summary>
 
-Creating rooms and adding/removing people is mutating and outward-facing, and the toolset can be
-exposed on platforms like Telegram. Hermes has **no built-in cross-platform owner concept**, so the
-Band tools enforce their own gate:
+The mutating tools (`band_create_room`, `band_send_message`, `band_add_participant`,
+`band_remove_participant`) are **loose by default**. Band owns access control: it decides who
+is admitted to a room and enforces member/admin/owner roles server-side, so the plugin does not
+re-gate the agent's own outbound actions. Anyone who can reach the agent on a platform that lists
+the `band` toolset can ask it to act on Band, and Band refuses what the agent's role doesn't allow.
 
-- **Owner bypass (checked first):** the agent's resolved Band owner calling from *any* Band room is
-  always authorized. Fail-closed when the owner is unresolved.
-- The mutating tools otherwise check the caller's `platform:user_id` against the `BAND_TOOL_OWNERS`
-  allowlist.
-- **Fail-closed:** if `BAND_TOOL_OWNERS` is unset, or the caller is not on it (and the owner bypass
-  doesn't apply), the mutating tools refuse with a clear error. With `BAND_TOOL_OWNERS` unset the
-  gate falls back to the calling platform's own `<PLATFORM>_ALLOWED_USERS` allowlist.
-- Read-only tools (`band_find_room`, `band_find_contact`, `band_get_participants`) bypass the gate.
+To restrict them, set `BAND_TOOL_OWNERS`:
+
+- The caller's `platform:user_id` must be on the list, or the mutating tools refuse with a clear
+  error.
+- **Owner bypass:** the resolved Band owner calling from a Band room is always allowed. If the
+  owner is unresolved, the bypass doesn't apply and only the list grants access.
+- Read-only tools (`band_find_room`, `band_find_contact`, `band_get_participants`) are never
+  gated.
+
+The one owner-only surface that is always on is Hermes slash commands (see
+[The Hub](#the-hub-main-channel--command-surface)).
 </details>
 
 <details>
@@ -449,8 +454,8 @@ platform_toolsets:
 > channel but **none** of the action tools. You must add `band` to the `band` platform's toolsets
 > as well, not just to Telegram/CLI.
 
-The owner gate (above) is the real access boundary, not which platforms list the toolset — so
-exposing `band` on Telegram does not widen who can mutate Band.
+Listing `band` for a platform lets every caller that platform admits drive the Band tools. Set
+`BAND_TOOL_OWNERS` (above) if that is wider than you want, for example on a shared Telegram bot.
 </details>
 
 <details>

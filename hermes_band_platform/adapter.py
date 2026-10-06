@@ -3138,10 +3138,11 @@ def interactive_setup() -> None:
     print_header("Band")
 
     # Step-by-step credential instructions. Agent creation lives on the Agents
-    # page (/agents/new) — NOT Settings, which only holds REST API keys + profile.
-    # The agent's API key is shown once in the creation modal.
+    # page's "Connect remote agent" button (/agents/create) — NOT Settings, which
+    # only holds REST API keys + profile. The agent's API key is shown once in
+    # the creation modal.
     print_info("To connect Hermes to Band you need a Band agent's ID and API key:")
-    print_info("  1. Open the Band app and go to the Agents page (/agents/new).")
+    print_info("  1. Open the Band app's Agents page and click 'Connect remote agent' (/agents/create).")
     print_info("  2. Create a new external agent (or open an existing one).")
     print_info("  3. Copy the Agent ID (a UUID) and the agent's API key (shown once).")
     print_info("")

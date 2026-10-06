@@ -57,7 +57,8 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
      for the one registration step, then remove it.
 
 3. Stop and ask me at the two human gates:
-   • Credentials — I either create the Band agent at app.band.ai/agents/new and give you
+   • Credentials — I either create the Band agent at app.band.ai/agents/create (Agents page →
+     Connect remote agent) and give you
      BAND_AGENT_ID + BAND_API_KEY, or I set BAND_USER_API_KEY for the bundled
      `scripts/register_agent.py` helper.
    • The live test — I @mention the agent in the "Hermes Agent Hub" room and confirm a reply.

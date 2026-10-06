@@ -409,6 +409,7 @@ class TestTerminalLifecycle:
 
 class TestRoomResolution:
 
+    @pytest.mark.usefixtures("hermetic_hermes_home")
     def test_resolves_against_the_real_session_store(self, monkeypatch, tmp_path):
         """The reverse lookup must agree with the store's own key derivation —
         the hooks carry session_id, only the session KEY holds the room."""

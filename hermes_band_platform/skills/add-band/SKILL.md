@@ -126,8 +126,11 @@ re-installs or re-registers what's already in place.
        `HERMES_PY=<that path>` unless the user says otherwise.
    - `method` in the JSON says what the answer rests on, strongest first: `env` (you set
      it) → `pid-file` (Hermes's own record of the running gateway, read from
-     `$HERMES_HOME/gateway.pid`) → `launcher-sibling` / `version-banner` /
-     `launcher-shebang` (inferred from `hermes` on this `PATH`) → `running-process` (a
+     `$HERMES_HOME/gateway.pid`) → `launcher-sibling` / `launcher-wrapper` (the
+     interpreter a shell wrapper such as the root install's `/usr/local/bin/hermes`
+     `exec`s) / `launcher-runtime` (the managed venv the current installer's launcher
+     activates, reported by `hermes --run-module site`) / `version-banner` /
+     `launcher-shebang` (all inferred from `hermes` on this `PATH`) → `running-process` (a
      `pgrep` scan) → `self`. Anything below `pid-file` describes an environment that
      *may* be the gateway's; set `HERMES_HOME` first if the user runs a named profile,
      so the resolver reads that profile's gateway record.

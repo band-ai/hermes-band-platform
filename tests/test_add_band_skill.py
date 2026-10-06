@@ -94,6 +94,7 @@ def test_verify_install_reports_missing_requirements(monkeypatch):
     monkeypatch.setattr(module, "_has_directory_manifest", lambda: False)
     monkeypatch.setattr(module, "_plugin_enabled", lambda: False)
     monkeypatch.setattr(module, "_env_value", lambda name: "")
+    monkeypatch.setattr(module, "_band_extra", dict)
     monkeypatch.setattr(module, "_access_policy_allowlist", lambda: False)
 
     result = module.verify_install()
@@ -129,6 +130,7 @@ def test_verify_install_does_not_block_on_a_directory_plugin_layout(monkeypatch)
     monkeypatch.setattr(module, "_installed_plugin_root", lambda: Path("/h/plugins/band"))
     monkeypatch.setattr(module, "_plugin_enabled", lambda: True)
     monkeypatch.setattr(module, "_env_value", lambda name: "set")
+    monkeypatch.setattr(module, "_band_extra", dict)
     monkeypatch.setattr(module, "_access_policy_allowlist", lambda: True)
     monkeypatch.setattr(module, "_conversations_skill_present", lambda: True)
     monkeypatch.setattr(
@@ -143,6 +145,48 @@ def test_verify_install_does_not_block_on_a_directory_plugin_layout(monkeypatch)
     assert "entry_point" in result["missing"]
     assert result["blocking"] == []
     assert not any("Install the plugin" in action for action in result["actions"])
+
+
+def test_verify_install_ignores_credentials_only_in_the_calling_shell(monkeypatch, tmp_path):
+    """The gateway loads its credentials from ``$HERMES_HOME/.env``, not from the
+    setup shell, where ``BAND_API_KEY`` is often the user key the web app's
+    snippet exports. Reading the shell reported a key the gateway never sees."""
+    pytest.importorskip("hermes_cli.config")
+    module = _load_script("verify_install.py")
+    # conftest's stub `band` has no __spec__; this test is about credentials.
+    monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BAND_AGENT_ID", "agent-in-the-shell-only")
+    monkeypatch.setenv("BAND_API_KEY", "band_u_user_key_in_the_shell_only")
+    env_file = tmp_path / ".env"
+    env_file.write_text("")
+
+    checks = module.verify_install()["checks"]
+
+    assert checks["band_agent_id_present"] is False
+    assert checks["band_api_key_present"] is False
+
+    env_file.write_text("BAND_AGENT_ID=agent-1\nBAND_API_KEY=band_a_agent_key\n")
+
+    checks = module.verify_install()["checks"]
+
+    assert checks["band_agent_id_present"] is True
+    assert checks["band_api_key_present"] is True
+
+
+def test_verify_install_accepts_credentials_from_the_platform_config(monkeypatch):
+    """The adapter falls back to ``platforms.band.extra`` for its credentials."""
+    module = _load_script("verify_install.py")
+    monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: None)
+    extra = {"agent_id": "agent-1", "api_key": "band_a_agent_key"}
+    _install_fake_hermes_config(
+        monkeypatch, {"config": {"platforms": {"band": {"extra": extra}}}, "env": {}}
+    )
+
+    checks = module.verify_install()["checks"]
+
+    assert checks["band_agent_id_present"] is True
+    assert checks["band_api_key_present"] is True
 
 
 def _install_fake_hermes_config(monkeypatch, store: dict):
@@ -166,6 +210,9 @@ def _install_fake_hermes_config(monkeypatch, store: dict):
     def get_env_value(name):
         return store.get("env", {}).get(name, "")
 
+    def load_env():
+        return dict(store.get("env", {}))
+
     def save_env_value(key, value):
         store.setdefault("saved", {})[key] = value
         store.setdefault("env", {})[key] = value
@@ -173,6 +220,7 @@ def _install_fake_hermes_config(monkeypatch, store: dict):
     mod.load_config = load_config
     mod.save_config = save_config
     mod.get_env_value = get_env_value
+    mod.load_env = load_env
     mod.save_env_value = save_env_value
     monkeypatch.setitem(sys.modules, "hermes_cli", pkg)
     monkeypatch.setitem(sys.modules, "hermes_cli.config", mod)

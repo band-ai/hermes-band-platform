@@ -158,13 +158,57 @@ def _plugin_enabled() -> bool:
     return isinstance(enabled, list) and "band" in enabled
 
 
-def _env_value(name: str) -> str:
+def _read_dotenv(path: Path) -> dict[str, str]:
+    """``KEY=VALUE`` pairs from a ``.env`` file; the fallback when Hermes can't parse it."""
+    values: dict[str, str] = {}
     try:
-        from hermes_cli.config import get_env_value
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.removeprefix("export ").partition("=")
+        values[key.strip()] = value.strip().strip("'\"")
+    return values
 
-        return str(get_env_value(name) or "")
+
+def _env_value(name: str) -> str:
+    """``name`` as the gateway loads it: from ``$HERMES_HOME/.env``.
+
+    Not ``get_env_value``, which answers from this process's environment first.
+    The checks here describe the gateway, and the gateway service does not
+    inherit the setup shell, where ``BAND_API_KEY`` is often the *user* key the
+    web app's snippet exports, or a stale one. Reading the shell reported
+    credentials as configured while the gateway's ``.env`` had none.
+    """
+    try:
+        from hermes_cli.config import load_env
+
+        return str(load_env().get(name) or "")
     except Exception:
-        return os.getenv(name, "")
+        return _read_dotenv(_hermes_home() / ".env").get(name, "")
+
+
+def _band_extra() -> dict[str, Any]:
+    """``platforms.band.extra`` from the Hermes config, or ``{}``."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    except Exception:
+        return {}
+    platforms = config.get("platforms", {}) if isinstance(config, dict) else {}
+    band = platforms.get("band", {}) if isinstance(platforms, dict) else {}
+    extra = band.get("extra", {}) if isinstance(band, dict) else {}
+    return extra if isinstance(extra, dict) else {}
+
+
+def _credential_present(env_name: str, extra_key: str) -> bool:
+    """Whether the gateway has a credential: in its ``.env``, or in the config
+    ``platforms.band.extra`` the adapter falls back to."""
+    return bool(_env_value(env_name).strip() or str(_band_extra().get(extra_key) or "").strip())
 
 
 def _access_policy_allowlist() -> bool:
@@ -179,16 +223,7 @@ def _access_policy_allowlist() -> bool:
     """
     if _env_value("BAND_ALLOW_ALL").strip().lower() in {"true", "1", "yes"}:
         return True
-    try:
-        from hermes_cli.config import load_config
-
-        config = load_config()
-    except Exception:
-        return False
-    platforms = config.get("platforms", {}) if isinstance(config, dict) else {}
-    band = platforms.get("band", {}) if isinstance(platforms, dict) else {}
-    extra = band.get("extra", {}) if isinstance(band, dict) else {}
-    return isinstance(extra, dict) and str(extra.get("group_policy", "")).strip().lower() == "allowlist"
+    return str(_band_extra().get("group_policy", "")).strip().lower() == "allowlist"
 
 
 def _conversations_skill_present() -> bool:
@@ -230,8 +265,8 @@ def verify_install() -> dict[str, Any]:
     installed_root = _installed_plugin_root()
     installed_directory_plugin = installed_root is not None
     enabled = _plugin_enabled()
-    agent_id_present = bool(_env_value("BAND_AGENT_ID").strip())
-    api_key_present = bool(_env_value("BAND_API_KEY").strip())
+    agent_id_present = _credential_present("BAND_AGENT_ID", "agent_id")
+    api_key_present = _credential_present("BAND_API_KEY", "api_key")
     access_policy = _access_policy_allowlist()
     conversations_skill = _conversations_skill_present()
     # ``band-libs`` must be on the gateway's sys.path whenever the directory

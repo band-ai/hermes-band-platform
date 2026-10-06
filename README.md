@@ -253,8 +253,8 @@ mints an agent and saves only the agent-scoped pair; the user key never reaches 
 ```bash
 export BAND_USER_API_KEY=...
 HERMES_PY="$(hermes_band_platform/skills/add-band/scripts/gateway_python.py --print)" || exit 1
-"$HERMES_PY" hermes_band_platform/skills/add-band/scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY
-unset BAND_USER_API_KEY
+"$HERMES_PY" hermes_band_platform/skills/add-band/scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY (+ a non-default BAND_BASE_URL)
+unset BAND_USER_API_KEY BAND_API_KEY   # the gateway reads the agent key from .env
 ```
 
 > The bundled `register_agent.py` is a temporary helper that sends browser-like registration
@@ -268,6 +268,7 @@ unset BAND_USER_API_KEY
 ```bash
 BAND_AGENT_ID=<agent-uuid>
 BAND_API_KEY=<band_a_key>
+BAND_BASE_URL=<https://your-band-host>   # only if the agent is not on app.band.ai
 ```
 
 Then restart: `hermes gateway restart`.

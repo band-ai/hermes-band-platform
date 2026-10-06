@@ -50,7 +50,7 @@ Skill helper paths are relative to this skill directory:
 - `scripts/verify_gateway.py`
 - `scripts/verify_roundtrip.py` — prove the agent can post to its owner
 
-Registration temporarily ships as `scripts/register_agent.py` because the SDK CLI is not published yet. The helper saves `BAND_AGENT_ID` + `BAND_API_KEY` through Hermes's env writer and never prints the user key. It also sends a browser-like request fingerprint to avoid Cloudflare 1010 blocks on `app.band.ai`; the future `band-register-agent` / `band.cli.register_agent` path must keep equivalent headers before the bundled helper is removed. The setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
+Registration temporarily ships as `scripts/register_agent.py` because the SDK CLI is not published yet. The helper saves `BAND_AGENT_ID` + `BAND_API_KEY` through Hermes's env writer (plus `BAND_BASE_URL` when it registered against a non-default host, so the gateway connects where the agent lives) and never prints the user key. It also sends a browser-like request fingerprint to avoid Cloudflare 1010 blocks on `app.band.ai`; the future `band-register-agent` / `band.cli.register_agent` path must keep equivalent headers before the bundled helper is removed. The setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
 
 This skill is **resumable**: run `verify_install.py` first and act *only* on what it reports as `blocking[]`, so re-running after a partial failure never double-installs or re-registers.
 
@@ -87,7 +87,7 @@ hermes plugins enable band 2>/dev/null && hermes plugins list | grep -w band >/d
 Register (temporary bundled helper — needs `BAND_USER_API_KEY`), ensure the access policy, then verify install / gateway / prove a round-trip (always with the gateway interpreter):
 
 ```bash
-"$HERMES_PY" scripts/register_agent.py        # mints the agent and saves BAND_AGENT_ID + BAND_API_KEY
+"$HERMES_PY" scripts/register_agent.py        # mints the agent and saves BAND_AGENT_ID + BAND_API_KEY (+ a non-default BAND_BASE_URL)
 "$HERMES_PY" scripts/ensure_access_policy.py   # gateway trusts Band's ACL (idempotent; safe to re-run)
 "$HERMES_PY" scripts/verify_install.py
 "$HERMES_PY" scripts/verify_gateway.py         # hub created + home (main) channel set
@@ -175,11 +175,11 @@ re-installs or re-registers what's already in place.
 
 5. Ensure agent credentials are present (`BAND_AGENT_ID` + `BAND_API_KEY` in Hermes's `.env`). `scripts/verify_install.py` reports whether they are.
    - Already saved (e.g. the bootstrapper registered the agent before handing off): continue.
-   - Pre-created agent: have the user click **Connect remote agent** on the Band Agents page (`app.band.ai/agents/create`), create the agent, and save `BAND_AGENT_ID` + `BAND_API_KEY` with Hermes's env writer.
+   - Pre-created agent: have the user click **Connect remote agent** on the Band Agents page (`app.band.ai/agents/create`), create the agent, and save `BAND_AGENT_ID` + `BAND_API_KEY` with Hermes's env writer. If the agent lives on a Band host other than `https://app.band.ai`, save that host as `BAND_BASE_URL` too, or the gateway connects to app.band.ai with a key it doesn't know.
    - Auto-register from a user key — a **script step, not an LLM step**. Until the SDK CLI is published, use the bundled `scripts/register_agent.py` helper. With `BAND_USER_API_KEY` set in a plain shell, the helper reads it from the environment, mints the agent, and saves agent-scoped creds through Hermes's env writer; it never prints or persists the *user* key:
      ```bash
-     "$HERMES_PY" scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY through Hermes env writer
-     unset BAND_USER_API_KEY
+     "$HERMES_PY" scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY (+ a non-default BAND_BASE_URL) through Hermes env writer
+     unset BAND_USER_API_KEY BAND_API_KEY   # BAND_API_KEY may hold the user key (web snippet); the gateway reads the agent key from .env
      ```
      This is **idempotent at the flow level**: step 2 only routes here when `verify_install` reports the credentials missing, so a re-run never mints a second agent. **Do not put `BAND_USER_API_KEY` into the agent's own environment or read it yourself** — let the bootstrapper or a plain shell consume it before/outside the agent, so the user key never reaches the LLM. After `band.cli.register_agent` is published in `band-sdk`, replace this helper call with `"$HERMES_PY" -m band.cli.register_agent` only after confirming the SDK CLI sends the same Cloudflare-safe registration headers. Have the user remove `BAND_USER_API_KEY` afterward.
 

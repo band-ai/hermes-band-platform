@@ -305,23 +305,68 @@ def test_register_agent_requires_user_key(monkeypatch):
         module.register_agent()
 
 
+def _register_with(monkeypatch, env: dict) -> tuple[dict, dict, dict]:
+    """Run register_agent against a fake Band and a fake Hermes env writer.
+
+    Returns (result, what was sent, what was saved).
+    """
+    module = _load_script("register_agent.py")
+    for var in ("BAND_USER_API_KEY", "BAND_API_KEY", "BAND_AGENT_ID", "BAND_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    saved = _stub_hermes(monkeypatch)
+    sent: dict = {}
+
+    def urlopen(request, *a, **k):
+        sent["url"] = request.full_url
+        sent["key"] = request.get_header("X-api-key")
+        return _RegistrationResponse()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", urlopen)
+    result = module.register_agent()
+    return result, sent, dict(saved)
+
+
 def test_register_agent_reads_user_key_from_band_api_key(monkeypatch):
     """The web app's onboarding snippet exports the user key as BAND_API_KEY."""
-    module = _load_script("register_agent.py")
-    monkeypatch.delenv("BAND_USER_API_KEY", raising=False)
-    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
-    monkeypatch.setenv("BAND_API_KEY", "user-key-from-snippet")
+    result, sent, saved = _register_with(monkeypatch, {"BAND_API_KEY": "user-key-from-snippet"})
 
-    captured = {}
-    monkeypatch.setattr(module, "_registration_headers", lambda k: captured.update(key=k) or {})
-    saved = _stub_hermes(monkeypatch)
-    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **k: _RegistrationResponse())
-
-    result = module.register_agent()
-
-    assert captured["key"] == "user-key-from-snippet"
-    assert saved == [("BAND_AGENT_ID", "a1"), ("BAND_API_KEY", "agent-key")]
+    assert sent["key"] == "user-key-from-snippet"
+    assert saved == {"BAND_AGENT_ID": "a1", "BAND_API_KEY": "agent-key"}
     assert result["success"] is True
+
+
+def test_register_agent_prefers_the_user_key_over_a_stale_agent_key(monkeypatch):
+    _, sent, _ = _register_with(
+        monkeypatch, {"BAND_USER_API_KEY": "band_u_user", "BAND_API_KEY": "band_a_stale"}
+    )
+
+    assert sent["key"] == "band_u_user"
+
+
+@pytest.mark.parametrize(
+    ("configured", "registered_at", "persisted"),
+    [
+        (None, "https://app.band.ai", None),
+        ("https://app.band.ai/", "https://app.band.ai", None),
+        ("https://dev.band.example/", "https://dev.band.example", "https://dev.band.example"),
+    ],
+)
+def test_register_agent_persists_a_non_default_base_url(
+    monkeypatch, configured, registered_at, persisted
+):
+    """The agent exists only on the host that minted it; without BAND_BASE_URL in
+    the gateway .env the adapter would connect to app.band.ai with its key."""
+    env = {"BAND_USER_API_KEY": "band_u_user"}
+    if configured is not None:
+        env["BAND_BASE_URL"] = configured
+
+    result, sent, saved = _register_with(monkeypatch, env)
+
+    assert sent["url"] == f"{registered_at}/api/v1/me/agents/register"
+    assert saved.get("BAND_BASE_URL") == persisted
+    assert ("BAND_BASE_URL" in result["saved"]) is (persisted is not None)
 
 
 def test_register_agent_short_circuits_when_already_registered(monkeypatch):

@@ -6,7 +6,7 @@
   <a href="https://github.com/band-ai/hermes-band-platform/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/band-ai/hermes-band-platform/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/band-ai/hermes-band-platform/actions/workflows/release.yml"><img alt="Release" src="https://github.com/band-ai/hermes-band-platform/actions/workflows/release.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <img alt="Python 3.11–3.13" src="https://img.shields.io/badge/python-3.11%E2%80%933.13-blue">
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue">
   <a href="https://app.band.ai"><img alt="Band" src="https://img.shields.io/badge/band-app.band.ai-1f6feb"></a>
 </p>
 
@@ -67,8 +67,8 @@ The snippet is just a thin fetch of [`band-ai/add-band`](https://github.com/band
 hand-authored [`hermes/bootstrap.sh`](https://github.com/band-ai/add-band/blob/main/hermes/bootstrap.sh).
 To run setup by hand or on a release build, see [Install](#install).
 
-**Prerequisites:** Hermes already installed, with its gateway on **Python 3.11–3.13** (band-sdk
-has no 3.14 wheels yet), shell access as the user who owns the Hermes install, and a Band account
+**Prerequisites:** Hermes already installed, with its gateway on **Python 3.11 or newer** (tested
+on 3.11–3.14), shell access as the user who owns the Hermes install, and a Band account
 (see [Credentials](#credentials)).
 
 ## Install
@@ -140,7 +140,7 @@ hermes-band-platform/install.sh
 ```
 
 The installer stages the plugin into `$HERMES_HOME/plugins/band/`, resolves
-`band-sdk>=1.3.0,<2.0.0` **with the gateway's interpreter** (Python 3.11–3.13; correct wheels for
+`band-sdk>=1.3.0,<2.0.0` **with the gateway's interpreter** (Python 3.11 or newer; correct wheels for
 its platform) into the user-writable `$HERMES_HOME/band-libs/`, verifies `import band`, and runs
 `hermes plugins enable band`. The plugin prepends `band-libs` to `sys.path` at load, so the
 gateway venv is never written to — **no sudo, works when site-packages is read-only**. Re-running

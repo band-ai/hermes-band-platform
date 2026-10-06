@@ -8,7 +8,7 @@ is on ``sys.path``) and ``hermes plugins list`` may look fine. That is the #1
 silent install failure, so this script turns the pitfall into a guard: it
 resolves the gateway interpreter through a fallback chain and refuses to proceed
 unless that interpreter can both *import* ``hermes_cli.config`` and run a
-supported Python (3.11–3.13; ``band-sdk`` has no 3.14 wheels yet).
+supported Python (3.11 or newer, the floor ``band-sdk`` declares).
 
 Two properties matter and are easy to get wrong:
 
@@ -44,8 +44,13 @@ import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+# The floor band-sdk declares (``Requires-Python: >=3.11``). There is no ceiling:
+# band-sdk is pure Python and every native wheel in its closure (pydantic-core,
+# cryptography, cffi, websockets, PyYAML) ships for each CPython the plugin is
+# tested on, 3.14 included. A Python too new for that closure fails the
+# installer's own `uv pip install` with the exact missing wheel, which is a truer
+# gate than a hand-maintained maximum here.
 MIN_VERSION = (3, 11)
-MAX_VERSION = (3, 13)  # inclusive; band-sdk has no 3.14 wheels yet
 
 OVERRIDE_VARS = ("HERMES_PY", "HERMES_PYTHON")
 
@@ -518,8 +523,7 @@ def _same_path(left: str, right: str) -> bool:
 def _version_error(vstr: str) -> str:
     return (
         f"Gateway Python is {vstr}; Band requires "
-        f"{'.'.join(map(str, MIN_VERSION))}–{'.'.join(map(str, MAX_VERSION))} "
-        "(band-sdk has no 3.14 wheels yet)"
+        f"{'.'.join(map(str, MIN_VERSION))} or newer (band-sdk's floor)"
     )
 
 
@@ -580,7 +584,7 @@ def resolve() -> dict[str, Any]:
 
         if probed is not None and probed.has_hermes_cli and probed.version is not None:
             vstr = ".".join(str(part) for part in probed.version)
-            in_range = MIN_VERSION <= probed.version[:2] <= MAX_VERSION
+            in_range = probed.version[:2] >= MIN_VERSION
             # Shape is a nudge, never a verdict. A system-wide Hermes (distro
             # package, `pip --break-system-packages`, single-python container) is a
             # legitimate install, and which candidate *wins* stays a question of

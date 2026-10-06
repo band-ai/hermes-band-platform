@@ -43,8 +43,9 @@ done
 [ -n "$plugin_src" ] || die "could not find the plugin source (plugin.yaml + adapter.py) near $src_root"
 
 # --- Resolve the gateway interpreter -----------------------------------------
-# band-sdk wheels must match the *gateway's* Python (3.11–3.13), so resolution
-# always uses that interpreter — but nothing is ever installed into its venv.
+# band-sdk wheels must match the *gateway's* Python (3.11 or newer), so
+# resolution always uses that interpreter — but nothing is ever installed into
+# its venv.
 resolver="$plugin_src/skills/add-band/scripts/gateway_python.py"
 if [ -z "${HERMES_PY:-}" ]; then
   for py in python3 python; do
@@ -57,12 +58,12 @@ if [ -z "${HERMES_PY:-}" ]; then
   [ -n "${HERMES_PY:-}" ] || die "could not resolve the gateway Python; set HERMES_PY and re-run (diagnose with: python3 $resolver)"
 else
   # Explicit override: still refuse an interpreter that isn't the gateway's or
-  # can't run band-sdk (3.11–3.13; no 3.14 wheels yet).
+  # is older than band-sdk's 3.11 floor.
   "$HERMES_PY" -c 'import sys, importlib.util
-ok_ver = (3, 11) <= sys.version_info[:2] <= (3, 13)
+ok_ver = sys.version_info[:2] >= (3, 11)
 ok_cli = importlib.util.find_spec("hermes_cli") is not None
 sys.exit(0 if (ok_ver and ok_cli) else 1)' \
-    || die "HERMES_PY=$HERMES_PY is not a gateway interpreter (needs hermes_cli importable and Python 3.11–3.13)"
+    || die "HERMES_PY=$HERMES_PY is not a gateway interpreter (needs hermes_cli importable and Python 3.11 or newer)"
 fi
 echo "gateway python: $HERMES_PY"
 

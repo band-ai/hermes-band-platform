@@ -41,7 +41,7 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
    • Install with the repo's installer: `/tmp/hbp/install.sh`. It ships the plugin as a
      DIRECTORY plugin under $HERMES_HOME (default ~/.hermes) and resolves
      `band-sdk>=1.3.0,<2.0.0` into $HERMES_HOME/band-libs with the gateway's interpreter
-     (Python 3.11–3.13) — ZERO writes to the gateway's site-packages, so it works on hosted
+     (Python 3.11 or newer) — ZERO writes to the gateway's site-packages, so it works on hosted
      runtimes where the gateway venv (e.g. /opt/hermes/.venv) is root-owned and read-only.
    • Never `sudo`, never write to the gateway venv, never edit the gateway's launch env
      (PYTHONPATH etc.) — the hosting platform resets such changes on redeploy. Everything

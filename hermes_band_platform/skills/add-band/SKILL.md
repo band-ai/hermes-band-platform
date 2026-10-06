@@ -25,7 +25,7 @@ Do not use this skill for ordinary Band chat troubleshooting after setup; inspec
 
 ## Prerequisites
 
-- Hermes is installed and its gateway runs in a Python **3.11–3.13** environment (the Band SDK has no 3.14 wheels yet).
+- Hermes is installed and its gateway runs in a Python **3.11 or newer** environment (the Band SDK's floor).
 - You can run shell commands as the user who owns the Hermes install.
 - The user can provide either:
   - Band agent credentials from `app.band.ai/agents/new`: `BAND_AGENT_ID` and `BAND_API_KEY`, or
@@ -105,7 +105,7 @@ re-installs or re-registers what's already in place.
    - The plugin must be installed into the *same* interpreter that runs `hermes`, or it
      stays undiscoverable even though `import hermes_band_platform` succeeds from the repo
      directory. Use the resolver, which validates `import hermes_cli` and a supported
-     version (3.11–3.13; `band-sdk` has no 3.14 wheels) and **fails loud** rather than
+     version (3.11 or newer, `band-sdk`'s floor) and **fails loud** rather than
      leaving a silent wrong-venv install:
      ```bash
      HERMES_PY="$(scripts/gateway_python.py --print)" || { scripts/gateway_python.py; exit 1; }

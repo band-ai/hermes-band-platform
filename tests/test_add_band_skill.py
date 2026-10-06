@@ -437,16 +437,32 @@ def test_gateway_python_accepts_supported_interpreter(monkeypatch):
     assert result["warnings"] == []
 
 
-def test_gateway_python_rejects_unsupported_version(monkeypatch):
+def test_gateway_python_rejects_a_python_older_than_the_sdk_floor(monkeypatch):
     module = _load_script("gateway_python.py")
     _stub_candidates(module, monkeypatch, shebang="/gw/.venv/bin/python")
-    monkeypatch.setattr(module, "_probe", lambda path: _usable(module, version=(3, 14, 0)))
+    monkeypatch.setattr(module, "_probe", lambda path: _usable(module, version=(3, 10, 14)))
 
     result = module.resolve()
 
     assert result["ok"] is False
     assert result["python"] == "/gw/.venv/bin/python"  # found, but version-gated
-    assert "3.14" in result["error"]
+    assert "3.10.14" in result["error"]
+    assert "3.11 or newer" in result["error"]
+
+
+@pytest.mark.parametrize("version", [(3, 11, 0), (3, 13, 9), (3, 14, 7)])
+def test_gateway_python_accepts_every_python_from_the_sdk_floor_up(monkeypatch, version):
+    """Current Hermes ships its gateway on CPython 3.14; band-sdk is py3-none-any
+    and its native closure has cp314 wheels, so 3.14 must not be refused."""
+    module = _load_script("gateway_python.py")
+    _stub_candidates(module, monkeypatch, shebang="/gw/.venv/bin/python")
+    monkeypatch.setattr(module, "_probe", lambda path: _usable(module, version=version))
+
+    result = module.resolve()
+
+    assert result["ok"] is True
+    assert result["version"] == ".".join(map(str, version))
+    assert result["error"] is None
 
 
 def test_gateway_python_fails_when_no_candidate_has_hermes_cli(monkeypatch):
@@ -571,8 +587,8 @@ def test_gateway_python_warns_when_the_winner_is_a_system_interpreter(monkeypatc
 def test_gateway_python_does_not_warn_when_the_version_is_rejected(monkeypatch):
     """One problem at a time — don't stack a shape nudge on a hard rejection."""
     module = _load_script("gateway_python.py")
-    _stub_candidates(module, monkeypatch, shebang="/usr/bin/python3.14")
-    monkeypatch.setattr(module, "_probe", lambda path: _system(module, version=(3, 14, 0)))
+    _stub_candidates(module, monkeypatch, shebang="/usr/bin/python3.10")
+    monkeypatch.setattr(module, "_probe", lambda path: _system(module, version=(3, 10, 0)))
 
     result = module.resolve()
 

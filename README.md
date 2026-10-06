@@ -25,7 +25,7 @@ links a Hermes agent to the **Band** platform over a persistent WebSocket and re
 between Band chat rooms and the agent. It wraps the official
 [`band-sdk`](https://pypi.org/project/band-sdk/) `BandLink` — it does **not** reimplement the
 Band protocol. Beyond messaging it registers a `band` action toolset (create rooms, look people
-up, add/remove participants, send messages) and bootstraps a **Hermes Hub**: a private
+up, add/remove participants, send messages) and bootstraps a **Hermes Agent Hub**: a private
 owner↔agent control room that serves as the Band main channel.
 
 ## How it works

@@ -13,7 +13,7 @@ metadata:
 
 Connect a Hermes agent to Band from install through verification. This skill sets up the Hermes side and can optionally mint a Band external agent when the user provides a temporary user API key, but it does not keep user-level credentials after registration.
 
-Band rooms are mention-gated and Band owns access control. The plugin creates a private Hermes Hub room on first gateway connect and stores only agent-scoped credentials in Hermes.
+Band rooms are mention-gated and Band owns access control. The plugin creates a private Hermes Agent Hub room on first gateway connect and stores only agent-scoped credentials in Hermes.
 
 ## When to Use
 
@@ -192,7 +192,7 @@ re-installs or re-registers what's already in place.
 
 7. Restart the gateway.
    - Use the user's normal Hermes gateway restart command.
-   - On first connect the adapter resolves the owner, creates the Hermes Hub room, writes `BAND_HUB_ROOM`, and wires the hub as the home channel.
+   - On first connect the adapter resolves the owner, creates the Hermes Agent Hub room, writes `BAND_HUB_ROOM`, and wires the hub as the home channel.
 
 8. Verify the gateway with `scripts/verify_gateway.py`.
    - Success means the hub exists, gateway logs show Band connection signals, and no known hub failure signal appears in recent logs.

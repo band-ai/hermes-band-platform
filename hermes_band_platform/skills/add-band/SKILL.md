@@ -217,13 +217,13 @@ re-installs or re-registers what's already in place.
      `BAND_EMIT_EXECUTION=hub` if the user wants execution visibility in the private owner
      hub, or `all` after explicitly confirming that every participant in an originating Band
      room may see the redacted tool args/results. Invalid values fail closed to `off`.
-   - The Band tools are owner-gated and **fail-closed**. From this setup session the caller may not be the resolved Band owner, so a mutation can be refused: if so, either have the user run the request from the Hub in Band (where the owner bypass applies) or add the calling `platform:user_id` to `BAND_TOOL_OWNERS`. On decline, point them at `band_create_room` / the Band UI for later.
+   - The Band tools are loose by default: Band owns access control and refuses what the agent's room role doesn't allow, so the plugin adds no owner gate unless `BAND_TOOL_OWNERS` is set. If the operator has set it and a mutation from this setup session is refused, either have the user run the request from a Band room as the owner (the owner bypass applies there) or add the calling `platform:user_id` to `BAND_TOOL_OWNERS`. On decline, point them at `band_create_room` / the Band UI for later.
    - Remind them Band has no DMs; an unmentioned message is ignored by design.
 
 11. Optionally enable Band action tools (if not already needed for step 10).
    - Add the `band` toolset to each platform that should act on Band in `platform_toolsets` (`~/.hermes/config.yaml`) — **including the `band` platform itself**, or Band sessions get the messaging channel but none of the action tools.
    - Keep `hermes-band` for the messaging channel and add `band` only where action tools are needed.
-   - Mutating tools remain owner-gated by the plugin.
+   - Every platform that lists `band` lets its callers drive the mutating tools. If that is wider than the user wants (for example a shared Telegram bot), set `BAND_TOOL_OWNERS` to the `platform:user_id` identities allowed to.
 
 ## Pitfalls
 

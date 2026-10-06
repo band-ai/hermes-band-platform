@@ -271,7 +271,11 @@ BAND_API_KEY=<band_a_key>
 BAND_BASE_URL=<https://your-band-host>   # only if the agent is not on app.band.ai
 ```
 
-Then restart: `hermes gateway restart`.
+Then restart the gateway: `hermes gateway restart`. On a first-time setup there is no gateway
+service to restart yet (on systemd, `start`/`restart` stop with "Gateway service is not
+installed"): install it with `hermes gateway install`, then `hermes gateway start`, or run it in
+the foreground with `hermes gateway run`. `hermes gateway setup` is the messaging-platform wizard,
+not the service installer.
 
 ### Verify it worked
 

@@ -57,7 +57,7 @@ def ensure_home_channel() -> dict[str, Any]:
             "band_home_room": "",
             "error": "no hub room yet — BAND_HUB_ROOM and BAND_HOME_ROOM are both unset",
             "action": (
-                "(Re)start the gateway so the adapter creates the Hermes Hub and "
+                "(Re)start the gateway so the adapter creates the Hermes Agent Hub and "
                 "persists BAND_HUB_ROOM, then re-run this script."
             ),
         }

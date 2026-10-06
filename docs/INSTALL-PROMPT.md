@@ -41,7 +41,7 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
    • Install with the repo's installer: `/tmp/hbp/install.sh`. It ships the plugin as a
      DIRECTORY plugin under $HERMES_HOME (default ~/.hermes) and resolves
      `band-sdk>=1.3.0,<2.0.0` into $HERMES_HOME/band-libs with the gateway's interpreter
-     (Python 3.11–3.13) — ZERO writes to the gateway's site-packages, so it works on hosted
+     (Python 3.11 or newer) — ZERO writes to the gateway's site-packages, so it works on hosted
      runtimes where the gateway venv (e.g. /opt/hermes/.venv) is root-owned and read-only.
    • Never `sudo`, never write to the gateway venv, never edit the gateway's launch env
      (PYTHONPATH etc.) — the hosting platform resets such changes on redeploy. Everything
@@ -57,7 +57,8 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
      for the one registration step, then remove it.
 
 3. Stop and ask me at the two human gates:
-   • Credentials — I either create the Band agent at app.band.ai/agents/new and give you
+   • Credentials — I either create the Band agent at app.band.ai/agents/create (Agents page →
+     Connect remote agent) and give you
      BAND_AGENT_ID + BAND_API_KEY, or I set BAND_USER_API_KEY for the bundled
      `scripts/register_agent.py` helper.
    • The live test — I @mention the agent in the "Hermes Agent Hub" room and confirm a reply.

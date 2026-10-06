@@ -8,7 +8,7 @@ is on ``sys.path``) and ``hermes plugins list`` may look fine. That is the #1
 silent install failure, so this script turns the pitfall into a guard: it
 resolves the gateway interpreter through a fallback chain and refuses to proceed
 unless that interpreter can both *import* ``hermes_cli.config`` and run a
-supported Python (3.11–3.13; ``band-sdk`` has no 3.14 wheels yet).
+supported Python (3.11 or newer, the floor ``band-sdk`` declares).
 
 Two properties matter and are easy to get wrong:
 
@@ -34,9 +34,11 @@ Modes:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -44,8 +46,13 @@ import tempfile
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+# The floor band-sdk declares (``Requires-Python: >=3.11``). There is no ceiling:
+# band-sdk is pure Python and every native wheel in its closure (pydantic-core,
+# cryptography, cffi, websockets, PyYAML) ships for each CPython the plugin is
+# tested on, 3.14 included. A Python too new for that closure fails the
+# installer's own `uv pip install` with the exact missing wheel, which is a truer
+# gate than a hand-maintained maximum here.
 MIN_VERSION = (3, 11)
-MAX_VERSION = (3, 13)  # inclusive; band-sdk has no 3.14 wheels yet
 
 OVERRIDE_VARS = ("HERMES_PY", "HERMES_PYTHON")
 
@@ -69,6 +76,19 @@ _VENV_RELATIVE_PYTHONS = (
     ("venv", "Scripts", "python.exe"),
     ("Scripts", "python.exe"),
 )
+
+# The lines `hermes --version` names the project directory on. Older builds print
+# `Project: <dir>`; the installer-managed builds print `Install directory: <dir>`.
+_BANNER_PROJECT_PREFIXES = ("Project:", "Install directory:")
+
+# How many shell wrappers to follow from `hermes` on PATH. The upstream installer
+# publishes at most two (`~/.local/bin/hermes` → `<root>/.hermes/bin/hermes`);
+# the bound only stops a cycle or a pathological chain.
+_MAX_WRAPPER_DEPTH = 4
+
+# A shell wrapper is a few hundred bytes. Anything larger is not one, and is not
+# worth reading to find out.
+_MAX_WRAPPER_BYTES = 64 * 1024
 
 # Anything a module prints while importing would corrupt a bare JSON payload, so
 # the report is delimited and parsed from the marker onward.
@@ -211,7 +231,12 @@ def _from_launcher_sibling() -> list[str]:
 
 
 def _from_version_banner() -> list[str]:
-    """Parse ``hermes --version`` → ``Project: <path>`` → the venv layouts under it."""
+    """Parse ``hermes --version`` for the project directory → the venv layouts under it.
+
+    Both banner shapes are read: ``Project: <dir>`` and the installer-managed
+    ``Install directory: <dir>`` (``/usr/local/lib/hermes-agent`` on a root
+    install, whose interpreter is ``<dir>/venv/bin/python``).
+    """
     hermes = _hermes_launcher()
     if not hermes:
         return []
@@ -223,11 +248,12 @@ def _from_version_banner() -> list[str]:
         return []
     for line in (out.stdout + out.stderr).splitlines():
         line = line.strip()
-        if line.startswith("Project:"):
-            project = line.split(":", 1)[1].strip()
-            if project:
-                root = Path(project)
-                return [str(root.joinpath(*parts)) for parts in _VENV_RELATIVE_PYTHONS]
+        for prefix in _BANNER_PROJECT_PREFIXES:
+            if line.startswith(prefix):
+                project = line[len(prefix):].strip()
+                if project:
+                    root = Path(project)
+                    return [str(root.joinpath(*parts)) for parts in _VENV_RELATIVE_PYTHONS]
     return []
 
 
@@ -253,6 +279,156 @@ def _from_launcher_shebang() -> Optional[str]:
     """Read the ``hermes`` launcher's shebang interpreter, if it's a real path."""
     hermes = _hermes_launcher()
     return _shebang_interpreter(hermes) if hermes else None
+
+
+def _read_wrapper(path: str) -> Optional[str]:
+    """The text of ``path`` if it is a small ``#!`` script, else None (binaries too)."""
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(_MAX_WRAPPER_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > _MAX_WRAPPER_BYTES or not raw.startswith(b"#!") or b"\x00" in raw:
+        return None
+    return raw.decode("utf-8", "replace")
+
+
+_EXEC_LINE_RE = re.compile(r"^[ \t]*exec[ \t]", re.MULTILINE)
+
+
+def _exec_target(text: str) -> Optional[str]:
+    """The program a shell wrapper ``exec``s, if it is a literal absolute path.
+
+    Tokenized with POSIX shell quoting from the ``exec`` onward, so a quoted path
+    and a multi-line ``-c '…'`` argument after it both parse. A target built from
+    a variable (``exec "$PY" …``) is not guessed at.
+    """
+    match = _EXEC_LINE_RE.search(text)
+    if match is None:
+        return None
+    lexer = shlex.shlex(text[match.start():], posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        lexer.get_token()  # `exec`
+        target = lexer.get_token()
+        while target and target.startswith("-"):  # `exec -l`, `exec -a NAME`
+            if target == "-a":
+                lexer.get_token()
+            target = lexer.get_token()
+    except ValueError:
+        return None
+    if not target or "$" in target or not os.path.isabs(target):
+        return None
+    return target
+
+
+def _launcher_chain() -> list[tuple[str, str]]:
+    """``(path, text)`` for ``hermes`` on PATH and each shell wrapper it ``exec``s.
+
+    The upstream installer puts wrappers in front of the interpreter, so neither
+    the launcher's directory nor its shebang names it:
+
+    * user install: ``~/.local/bin/hermes`` → ``exec <root>/.hermes/bin/hermes``
+      → ``exec <store python> -I -c '<bootstrap>'``;
+    * root install: ``/usr/local/bin/hermes`` → ``exec <root>/venv/bin/python
+      <root>/hermes``.
+
+    Stops at the first file that is not a ``#!`` script, so a binary or a venv
+    console script ends the chain as its last entry.
+    """
+    hermes = _hermes_launcher()
+    chain: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    current = hermes
+    while current and len(chain) < _MAX_WRAPPER_DEPTH:
+        real = os.path.realpath(current)
+        if real in seen:
+            break
+        seen.add(real)
+        text = _read_wrapper(current)
+        if text is None:
+            break
+        chain.append((current, text))
+        current = _exec_target(text)
+    return chain
+
+
+def _from_launcher_wrappers() -> list[str]:
+    """Interpreters named along the ``hermes`` wrapper chain.
+
+    Each script contributes its shebang if that is a Python (a venv console
+    script) and its ``exec`` target if that is a Python (the root install's
+    ``exec <root>/venv/bin/python``). A base interpreter that only runs Hermes by
+    way of a ``-c`` bootstrap is reported too; the probe rejects it, and
+    ``_from_launcher_runtime`` supplies the environment it activates.
+    """
+    found: list[str] = []
+    for path, text in _launcher_chain():
+        shebang = _shebang_interpreter(path)
+        if shebang:
+            found.append(shebang)
+        target = _exec_target(text)
+        if target and "python" in Path(target).name:
+            found.append(target)
+    return found
+
+
+def _venv_for_site_packages(entry: str) -> Optional[Path]:
+    """The venv root owning a ``site-packages`` path, if it has a ``pyvenv.cfg``."""
+    path = Path(entry)
+    if path.name != "site-packages":
+        return None
+    if path.parent.name.startswith("python") and path.parent.parent.name == "lib":
+        root = path.parent.parent.parent  # <venv>/lib/pythonX.Y/site-packages
+    elif path.parent.name == "Lib":
+        root = path.parent.parent  # <venv>/Lib/site-packages (Windows)
+    else:
+        return None
+    return root if (root / "pyvenv.cfg").is_file() else None
+
+
+def _from_launcher_runtime() -> list[str]:
+    """The venv the installer-managed launcher activates, by asking the launcher.
+
+    The current installer runs Hermes on a bare store interpreter and selects a
+    managed dependency environment at boot, so no path on disk says which venv
+    that is. The launcher's own ``--run-module`` entry runs a module inside that
+    activated runtime; ``site`` prints the resulting ``sys.path``, and the venv
+    whose ``site-packages`` is on it holds an interpreter that imports
+    ``hermes_cli`` on its own. Only asked of a launcher whose wrapper declares
+    ``--run-module``: older launchers would parse it as a chat flag.
+    """
+    hermes = _hermes_launcher()
+    if not hermes or not any("--run-module" in text for _, text in _launcher_chain()):
+        return []
+    try:
+        with tempfile.TemporaryDirectory(prefix="gateway-python-") as neutral_cwd:
+            out = subprocess.run(
+                [hermes, "--run-module", "site"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=neutral_cwd,
+            )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    match = re.search(r"^sys\.path = (\[.*?^\])", out.stdout, re.MULTILINE | re.DOTALL)
+    if match is None:
+        return []
+    try:
+        entries = ast.literal_eval(match.group(1))
+    except (ValueError, SyntaxError):
+        return []
+    found: list[str] = []
+    for entry in entries if isinstance(entries, list) else ():
+        root = _venv_for_site_packages(str(entry))
+        if root is not None:
+            found.extend(
+                str(root.joinpath(*parts))
+                for parts in (("bin", "python3"), ("bin", "python"), ("Scripts", "python.exe"))
+            )
+    return found
 
 
 # The shapes a real gateway is launched in. This mirrors the host's own
@@ -507,19 +683,31 @@ def _from_running_process() -> list[str]:
     return found
 
 
-def _same_path(left: str, right: str) -> bool:
-    """Whether two candidate paths name the same interpreter (symlinks included)."""
+def _environment_key(path: str) -> tuple[str, str]:
+    """Identify the environment an interpreter path runs, for de-duplication.
+
+    Not ``Path(path).resolve()`` alone: a venv's ``bin/python`` is a symlink to
+    its base interpreter, so resolving the file maps the venv and the bare base
+    Python to one path, and whichever came first would hide the other. The venv
+    is defined by the directory the interpreter is invoked from (its
+    ``pyvenv.cfg`` sits above it), so that directory is part of the key.
+    """
+    candidate = Path(path)
     try:
-        return Path(left).resolve() == Path(right).resolve()
+        return str(candidate.parent.resolve()), str(candidate.resolve())
     except OSError:
-        return left == right
+        return str(candidate.parent), path
+
+
+def _same_path(left: str, right: str) -> bool:
+    """Whether two candidate paths run the same interpreter in the same environment."""
+    return _environment_key(left) == _environment_key(right)
 
 
 def _version_error(vstr: str) -> str:
     return (
         f"Gateway Python is {vstr}; Band requires "
-        f"{'.'.join(map(str, MIN_VERSION))}–{'.'.join(map(str, MAX_VERSION))} "
-        "(band-sdk has no 3.14 wheels yet)"
+        f"{'.'.join(map(str, MIN_VERSION))} or newer (band-sdk's floor)"
     )
 
 
@@ -538,20 +726,23 @@ def _rejection(python: str, probed: Optional[Probe]) -> str:
 def resolve() -> dict[str, Any]:
     """Resolve the gateway interpreter, validating import + version."""
     candidates: list[tuple[str, str]] = []  # (path, method)
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+    probes: dict[str, Optional[Probe]] = {}
+
+    def probe(path: str) -> Optional[Probe]:
+        if path not in probes:
+            probes[path] = _probe(path)
+        return probes[path]
 
     def add(path: Optional[str], method: str, *, require_exists: bool = False) -> None:
         if not path:
             return
         if require_exists and not Path(path).exists():
             return
-        try:
-            real = str(Path(path).resolve())
-        except OSError:
-            real = path
-        if real in seen:
+        key = _environment_key(path)
+        if key in seen:
             return
-        seen.add(real)
+        seen.add(key)
         candidates.append((path, method))
 
     # Order is evidence, strongest first. The operator's own statement, then the
@@ -564,6 +755,10 @@ def resolve() -> dict[str, Any]:
         add(pid_file_python, "pid-file", require_exists=True)
     for sibling in _from_launcher_sibling():
         add(sibling, "launcher-sibling", require_exists=True)
+    for wrapped in _from_launcher_wrappers():
+        add(wrapped, "launcher-wrapper", require_exists=True)
+    for runtime_python in _from_launcher_runtime():
+        add(runtime_python, "launcher-runtime", require_exists=True)
     for banner_python in _from_version_banner():
         add(banner_python, "version-banner", require_exists=True)
     add(_from_launcher_shebang(), "launcher-shebang")
@@ -573,14 +768,14 @@ def resolve() -> dict[str, Any]:
 
     tried: list[dict[str, Any]] = []
     for path, method in candidates:
-        probed = _probe(path)
+        probed = probe(path)
         record: dict[str, Any] = {"python": path, "method": method}
         record.update(probed.as_dict() if probed else {"usable": False})
         tried.append(record)
 
         if probed is not None and probed.has_hermes_cli and probed.version is not None:
             vstr = ".".join(str(part) for part in probed.version)
-            in_range = MIN_VERSION <= probed.version[:2] <= MAX_VERSION
+            in_range = probed.version[:2] >= MIN_VERSION
             # Shape is a nudge, never a verdict. A system-wide Hermes (distro
             # package, `pip --break-system-packages`, single-python container) is a
             # legitimate install, and which candidate *wins* stays a question of
@@ -598,12 +793,19 @@ def resolve() -> dict[str, Any]:
             # process evidence was unusable or unscoped (a gateway in another home,
             # so it stays ranked below) — either way, say so instead of installing
             # quietly into the wrong environment.
+            # Only a process candidate that is itself a usable gateway interpreter
+            # counts: the store-Python launch below the current installer's
+            # wrappers is the live gateway's argv[0], yet cannot import hermes_cli
+            # without the environment the launcher activates, so naming it here
+            # would be wrong advice.
             if in_range and method != "env" and method not in _PROCESS_METHODS:
-                disagreeing = [
-                    candidate
-                    for candidate, candidate_method in candidates
-                    if candidate_method in _PROCESS_METHODS and not _same_path(candidate, path)
-                ]
+                disagreeing = []
+                for candidate, candidate_method in candidates:
+                    if candidate_method not in _PROCESS_METHODS or _same_path(candidate, path):
+                        continue
+                    process_probe = probe(candidate)
+                    if process_probe is not None and process_probe.has_hermes_cli:
+                        disagreeing.append(candidate)
                 if disagreeing:
                     warnings.append(
                         f"{path} came from {method}, but a running gateway reports "

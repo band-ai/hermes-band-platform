@@ -13,7 +13,7 @@ metadata:
 
 Connect a Hermes agent to Band from install through verification. This skill sets up the Hermes side and can optionally mint a Band external agent when the user provides a temporary user API key, but it does not keep user-level credentials after registration.
 
-Band rooms are mention-gated and Band owns access control. The plugin creates a private Hermes Hub room on first gateway connect and stores only agent-scoped credentials in Hermes.
+Band rooms are mention-gated and Band owns access control. The plugin creates a private Hermes Agent Hub room on first gateway connect and stores only agent-scoped credentials in Hermes.
 
 ## When to Use
 
@@ -25,10 +25,10 @@ Do not use this skill for ordinary Band chat troubleshooting after setup; inspec
 
 ## Prerequisites
 
-- Hermes is installed and its gateway runs in a Python **3.11–3.13** environment (the Band SDK has no 3.14 wheels yet).
+- Hermes is installed and its gateway runs in a Python **3.11 or newer** environment (the Band SDK's floor).
 - You can run shell commands as the user who owns the Hermes install.
 - The user can provide either:
-  - Band agent credentials from `app.band.ai/agents/new`: `BAND_AGENT_ID` and `BAND_API_KEY`, or
+  - Band agent credentials from the Agents page's **Connect remote agent** button (`app.band.ai/agents/create`): `BAND_AGENT_ID` and `BAND_API_KEY`, or
   - a short-lived user API key in `BAND_USER_API_KEY` for automated Enterprise registration.
 
 This skill installs the plugin and the Band SDK as part of the procedure — they need not be present beforehand.
@@ -50,7 +50,7 @@ Skill helper paths are relative to this skill directory:
 - `scripts/verify_gateway.py`
 - `scripts/verify_roundtrip.py` — prove the agent can post to its owner
 
-Registration temporarily ships as `scripts/register_agent.py` because the SDK CLI is not published yet. The helper saves `BAND_AGENT_ID` + `BAND_API_KEY` through Hermes's env writer and never prints the user key. It also sends a browser-like request fingerprint to avoid Cloudflare 1010 blocks on `app.band.ai`; the future `band-register-agent` / `band.cli.register_agent` path must keep equivalent headers before the bundled helper is removed. The setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
+Registration temporarily ships as `scripts/register_agent.py` because the SDK CLI is not published yet. The helper saves `BAND_AGENT_ID` + `BAND_API_KEY` through Hermes's env writer (plus `BAND_BASE_URL` when it registered against a non-default host, so the gateway connects where the agent lives) and never prints the user key. It also sends a browser-like request fingerprint to avoid Cloudflare 1010 blocks on `app.band.ai`; the future `band-register-agent` / `band.cli.register_agent` path must keep equivalent headers before the bundled helper is removed. The setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
 
 This skill is **resumable**: run `verify_install.py` first and act *only* on what it reports as `blocking[]`, so re-running after a partial failure never double-installs or re-registers.
 
@@ -87,7 +87,7 @@ hermes plugins enable band 2>/dev/null && hermes plugins list | grep -w band >/d
 Register (temporary bundled helper — needs `BAND_USER_API_KEY`), ensure the access policy, then verify install / gateway / prove a round-trip (always with the gateway interpreter):
 
 ```bash
-"$HERMES_PY" scripts/register_agent.py        # mints the agent and saves BAND_AGENT_ID + BAND_API_KEY
+"$HERMES_PY" scripts/register_agent.py        # mints the agent and saves BAND_AGENT_ID + BAND_API_KEY (+ a non-default BAND_BASE_URL)
 "$HERMES_PY" scripts/ensure_access_policy.py   # gateway trusts Band's ACL (idempotent; safe to re-run)
 "$HERMES_PY" scripts/verify_install.py
 "$HERMES_PY" scripts/verify_gateway.py         # hub created + home (main) channel set
@@ -105,7 +105,7 @@ re-installs or re-registers what's already in place.
    - The plugin must be installed into the *same* interpreter that runs `hermes`, or it
      stays undiscoverable even though `import hermes_band_platform` succeeds from the repo
      directory. Use the resolver, which validates `import hermes_cli` and a supported
-     version (3.11–3.13; `band-sdk` has no 3.14 wheels) and **fails loud** rather than
+     version (3.11 or newer, `band-sdk`'s floor) and **fails loud** rather than
      leaving a silent wrong-venv install:
      ```bash
      HERMES_PY="$(scripts/gateway_python.py --print)" || { scripts/gateway_python.py; exit 1; }
@@ -126,8 +126,11 @@ re-installs or re-registers what's already in place.
        `HERMES_PY=<that path>` unless the user says otherwise.
    - `method` in the JSON says what the answer rests on, strongest first: `env` (you set
      it) → `pid-file` (Hermes's own record of the running gateway, read from
-     `$HERMES_HOME/gateway.pid`) → `launcher-sibling` / `version-banner` /
-     `launcher-shebang` (inferred from `hermes` on this `PATH`) → `running-process` (a
+     `$HERMES_HOME/gateway.pid`) → `launcher-sibling` / `launcher-wrapper` (the
+     interpreter a shell wrapper such as the root install's `/usr/local/bin/hermes`
+     `exec`s) / `launcher-runtime` (the managed venv the current installer's launcher
+     activates, reported by `hermes --run-module site`) / `version-banner` /
+     `launcher-shebang` (all inferred from `hermes` on this `PATH`) → `running-process` (a
      `pgrep` scan) → `self`. Anything below `pid-file` describes an environment that
      *may* be the gateway's; set `HERMES_HOME` first if the user runs a named profile,
      so the resolver reads that profile's gateway record.
@@ -172,11 +175,11 @@ re-installs or re-registers what's already in place.
 
 5. Ensure agent credentials are present (`BAND_AGENT_ID` + `BAND_API_KEY` in Hermes's `.env`). `scripts/verify_install.py` reports whether they are.
    - Already saved (e.g. the bootstrapper registered the agent before handing off): continue.
-   - Pre-created agent: have the user create one at `app.band.ai/agents/new` and save `BAND_AGENT_ID` + `BAND_API_KEY` with Hermes's env writer.
+   - Pre-created agent: have the user click **Connect remote agent** on the Band Agents page (`app.band.ai/agents/create`), create the agent, and save `BAND_AGENT_ID` + `BAND_API_KEY` with Hermes's env writer. If the agent lives on a Band host other than `https://app.band.ai`, save that host as `BAND_BASE_URL` too, or the gateway connects to app.band.ai with a key it doesn't know.
    - Auto-register from a user key — a **script step, not an LLM step**. Until the SDK CLI is published, use the bundled `scripts/register_agent.py` helper. With `BAND_USER_API_KEY` set in a plain shell, the helper reads it from the environment, mints the agent, and saves agent-scoped creds through Hermes's env writer; it never prints or persists the *user* key:
      ```bash
-     "$HERMES_PY" scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY through Hermes env writer
-     unset BAND_USER_API_KEY
+     "$HERMES_PY" scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY (+ a non-default BAND_BASE_URL) through Hermes env writer
+     unset BAND_USER_API_KEY BAND_API_KEY   # BAND_API_KEY may hold the user key (web snippet); the gateway reads the agent key from .env
      ```
      This is **idempotent at the flow level**: step 2 only routes here when `verify_install` reports the credentials missing, so a re-run never mints a second agent. **Do not put `BAND_USER_API_KEY` into the agent's own environment or read it yourself** — let the bootstrapper or a plain shell consume it before/outside the agent, so the user key never reaches the LLM. After `band.cli.register_agent` is published in `band-sdk`, replace this helper call with `"$HERMES_PY" -m band.cli.register_agent` only after confirming the SDK CLI sends the same Cloudflare-safe registration headers. Have the user remove `BAND_USER_API_KEY` afterward.
 
@@ -188,8 +191,9 @@ re-installs or re-registers what's already in place.
    - Quick alternative for an immediate unblock without editing config: `hermes config set BAND_ALLOW_ALL true` (broader — trusts every sender Band delivers; the `allowlist` policy is the precise equivalent of Band's ACL).
 
 7. Restart the gateway.
-   - Use the user's normal Hermes gateway restart command.
-   - On first connect the adapter resolves the owner, creates the Hermes Hub room, writes `BAND_HUB_ROOM`, and wires the hub as the home channel.
+   - Use the user's normal Hermes gateway restart command (`hermes gateway restart` for the installed service).
+   - First-time setup has no service yet (on systemd, `start` / `restart` stop with "Gateway service is not installed"): run `hermes gateway install`, then `hermes gateway start`, or `hermes gateway run` in the foreground (containers, WSL). `hermes gateway setup` is the messaging-platform wizard, not the service installer.
+   - On first connect the adapter resolves the owner, creates the Hermes Agent Hub room, writes `BAND_HUB_ROOM`, and wires the hub as the home channel.
 
 8. Verify the gateway with `scripts/verify_gateway.py`.
    - Success means the hub exists, gateway logs show Band connection signals, and no known hub failure signal appears in recent logs.
@@ -217,13 +221,13 @@ re-installs or re-registers what's already in place.
      `BAND_EMIT_EXECUTION=hub` if the user wants execution visibility in the private owner
      hub, or `all` after explicitly confirming that every participant in an originating Band
      room may see the redacted tool args/results. Invalid values fail closed to `off`.
-   - The Band tools are owner-gated and **fail-closed**. From this setup session the caller may not be the resolved Band owner, so a mutation can be refused: if so, either have the user run the request from the Hub in Band (where the owner bypass applies) or add the calling `platform:user_id` to `BAND_TOOL_OWNERS`. On decline, point them at `band_create_room` / the Band UI for later.
+   - The Band tools are loose by default: Band owns access control and refuses what the agent's room role doesn't allow, so the plugin adds no owner gate unless `BAND_TOOL_OWNERS` is set. If the operator has set it and a mutation from this setup session is refused, either have the user run the request from a Band room as the owner (the owner bypass applies there) or add the calling `platform:user_id` to `BAND_TOOL_OWNERS`. On decline, point them at `band_create_room` / the Band UI for later.
    - Remind them Band has no DMs; an unmentioned message is ignored by design.
 
 11. Optionally enable Band action tools (if not already needed for step 10).
    - Add the `band` toolset to each platform that should act on Band in `platform_toolsets` (`~/.hermes/config.yaml`) — **including the `band` platform itself**, or Band sessions get the messaging channel but none of the action tools.
    - Keep `hermes-band` for the messaging channel and add `band` only where action tools are needed.
-   - Mutating tools remain owner-gated by the plugin.
+   - Every platform that lists `band` lets its callers drive the mutating tools. If that is wider than the user wants (for example a shared Telegram bot), set `BAND_TOOL_OWNERS` to the `platform:user_id` identities allowed to.
 
 ## Pitfalls
 
@@ -245,7 +249,7 @@ re-installs or re-registers what's already in place.
 ## Verification
 
 - `scripts/gateway_python.py` resolves and version-gates the gateway interpreter (run before anything else).
-- `scripts/verify_install.py` reports package or directory plugin presence, SDK importability (after applying the same `band-libs` shim the gateway applies — `band_libs_on_sys_path` asserts the shim took effect), plugin enablement, required credential presence, and whether the access policy authorizes Band traffic (`access_policy_allowlist`). Run it as `$HERMES_PY` so its checks reflect the gateway interpreter, not whatever shell python you happen to be in.
+- `scripts/verify_install.py` reports package or directory plugin presence, SDK importability (after applying the same `band-libs` shim the gateway applies — `band_libs_on_sys_path` asserts the shim took effect), plugin enablement, required credential presence (read from the gateway's `$HERMES_HOME/.env` or `platforms.band.extra`, never from this shell, so an exported user key doesn't count), and whether the access policy authorizes Band traffic (`access_policy_allowlist`). Run it as `$HERMES_PY` so its checks reflect the gateway interpreter, not whatever shell python you happen to be in.
 - `scripts/ensure_access_policy.py` sets Band's access policy to `allowlist` so the gateway trusts Band's ACL. Idempotent and safe to run anytime — use it to repair an agent that rejects its owner with "not an authorized user".
 - `scripts/ensure_home_channel.py` persists the hub as the home (main) channel (`BAND_HOME_ROOM`). Idempotent and safe to run anytime after the hub exists — use it to repair an agent that complains it has "no home".
 - `scripts/verify_gateway.py` reports `BAND_HUB_ROOM`, recent Band gateway success signals, and known failure signals.

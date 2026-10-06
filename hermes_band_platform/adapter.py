@@ -29,7 +29,7 @@ Scope notes:
     write through ``_post_chunks``, so they cannot drift.
   * The HUB: on connect the adapter ensures a private owner↔agent control
     room — the pinned ``BAND_HUB_ROOM`` if set, else a freshly created
-    "Hermes Hub" — and wires it as the platform home channel (the Band main
+    "Hermes Agent Hub" — and wires it as the platform home channel (the Band main
     channel). Existing rooms are never adopted as the hub.
   * Slash commands are OWNER-ONLY, in any Band room — command-shaped
     messages from anyone else are dropped (one-time notice for humans,
@@ -1265,7 +1265,7 @@ class BandAdapter(BasePlatformAdapter):
             self.config.home_channel = HomeChannel(
                 platform=self.platform,
                 chat_id=room_id,
-                name="Hermes Hub",
+                name=_HUB_TITLE,
             )
         except Exception as e:
             logger.debug("[band] Could not wire home channel: %s", e)
@@ -3100,7 +3100,7 @@ def _env_enablement() -> dict | None:
     if home_room:
         seed["home_channel"] = {
             "chat_id": home_room,
-            "name": "Hermes Hub" if home_room == hub_room else "Band Home",
+            "name": _HUB_TITLE if home_room == hub_room else "Band Home",
         }
 
     # TODO (memory pass): surface BAND_MEMORY_PRELOAD / BAND_MEMORY_WRITETHROUGH
@@ -3138,10 +3138,11 @@ def interactive_setup() -> None:
     print_header("Band")
 
     # Step-by-step credential instructions. Agent creation lives on the Agents
-    # page (/agents/new) — NOT Settings, which only holds REST API keys + profile.
-    # The agent's API key is shown once in the creation modal.
+    # page's "Connect remote agent" button (/agents/create) — NOT Settings, which
+    # only holds REST API keys + profile. The agent's API key is shown once in
+    # the creation modal.
     print_info("To connect Hermes to Band you need a Band agent's ID and API key:")
-    print_info("  1. Open the Band app and go to the Agents page (/agents/new).")
+    print_info("  1. Open the Band app's Agents page and click 'Connect remote agent' (/agents/create).")
     print_info("  2. Create a new external agent (or open an existing one).")
     print_info("  3. Copy the Agent ID (a UUID) and the agent's API key (shown once).")
     print_info("")
@@ -3184,7 +3185,7 @@ def interactive_setup() -> None:
     print_info("agent (in any chat or the hub) can talk to it; no allowlist setup is needed.")
     print_info("Owner, hub room, and home room are resolved automatically:")
     print_info("  • The owner is read from the agent identity on first connect.")
-    print_info("  • A private 'Hermes Hub' control room is created automatically")
+    print_info("  • A private 'Hermes Agent Hub' control room is created automatically")
     print_info("    on first connect and wired as the Band main channel (where")
     print_info("    cron and notification deliveries land).")
     print_info("Band has no DMs — to reach the agent, @mention it in a room (the hub included).")

@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -93,6 +94,7 @@ def test_verify_install_reports_missing_requirements(monkeypatch):
     monkeypatch.setattr(module, "_has_directory_manifest", lambda: False)
     monkeypatch.setattr(module, "_plugin_enabled", lambda: False)
     monkeypatch.setattr(module, "_env_value", lambda name: "")
+    monkeypatch.setattr(module, "_band_extra", dict)
     monkeypatch.setattr(module, "_access_policy_allowlist", lambda: False)
 
     result = module.verify_install()
@@ -128,6 +130,7 @@ def test_verify_install_does_not_block_on_a_directory_plugin_layout(monkeypatch)
     monkeypatch.setattr(module, "_installed_plugin_root", lambda: Path("/h/plugins/band"))
     monkeypatch.setattr(module, "_plugin_enabled", lambda: True)
     monkeypatch.setattr(module, "_env_value", lambda name: "set")
+    monkeypatch.setattr(module, "_band_extra", dict)
     monkeypatch.setattr(module, "_access_policy_allowlist", lambda: True)
     monkeypatch.setattr(module, "_conversations_skill_present", lambda: True)
     monkeypatch.setattr(
@@ -142,6 +145,67 @@ def test_verify_install_does_not_block_on_a_directory_plugin_layout(monkeypatch)
     assert "entry_point" in result["missing"]
     assert result["blocking"] == []
     assert not any("Install the plugin" in action for action in result["actions"])
+
+
+def test_verify_install_ignores_credentials_only_in_the_calling_shell(monkeypatch, tmp_path):
+    """The gateway loads its credentials from ``$HERMES_HOME/.env``, not from the
+    setup shell, where ``BAND_API_KEY`` is often the user key the web app's
+    snippet exports. Reading the shell reported a key the gateway never sees."""
+    pytest.importorskip("hermes_cli.config")
+    module = _load_script("verify_install.py")
+    # conftest's stub `band` has no __spec__; this test is about credentials.
+    monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BAND_AGENT_ID", "agent-in-the-shell-only")
+    monkeypatch.setenv("BAND_API_KEY", "band_u_user_key_in_the_shell_only")
+    env_file = tmp_path / ".env"
+    env_file.write_text("")
+
+    checks = module.verify_install()["checks"]
+
+    assert checks["band_agent_id_present"] is False
+    assert checks["band_api_key_present"] is False
+
+    env_file.write_text("BAND_AGENT_ID=agent-1\nBAND_API_KEY=band_a_agent_key\n")
+
+    checks = module.verify_install()["checks"]
+
+    assert checks["band_agent_id_present"] is True
+    assert checks["band_api_key_present"] is True
+
+
+def test_verify_install_accepts_credentials_from_the_platform_config(monkeypatch):
+    """The adapter falls back to ``platforms.band.extra`` for its credentials."""
+    module = _load_script("verify_install.py")
+    monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: None)
+    extra = {"agent_id": "agent-1", "api_key": "band_a_agent_key"}
+    _install_fake_hermes_config(
+        monkeypatch, {"config": {"platforms": {"band": {"extra": extra}}}, "env": {}}
+    )
+
+    checks = module.verify_install()["checks"]
+
+    assert checks["band_agent_id_present"] is True
+    assert checks["band_api_key_present"] is True
+
+
+def test_verify_install_output_never_contains_credential_values(monkeypatch, tmp_path, capsys):
+    """The printed report carries presence flags only, never the credentials."""
+    module = _load_script("verify_install.py")
+    monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
+    monkeypatch.delenv("BAND_API_KEY", raising=False)
+    agent_id = "agent-id-7f3c9e1d"
+    agent_key = "band_a_fake_secret_4b8e2a6c"
+    (tmp_path / ".env").write_text(f"BAND_AGENT_ID={agent_id}\nBAND_API_KEY='{agent_key}'\n")
+
+    module.main()
+    output = capsys.readouterr().out
+
+    assert json.loads(output)["checks"]["band_api_key_present"] is True
+    assert agent_key not in output
+    assert agent_id not in output
 
 
 def _install_fake_hermes_config(monkeypatch, store: dict):
@@ -165,6 +229,9 @@ def _install_fake_hermes_config(monkeypatch, store: dict):
     def get_env_value(name):
         return store.get("env", {}).get(name, "")
 
+    def load_env():
+        return dict(store.get("env", {}))
+
     def save_env_value(key, value):
         store.setdefault("saved", {})[key] = value
         store.setdefault("env", {})[key] = value
@@ -172,6 +239,7 @@ def _install_fake_hermes_config(monkeypatch, store: dict):
     mod.load_config = load_config
     mod.save_config = save_config
     mod.get_env_value = get_env_value
+    mod.load_env = load_env
     mod.save_env_value = save_env_value
     monkeypatch.setitem(sys.modules, "hermes_cli", pkg)
     monkeypatch.setitem(sys.modules, "hermes_cli.config", mod)
@@ -304,38 +372,81 @@ def test_register_agent_requires_user_key(monkeypatch):
         module.register_agent()
 
 
+class _RegistrationResponse:
+    status = 200
+
+    def read(self):
+        return b'{"agent": {"id": "a1"}, "credentials": {"api_key": "agent-key"}}'
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _register_with(monkeypatch, env: dict) -> tuple[dict, dict, dict]:
+    """Run register_agent against a fake Band and a fake Hermes env writer.
+
+    Returns (result, what was sent, what was saved).
+    """
+    module = _load_script("register_agent.py")
+    for var in ("BAND_USER_API_KEY", "BAND_API_KEY", "BAND_AGENT_ID", "BAND_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    store: dict = {"config": {}, "env": {}}
+    _install_fake_hermes_config(monkeypatch, store)
+    sent: dict = {}
+
+    def urlopen(request, *a, **k):
+        sent["url"] = request.full_url
+        sent["key"] = request.get_header("X-api-key")
+        return _RegistrationResponse()
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", urlopen)
+    return module.register_agent(), sent, store.get("saved", {})
+
+
 def test_register_agent_reads_user_key_from_band_api_key(monkeypatch):
     """The web app's onboarding snippet exports the user key as BAND_API_KEY."""
-    module = _load_script("register_agent.py")
-    monkeypatch.delenv("BAND_USER_API_KEY", raising=False)
-    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
-    monkeypatch.setenv("BAND_API_KEY", "user-key-from-snippet")
+    result, sent, saved = _register_with(monkeypatch, {"BAND_API_KEY": "user-key-from-snippet"})
 
-    captured = {}
-    monkeypatch.setattr(module, "_registration_headers", lambda k: captured.update(key=k) or {})
-    monkeypatch.setattr(
-        module, "_save_credentials", lambda agent_id, api_key: captured.update(saved=(agent_id, api_key))
+    assert sent["key"] == "user-key-from-snippet"
+    assert saved == {"BAND_AGENT_ID": "a1", "BAND_API_KEY": "agent-key"}
+    assert result["success"] is True
+
+
+def test_register_agent_prefers_the_user_key_over_a_stale_agent_key(monkeypatch):
+    _, sent, _ = _register_with(
+        monkeypatch, {"BAND_USER_API_KEY": "band_u_user", "BAND_API_KEY": "band_a_stale"}
     )
 
-    class _Resp:
-        status = 200
+    assert sent["key"] == "band_u_user"
 
-        def read(self):
-            return b'{"agent": {"id": "a1"}, "credentials": {"api_key": "agent-key"}}'
 
-        def __enter__(self):
-            return self
+@pytest.mark.parametrize(
+    ("configured", "registered_at", "persisted"),
+    [
+        (None, "https://app.band.ai", None),
+        ("https://app.band.ai/", "https://app.band.ai", None),
+        ("https://dev.band.example/", "https://dev.band.example", "https://dev.band.example"),
+    ],
+)
+def test_register_agent_persists_a_non_default_base_url(
+    monkeypatch, configured, registered_at, persisted
+):
+    """The agent exists only on the host that minted it; without BAND_BASE_URL in
+    the gateway .env the adapter would connect to app.band.ai with its key."""
+    env = {"BAND_USER_API_KEY": "band_u_user"}
+    if configured is not None:
+        env["BAND_BASE_URL"] = configured
 
-        def __exit__(self, *exc):
-            return False
+    result, sent, saved = _register_with(monkeypatch, env)
 
-    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **k: _Resp())
-
-    result = module.register_agent()
-
-    assert captured["key"] == "user-key-from-snippet"
-    assert captured["saved"] == ("a1", "agent-key")
-    assert result["success"] is True
+    assert sent["url"] == f"{registered_at}/api/v1/me/agents/register"
+    assert saved.get("BAND_BASE_URL") == persisted
+    assert ("BAND_BASE_URL" in result["saved"]) is (persisted is not None)
 
 
 def test_register_agent_short_circuits_when_already_registered(monkeypatch):
@@ -382,18 +493,29 @@ def test_register_agent_headers_allow_user_agent_override(monkeypatch):
 
 
 def _stub_candidates(
-    module, monkeypatch, banner=(), sibling=(), shebang=None, procs=(), pid_file=()
+    module,
+    monkeypatch,
+    banner=(),
+    sibling=(),
+    shebang=None,
+    procs=(),
+    pid_file=(),
+    wrappers=(),
+    runtime=(),
 ):
     """Pin every candidate source so a test controls the whole chain.
 
     ``_from_pid_file`` included: it reads ``$HERMES_HOME/gateway.pid``, so leaving
     it live would make any ordering assertion depend on whether the developer
-    running the suite happens to have a gateway up.
+    running the suite happens to have a gateway up. The launcher sources read and
+    run the real ``hermes`` on PATH, so they are pinned for the same reason.
     """
     for var in module.OVERRIDE_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(module, "_from_pid_file", lambda: list(pid_file))
     monkeypatch.setattr(module, "_from_launcher_sibling", lambda: list(sibling))
+    monkeypatch.setattr(module, "_from_launcher_wrappers", lambda: list(wrappers))
+    monkeypatch.setattr(module, "_from_launcher_runtime", lambda: list(runtime))
     monkeypatch.setattr(module, "_from_version_banner", lambda: list(banner))
     monkeypatch.setattr(module, "_from_launcher_shebang", lambda: shebang)
     monkeypatch.setattr(module, "_from_running_process", lambda: list(procs))
@@ -437,16 +559,32 @@ def test_gateway_python_accepts_supported_interpreter(monkeypatch):
     assert result["warnings"] == []
 
 
-def test_gateway_python_rejects_unsupported_version(monkeypatch):
+def test_gateway_python_rejects_a_python_older_than_the_sdk_floor(monkeypatch):
     module = _load_script("gateway_python.py")
     _stub_candidates(module, monkeypatch, shebang="/gw/.venv/bin/python")
-    monkeypatch.setattr(module, "_probe", lambda path: _usable(module, version=(3, 14, 0)))
+    monkeypatch.setattr(module, "_probe", lambda path: _usable(module, version=(3, 10, 14)))
 
     result = module.resolve()
 
     assert result["ok"] is False
     assert result["python"] == "/gw/.venv/bin/python"  # found, but version-gated
-    assert "3.14" in result["error"]
+    assert "3.10.14" in result["error"]
+    assert "3.11 or newer" in result["error"]
+
+
+@pytest.mark.parametrize("version", [(3, 11, 0), (3, 13, 9), (3, 14, 7)])
+def test_gateway_python_accepts_every_python_from_the_sdk_floor_up(monkeypatch, version):
+    """Current Hermes ships its gateway on CPython 3.14; band-sdk is py3-none-any
+    and its native closure has cp314 wheels, so 3.14 must not be refused."""
+    module = _load_script("gateway_python.py")
+    _stub_candidates(module, monkeypatch, shebang="/gw/.venv/bin/python")
+    monkeypatch.setattr(module, "_probe", lambda path: _usable(module, version=version))
+
+    result = module.resolve()
+
+    assert result["ok"] is True
+    assert result["version"] == ".".join(map(str, version))
+    assert result["error"] is None
 
 
 def test_gateway_python_fails_when_no_candidate_has_hermes_cli(monkeypatch):
@@ -527,6 +665,8 @@ def test_gateway_python_finds_a_dot_venv_project_layout(monkeypatch, tmp_path):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(module, "_from_pid_file", list)
     monkeypatch.setattr(module, "_from_launcher_sibling", list)
+    monkeypatch.setattr(module, "_from_launcher_wrappers", list)
+    monkeypatch.setattr(module, "_from_launcher_runtime", list)
     monkeypatch.setattr(module, "_from_launcher_shebang", lambda: None)
     monkeypatch.setattr(module, "_from_running_process", list)
     monkeypatch.setattr(module, "_probe", lambda path: _usable(module))
@@ -571,8 +711,8 @@ def test_gateway_python_warns_when_the_winner_is_a_system_interpreter(monkeypatc
 def test_gateway_python_does_not_warn_when_the_version_is_rejected(monkeypatch):
     """One problem at a time — don't stack a shape nudge on a hard rejection."""
     module = _load_script("gateway_python.py")
-    _stub_candidates(module, monkeypatch, shebang="/usr/bin/python3.14")
-    monkeypatch.setattr(module, "_probe", lambda path: _system(module, version=(3, 14, 0)))
+    _stub_candidates(module, monkeypatch, shebang="/usr/bin/python3.10")
+    monkeypatch.setattr(module, "_probe", lambda path: _system(module, version=(3, 10, 0)))
 
     result = module.resolve()
 
@@ -638,6 +778,208 @@ def test_gateway_python_print_mode_keeps_stdout_path_only(monkeypatch, capsys):
     assert rc == 0
     assert captured.out == "/usr/bin/python3\n"
     assert "warning: /usr/bin/python3 looks like a system Python" in captured.err
+
+
+_POSIX_LAUNCHERS = pytest.mark.skipif(
+    os.name == "nt", reason="the upstream installer's shell wrappers are POSIX-only"
+)
+
+
+def _make_venv(path: Path, *, with_hermes_cli: bool) -> Path:
+    """A real, pip-less venv; with ``hermes_cli`` importable only if asked.
+
+    A venv rather than the bare base interpreter on purpose: the base may well
+    have ``hermes-agent`` installed (CI does), which would make a "bare" stand-in
+    pass the probe it must fail.
+    """
+    import venv
+
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(path)
+    if with_hermes_cli:
+        _fake_hermes_cli(next(path.glob("lib/python*/site-packages")))
+    return path / "bin" / "python3"
+
+
+def _write_executable(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(0o755)
+    return path
+
+
+def _isolate_launcher(module, monkeypatch, launcher: Path) -> list[list[str]]:
+    """Point the resolver at ``launcher`` and away from this machine's gateway.
+
+    Returns the argv of every subprocess the resolver starts, so a test can say
+    what it must never ask a launcher.
+    """
+    for var in module.OVERRIDE_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(module, "_hermes_launcher", lambda: str(launcher))
+    monkeypatch.setattr(module, "_from_pid_file", list)
+    monkeypatch.setattr(module, "_from_running_process", list)
+    calls: list[list[str]] = []
+    real_run = module.subprocess.run
+
+    def spy(argv, *args, **kwargs):
+        calls.append([str(part) for part in argv])
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", spy)
+    return calls
+
+
+@_POSIX_LAUNCHERS
+def test_gateway_python_follows_the_root_install_bash_wrapper(monkeypatch, tmp_path):
+    """Hermes v2026.9.11 as root: ``/usr/local/bin/hermes`` is a bash wrapper.
+
+    It ``exec``s ``<install dir>/venv/bin/python <install dir>/hermes``, and
+    ``hermes --version`` prints ``Install directory:``, not ``Project:``. The
+    resolver used to see neither, try only the system ``python3`` beside the
+    wrapper, and fail with "none of the candidates could import
+    hermes_cli.config".
+    """
+    module = _load_script("gateway_python.py")
+    system_python = _make_venv(tmp_path / "system", with_hermes_cli=False)
+    project = tmp_path / "lib" / "hermes-agent"
+    gateway_python = _make_venv(project / "venv", with_hermes_cli=True)
+    entry = _write_executable(
+        project / "hermes",
+        f"#!{gateway_python}\n"
+        "print('Hermes Agent v0.21.2 (2026.9.11)')\n"
+        f"print('Install directory: {project}')\n",
+    )
+    _write_executable(tmp_path / "bin" / "python3", f'#!/bin/sh\nexec "{system_python}" "$@"\n')
+    launcher = _write_executable(
+        tmp_path / "bin" / "hermes",
+        "#!/usr/bin/env bash\n"
+        "unset PYTHONPATH\n"
+        "unset PYTHONHOME\n"
+        f'exec "{gateway_python}" "{entry}" "$@"\n',
+    )
+    calls = _isolate_launcher(module, monkeypatch, launcher)
+
+    result = module.resolve()
+
+    assert result["ok"] is True, result["error"]
+    assert result["python"] == str(gateway_python)
+    assert result["method"] == "launcher-wrapper"
+    assert result["is_venv"] is True
+    assert result["warnings"] == []
+    # A launcher that does not declare --run-module would read it as a chat flag.
+    assert not any("--run-module" in argv for argv in calls)
+
+
+@_POSIX_LAUNCHERS
+def test_gateway_python_reads_the_install_directory_banner(monkeypatch, tmp_path):
+    module = _load_script("gateway_python.py")
+    project = tmp_path / "hermes-agent"
+    launcher = _write_executable(
+        tmp_path / "hermes",
+        "#!/bin/sh\n"
+        "echo 'Hermes Agent v0.21.2 (2026.9.11)'\n"
+        f"echo 'Install directory: {project}'\n",
+    )
+    _isolate_launcher(module, monkeypatch, launcher)
+
+    paths = module._from_version_banner()
+
+    assert str(project / "venv" / "bin" / "python") in paths
+
+
+@_POSIX_LAUNCHERS
+def test_gateway_python_asks_the_managed_launcher_for_its_runtime(monkeypatch, tmp_path):
+    """Current Hermes (2026.9.24+), user install: two ``sh`` wrappers, then a bare
+    store interpreter that selects a managed venv at boot.
+
+    ``~/.local/bin/hermes`` ``exec``s ``<root>/.hermes/bin/hermes``, which ``exec``s
+    ``<store python> -I -c '<bootstrap>'``. No path on disk names the venv, and the
+    store interpreter cannot import ``hermes_cli`` without the bootstrap. The
+    live gateway's argv[0] is that same store interpreter, so it must not be
+    offered as the "right" answer either.
+    """
+    module = _load_script("gateway_python.py")
+    store_python = _make_venv(tmp_path / "tools" / "python-3.14.7", with_hermes_cli=False)
+    gateway_venv = tmp_path / "installs" / "k" / "environments" / "e" / "venv"
+    gateway_python = _make_venv(gateway_venv, with_hermes_cli=True)
+    site_packages = next(gateway_venv.glob("lib/python*/site-packages"))
+    root = tmp_path / ".hermes" / "hermes-agent"
+    # Mirrors the published launcher: the bootstrap puts the root and the
+    # selected environment on sys.path, then serves --run-module / the CLI.
+    bootstrap = (
+        "import os, sys\n"
+        "os.environ.pop('PYTHONPATH', None)\n"
+        f"sys.path.insert(0, {str(root)!r})\n"
+        f"sys.path.insert(1, {str(site_packages)!r})\n"
+        "if sys.argv[1:2] == ['--run-module']:\n"
+        "    import runpy\n"
+        "    module = sys.argv.pop(2)\n"
+        "    del sys.argv[1]\n"
+        "    runpy.run_module(module, run_name='__main__', alter_sys=True)\n"
+        "    sys.exit(0)\n"
+        "print('Hermes Agent v0.21.5 (2026.9.24)')\n"
+        f"print('Install directory: {root}')\n"
+    )
+    inner = _write_executable(
+        root / ".hermes" / "bin" / "hermes",
+        f'#!/bin/sh\nexec {store_python} -I -c {shlex.quote(bootstrap)} "$@"\n',
+    )
+    launcher = _write_executable(
+        tmp_path / ".local" / "bin" / "hermes", f'#!/bin/sh\nexec {inner} "$@"\n'
+    )
+    _isolate_launcher(module, monkeypatch, launcher)
+    monkeypatch.setattr(module, "_from_pid_file", lambda: [str(store_python)])
+
+    result = module.resolve()
+
+    assert result["ok"] is True, result["error"]
+    assert result["python"] == str(gateway_python)
+    assert result["method"] == "launcher-runtime"
+    assert result["is_venv"] is True
+    assert result["warnings"] == []
+    rejected = {entry["python"]: entry for entry in result["candidates"]}
+    assert rejected[str(store_python)]["has_hermes_cli"] is False
+
+
+def test_gateway_python_keeps_a_venv_that_links_to_an_earlier_candidate(monkeypatch, tmp_path):
+    """A venv's ``bin/python`` is a symlink to its base interpreter.
+
+    De-duplicating by the resolved file made the venv a "duplicate" of the bare
+    base Python tried before it, so the one interpreter that works was dropped.
+    """
+    module = _load_script("gateway_python.py")
+    base = tmp_path / "store" / "bin" / "python3"
+    base.parent.mkdir(parents=True)
+    base.touch()
+    venv_python = tmp_path / "venv" / "bin" / "python3"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base)
+    _stub_candidates(module, monkeypatch, pid_file=[str(base)], runtime=[str(venv_python)])
+    probes = {str(base): _unusable(module), str(venv_python): _usable(module)}
+    monkeypatch.setattr(module, "_probe", lambda path: probes.get(path, _unusable(module)))
+
+    result = module.resolve()
+
+    assert result["python"] == str(venv_python)
+    assert result["method"] == "launcher-runtime"
+    assert result["warnings"] == []  # the unusable process candidate is no advice
+
+
+@pytest.mark.parametrize(
+    ("text", "target"),
+    [
+        ('#!/bin/sh\nexec "/opt/h/venv/bin/python" "/opt/h/hermes" "$@"\n', "/opt/h/venv/bin/python"),
+        ("#!/bin/sh\nexec /opt/h/.hermes/bin/hermes \"$@\"\n", "/opt/h/.hermes/bin/hermes"),
+        ("#!/bin/sh\nexec -a hermes /opt/py -I -c 'import sys\nprint(1)\n' \"$@\"\n", "/opt/py"),
+        ('#!/bin/sh\nPY=/opt/py\nexec "$PY" "$@"\n', None),  # not guessed from a variable
+        ("#!/bin/sh\nexec python3 -m hermes_cli.main\n", None),  # not a path
+        ("#!/bin/sh\necho no exec here\n", None),
+    ],
+)
+def test_gateway_python_exec_target(text, target):
+    module = _load_script("gateway_python.py")
+
+    assert module._exec_target(text) == target
 
 
 @pytest.mark.parametrize(

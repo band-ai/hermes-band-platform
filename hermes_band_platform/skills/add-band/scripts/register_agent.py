@@ -5,8 +5,10 @@ Temporary helper until ``band-sdk`` publishes ``band.cli.register_agent``. The
 Band *user* API key is read from ``BAND_API_KEY`` (the name the Band web app's
 onboarding snippet exports) or ``BAND_USER_API_KEY``, and is never printed. Only
 the returned agent-scoped ``BAND_AGENT_ID`` + ``BAND_API_KEY`` are persisted to
-the gateway ``.env`` through Hermes's env writer — the user key in the shell env
-is the caller's to ``unset`` before any agent/LLM handoff (the bootstrap does).
+the gateway ``.env`` through Hermes's env writer, plus ``BAND_BASE_URL`` when
+registration ran against a non-default host, so the gateway connects to the host
+that minted the agent. The user key in the shell env is the caller's to
+``unset`` before any agent/LLM handoff (the bootstrap does).
 
 If ``BAND_AGENT_ID`` is already set, registration short-circuits (pass
 ``--force`` to re-register). This keeps a re-run from minting a second agent and,
@@ -28,6 +30,8 @@ _DEFAULT_REGISTRATION_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/126.0.0.0 Safari/537.36"
 )
+
+_DEFAULT_BASE_URL = "https://app.band.ai"
 
 
 def _registration_headers(user_key: str) -> dict[str, str]:
@@ -77,7 +81,12 @@ def _extract_credentials(data: dict[str, Any]) -> tuple[str, str]:
     return str(agent_id).strip(), str(api_key).strip()
 
 
-def _save_credentials(agent_id: str, api_key: str) -> None:
+def _save_credentials(agent_id: str, api_key: str, base_url: str) -> list[str]:
+    """Persist the agent's credentials; return the names written.
+
+    A non-default ``base_url`` is saved too: the agent exists only on the host
+    that registered it, and the adapter falls back to app.band.ai without it.
+    """
     try:
         from hermes_cli.config import save_env_value
     except Exception as exc:  # pragma: no cover - environment failure path
@@ -88,6 +97,11 @@ def _save_credentials(agent_id: str, api_key: str) -> None:
 
     save_env_value("BAND_AGENT_ID", agent_id)
     save_env_value("BAND_API_KEY", api_key)
+    saved = ["BAND_AGENT_ID", "BAND_API_KEY"]
+    if base_url != _DEFAULT_BASE_URL:
+        save_env_value("BAND_BASE_URL", base_url)
+        saved.append("BAND_BASE_URL")
+    return saved
 
 
 def register_agent(force: bool = False) -> dict[str, Any]:
@@ -113,7 +127,7 @@ def register_agent(force: bool = False) -> dict[str, Any]:
     if not user_key:
         raise RuntimeError("a Band API key is required (set BAND_API_KEY or BAND_USER_API_KEY)")
 
-    base_url = os.environ.get("BAND_BASE_URL", "https://app.band.ai").rstrip("/")
+    base_url = os.environ.get("BAND_BASE_URL", "").strip().rstrip("/") or _DEFAULT_BASE_URL
     name = os.environ.get("BAND_AGENT_NAME", "Hermes Agent")
     description = os.environ.get("BAND_AGENT_DESCRIPTION", "Hermes agent on Band")
     body = json.dumps({"agent": {"name": name, "description": description}}).encode()
@@ -150,11 +164,11 @@ def register_agent(force: bool = False) -> dict[str, Any]:
     if not agent_id or not api_key:
         raise RuntimeError("Band registration response missing agent id/key")
 
-    _save_credentials(agent_id, api_key)
+    saved = _save_credentials(agent_id, api_key, base_url)
     return {
         "success": True,
         "agent_id": agent_id,
-        "saved": ["BAND_AGENT_ID", "BAND_API_KEY"],
+        "saved": saved,
     }
 
 

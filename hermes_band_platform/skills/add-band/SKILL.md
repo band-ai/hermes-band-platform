@@ -191,7 +191,8 @@ re-installs or re-registers what's already in place.
    - Quick alternative for an immediate unblock without editing config: `hermes config set BAND_ALLOW_ALL true` (broader — trusts every sender Band delivers; the `allowlist` policy is the precise equivalent of Band's ACL).
 
 7. Restart the gateway.
-   - Use the user's normal Hermes gateway restart command.
+   - Use the user's normal Hermes gateway restart command (`hermes gateway restart` for the installed service).
+   - First-time setup has no service yet (on systemd, `start` / `restart` stop with "Gateway service is not installed"): run `hermes gateway install`, then `hermes gateway start`, or `hermes gateway run` in the foreground (containers, WSL). `hermes gateway setup` is the messaging-platform wizard, not the service installer.
    - On first connect the adapter resolves the owner, creates the Hermes Agent Hub room, writes `BAND_HUB_ROOM`, and wires the hub as the home channel.
 
 8. Verify the gateway with `scripts/verify_gateway.py`.

@@ -2797,7 +2797,7 @@ class TestHubBootstrap:
         assert adapter.config.extra.get("hub_room") == "hub-new-1"
         assert adapter.config.home_channel is not None
         assert adapter.config.home_channel.chat_id == "hub-new-1"
-        assert adapter.config.home_channel.name == "Hermes Hub"
+        assert adapter.config.home_channel.name == "Hermes Agent Hub"
         # Home is persisted (not just in-memory) so every config reader sees it.
         assert adapter._test_saved_env.get("BAND_HOME_ROOM") == "hub-new-1"
 
@@ -3187,7 +3187,7 @@ class TestEnvEnablementHubSeeds:
         monkeypatch.delenv("BAND_HOME_ROOM", raising=False)
         result = _env_enablement()
         assert result["hub_room"] == "hub-1"
-        assert result["home_channel"] == {"chat_id": "hub-1", "name": "Hermes Hub"}
+        assert result["home_channel"] == {"chat_id": "hub-1", "name": "Hermes Agent Hub"}
 
     def test_home_room_overrides_hub_seed(self, monkeypatch):
         monkeypatch.setenv("BAND_HUB_ROOM", "hub-1")

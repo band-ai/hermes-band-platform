@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify Band gateway connection and Hermes Hub readiness."""
+"""Verify Band gateway connection and Hermes Agent Hub readiness."""
 
 from __future__ import annotations
 

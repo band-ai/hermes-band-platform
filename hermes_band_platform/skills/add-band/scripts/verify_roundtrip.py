@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove the agent can actually talk to its owner in the Hermes Hub.
+"""Prove the agent can actually talk to its owner in the Hermes Agent Hub.
 
 ``verify_gateway.py`` confirms the WebSocket connected and the hub was created,
 but **connected is not working**: hub bootstrap runs in a ``try/except`` that

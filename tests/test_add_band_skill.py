@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -382,18 +383,29 @@ def test_register_agent_headers_allow_user_agent_override(monkeypatch):
 
 
 def _stub_candidates(
-    module, monkeypatch, banner=(), sibling=(), shebang=None, procs=(), pid_file=()
+    module,
+    monkeypatch,
+    banner=(),
+    sibling=(),
+    shebang=None,
+    procs=(),
+    pid_file=(),
+    wrappers=(),
+    runtime=(),
 ):
     """Pin every candidate source so a test controls the whole chain.
 
     ``_from_pid_file`` included: it reads ``$HERMES_HOME/gateway.pid``, so leaving
     it live would make any ordering assertion depend on whether the developer
-    running the suite happens to have a gateway up.
+    running the suite happens to have a gateway up. The launcher sources read and
+    run the real ``hermes`` on PATH, so they are pinned for the same reason.
     """
     for var in module.OVERRIDE_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(module, "_from_pid_file", lambda: list(pid_file))
     monkeypatch.setattr(module, "_from_launcher_sibling", lambda: list(sibling))
+    monkeypatch.setattr(module, "_from_launcher_wrappers", lambda: list(wrappers))
+    monkeypatch.setattr(module, "_from_launcher_runtime", lambda: list(runtime))
     monkeypatch.setattr(module, "_from_version_banner", lambda: list(banner))
     monkeypatch.setattr(module, "_from_launcher_shebang", lambda: shebang)
     monkeypatch.setattr(module, "_from_running_process", lambda: list(procs))
@@ -543,6 +555,8 @@ def test_gateway_python_finds_a_dot_venv_project_layout(monkeypatch, tmp_path):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(module, "_from_pid_file", list)
     monkeypatch.setattr(module, "_from_launcher_sibling", list)
+    monkeypatch.setattr(module, "_from_launcher_wrappers", list)
+    monkeypatch.setattr(module, "_from_launcher_runtime", list)
     monkeypatch.setattr(module, "_from_launcher_shebang", lambda: None)
     monkeypatch.setattr(module, "_from_running_process", list)
     monkeypatch.setattr(module, "_probe", lambda path: _usable(module))
@@ -654,6 +668,208 @@ def test_gateway_python_print_mode_keeps_stdout_path_only(monkeypatch, capsys):
     assert rc == 0
     assert captured.out == "/usr/bin/python3\n"
     assert "warning: /usr/bin/python3 looks like a system Python" in captured.err
+
+
+_POSIX_LAUNCHERS = pytest.mark.skipif(
+    os.name == "nt", reason="the upstream installer's shell wrappers are POSIX-only"
+)
+
+
+def _make_venv(path: Path, *, with_hermes_cli: bool) -> Path:
+    """A real, pip-less venv; with ``hermes_cli`` importable only if asked.
+
+    A venv rather than the bare base interpreter on purpose: the base may well
+    have ``hermes-agent`` installed (CI does), which would make a "bare" stand-in
+    pass the probe it must fail.
+    """
+    import venv
+
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(path)
+    if with_hermes_cli:
+        _fake_hermes_cli(next(path.glob("lib/python*/site-packages")))
+    return path / "bin" / "python3"
+
+
+def _write_executable(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    path.chmod(0o755)
+    return path
+
+
+def _isolate_launcher(module, monkeypatch, launcher: Path) -> list[list[str]]:
+    """Point the resolver at ``launcher`` and away from this machine's gateway.
+
+    Returns the argv of every subprocess the resolver starts, so a test can say
+    what it must never ask a launcher.
+    """
+    for var in module.OVERRIDE_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(module, "_hermes_launcher", lambda: str(launcher))
+    monkeypatch.setattr(module, "_from_pid_file", list)
+    monkeypatch.setattr(module, "_from_running_process", list)
+    calls: list[list[str]] = []
+    real_run = module.subprocess.run
+
+    def spy(argv, *args, **kwargs):
+        calls.append([str(part) for part in argv])
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", spy)
+    return calls
+
+
+@_POSIX_LAUNCHERS
+def test_gateway_python_follows_the_root_install_bash_wrapper(monkeypatch, tmp_path):
+    """Hermes v2026.9.11 as root: ``/usr/local/bin/hermes`` is a bash wrapper.
+
+    It ``exec``s ``<install dir>/venv/bin/python <install dir>/hermes``, and
+    ``hermes --version`` prints ``Install directory:``, not ``Project:``. The
+    resolver used to see neither, try only the system ``python3`` beside the
+    wrapper, and fail with "none of the candidates could import
+    hermes_cli.config".
+    """
+    module = _load_script("gateway_python.py")
+    system_python = _make_venv(tmp_path / "system", with_hermes_cli=False)
+    project = tmp_path / "lib" / "hermes-agent"
+    gateway_python = _make_venv(project / "venv", with_hermes_cli=True)
+    entry = _write_executable(
+        project / "hermes",
+        f"#!{gateway_python}\n"
+        "print('Hermes Agent v0.21.2 (2026.9.11)')\n"
+        f"print('Install directory: {project}')\n",
+    )
+    _write_executable(tmp_path / "bin" / "python3", f'#!/bin/sh\nexec "{system_python}" "$@"\n')
+    launcher = _write_executable(
+        tmp_path / "bin" / "hermes",
+        "#!/usr/bin/env bash\n"
+        "unset PYTHONPATH\n"
+        "unset PYTHONHOME\n"
+        f'exec "{gateway_python}" "{entry}" "$@"\n',
+    )
+    calls = _isolate_launcher(module, monkeypatch, launcher)
+
+    result = module.resolve()
+
+    assert result["ok"] is True, result["error"]
+    assert result["python"] == str(gateway_python)
+    assert result["method"] == "launcher-wrapper"
+    assert result["is_venv"] is True
+    assert result["warnings"] == []
+    # A launcher that does not declare --run-module would read it as a chat flag.
+    assert not any("--run-module" in argv for argv in calls)
+
+
+@_POSIX_LAUNCHERS
+def test_gateway_python_reads_the_install_directory_banner(monkeypatch, tmp_path):
+    module = _load_script("gateway_python.py")
+    project = tmp_path / "hermes-agent"
+    launcher = _write_executable(
+        tmp_path / "hermes",
+        "#!/bin/sh\n"
+        "echo 'Hermes Agent v0.21.2 (2026.9.11)'\n"
+        f"echo 'Install directory: {project}'\n",
+    )
+    _isolate_launcher(module, monkeypatch, launcher)
+
+    paths = module._from_version_banner()
+
+    assert str(project / "venv" / "bin" / "python") in paths
+
+
+@_POSIX_LAUNCHERS
+def test_gateway_python_asks_the_managed_launcher_for_its_runtime(monkeypatch, tmp_path):
+    """Current Hermes (2026.9.24+), user install: two ``sh`` wrappers, then a bare
+    store interpreter that selects a managed venv at boot.
+
+    ``~/.local/bin/hermes`` ``exec``s ``<root>/.hermes/bin/hermes``, which ``exec``s
+    ``<store python> -I -c '<bootstrap>'``. No path on disk names the venv, and the
+    store interpreter cannot import ``hermes_cli`` without the bootstrap. The
+    live gateway's argv[0] is that same store interpreter, so it must not be
+    offered as the "right" answer either.
+    """
+    module = _load_script("gateway_python.py")
+    store_python = _make_venv(tmp_path / "tools" / "python-3.14.7", with_hermes_cli=False)
+    gateway_venv = tmp_path / "installs" / "k" / "environments" / "e" / "venv"
+    gateway_python = _make_venv(gateway_venv, with_hermes_cli=True)
+    site_packages = next(gateway_venv.glob("lib/python*/site-packages"))
+    root = tmp_path / ".hermes" / "hermes-agent"
+    # Mirrors the published launcher: the bootstrap puts the root and the
+    # selected environment on sys.path, then serves --run-module / the CLI.
+    bootstrap = (
+        "import os, sys\n"
+        "os.environ.pop('PYTHONPATH', None)\n"
+        f"sys.path.insert(0, {str(root)!r})\n"
+        f"sys.path.insert(1, {str(site_packages)!r})\n"
+        "if sys.argv[1:2] == ['--run-module']:\n"
+        "    import runpy\n"
+        "    module = sys.argv.pop(2)\n"
+        "    del sys.argv[1]\n"
+        "    runpy.run_module(module, run_name='__main__', alter_sys=True)\n"
+        "    sys.exit(0)\n"
+        "print('Hermes Agent v0.21.5 (2026.9.24)')\n"
+        f"print('Install directory: {root}')\n"
+    )
+    inner = _write_executable(
+        root / ".hermes" / "bin" / "hermes",
+        f'#!/bin/sh\nexec {store_python} -I -c {shlex.quote(bootstrap)} "$@"\n',
+    )
+    launcher = _write_executable(
+        tmp_path / ".local" / "bin" / "hermes", f'#!/bin/sh\nexec {inner} "$@"\n'
+    )
+    _isolate_launcher(module, monkeypatch, launcher)
+    monkeypatch.setattr(module, "_from_pid_file", lambda: [str(store_python)])
+
+    result = module.resolve()
+
+    assert result["ok"] is True, result["error"]
+    assert result["python"] == str(gateway_python)
+    assert result["method"] == "launcher-runtime"
+    assert result["is_venv"] is True
+    assert result["warnings"] == []
+    rejected = {entry["python"]: entry for entry in result["candidates"]}
+    assert rejected[str(store_python)]["has_hermes_cli"] is False
+
+
+def test_gateway_python_keeps_a_venv_that_links_to_an_earlier_candidate(monkeypatch, tmp_path):
+    """A venv's ``bin/python`` is a symlink to its base interpreter.
+
+    De-duplicating by the resolved file made the venv a "duplicate" of the bare
+    base Python tried before it, so the one interpreter that works was dropped.
+    """
+    module = _load_script("gateway_python.py")
+    base = tmp_path / "store" / "bin" / "python3"
+    base.parent.mkdir(parents=True)
+    base.touch()
+    venv_python = tmp_path / "venv" / "bin" / "python3"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base)
+    _stub_candidates(module, monkeypatch, pid_file=[str(base)], runtime=[str(venv_python)])
+    probes = {str(base): _unusable(module), str(venv_python): _usable(module)}
+    monkeypatch.setattr(module, "_probe", lambda path: probes.get(path, _unusable(module)))
+
+    result = module.resolve()
+
+    assert result["python"] == str(venv_python)
+    assert result["method"] == "launcher-runtime"
+    assert result["warnings"] == []  # the unusable process candidate is no advice
+
+
+@pytest.mark.parametrize(
+    ("text", "target"),
+    [
+        ('#!/bin/sh\nexec "/opt/h/venv/bin/python" "/opt/h/hermes" "$@"\n', "/opt/h/venv/bin/python"),
+        ("#!/bin/sh\nexec /opt/h/.hermes/bin/hermes \"$@\"\n", "/opt/h/.hermes/bin/hermes"),
+        ("#!/bin/sh\nexec -a hermes /opt/py -I -c 'import sys\nprint(1)\n' \"$@\"\n", "/opt/py"),
+        ('#!/bin/sh\nPY=/opt/py\nexec "$PY" "$@"\n', None),  # not guessed from a variable
+        ("#!/bin/sh\nexec python3 -m hermes_cli.main\n", None),  # not a path
+        ("#!/bin/sh\necho no exec here\n", None),
+    ],
+)
+def test_gateway_python_exec_target(text, target):
+    module = _load_script("gateway_python.py")
+
+    assert module._exec_target(text) == target
 
 
 @pytest.mark.parametrize(

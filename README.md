@@ -156,17 +156,19 @@ is safe (idempotent). Env knobs: `HERMES_HOME`, `HERMES_PY` (interpreter overrid
 </details>
 
 Everything below installs into `$HERMES_PY`, **the interpreter that runs the gateway** — install
-anywhere else and the plugin stays invisible to Hermes. Derive it once from the `hermes` console
-script, whose shebang points at its own interpreter (don't guess `<project>/venv/bin/python`: the
-directory is `.venv` as often as `venv`, and FHS installs have neither):
+anywhere else and the plugin stays invisible to Hermes. Don't derive it from the `hermes` launcher
+by hand: the upstream installer puts shell wrappers in front of the interpreter (a root install's
+`/usr/local/bin/hermes` is a bash script, and current user installs run a store Python that
+activates a managed venv at boot), so neither the launcher's shebang nor
+`<project>/venv/bin/python` is reliable. Use the plugin's resolver, a single stdlib-only script that
+follows those launchers and validates the interpreter it prints:
 
 ```bash
-HERMES_PY="${HERMES_PY:-$(sed -n '1s/^#!\([^ ]*\).*/\1/p' "$(command -v hermes)")}"
-case "$HERMES_PY" in */python*) ;; *) echo "set HERMES_PY to the Python that runs hermes" >&2 ;; esac
+HERMES_PY="${HERMES_PY:-$(curl -fsSL https://raw.githubusercontent.com/band-ai/hermes-band-platform/main/hermes_band_platform/skills/add-band/scripts/gateway_python.py | python3 - --print)}"
 ```
 
-Once the plugin is installed, `scripts/gateway_python.py --print` does this properly — it
-validates the interpreter instead of deriving it, and the setup skill uses it for every step.
+From a checkout, run `hermes_band_platform/skills/add-band/scripts/gateway_python.py` directly
+(without `--print` for a JSON report of every candidate it tried).
 
 <details>
 <summary><b>Git directory install</b> — <code>hermes plugins install</code></summary>

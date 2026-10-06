@@ -270,6 +270,21 @@ def _install_band_mock() -> MagicMock:
 _install_band_mock()
 
 
+@pytest.fixture
+def hermetic_hermes_home(tmp_path, monkeypatch):
+    """Point ``HERMES_HOME`` at a temporary directory for this test.
+
+    The host's ``SessionStore`` constructor opens the default
+    ``$HERMES_HOME/state.db`` before a test can swap in its own ``SessionDB``, so
+    building a real store otherwise opens the developer's (or CI runner's)
+    ``~/.hermes/state.db``. Current Hermes refuses that outright.
+    """
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _register_band_platform():
     """Register the ``band`` platform in the host registry before tests run.

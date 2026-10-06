@@ -189,6 +189,25 @@ def test_verify_install_accepts_credentials_from_the_platform_config(monkeypatch
     assert checks["band_api_key_present"] is True
 
 
+def test_verify_install_output_never_contains_credential_values(monkeypatch, tmp_path, capsys):
+    """The printed report carries presence flags only, never the credentials."""
+    module = _load_script("verify_install.py")
+    monkeypatch.setattr(module.importlib.util, "find_spec", lambda name: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
+    monkeypatch.delenv("BAND_API_KEY", raising=False)
+    agent_id = "agent-id-7f3c9e1d"
+    agent_key = "band_a_fake_secret_4b8e2a6c"
+    (tmp_path / ".env").write_text(f"BAND_AGENT_ID={agent_id}\nBAND_API_KEY='{agent_key}'\n")
+
+    module.main()
+    output = capsys.readouterr().out
+
+    assert json.loads(output)["checks"]["band_api_key_present"] is True
+    assert agent_key not in output
+    assert agent_id not in output
+
+
 def _install_fake_hermes_config(monkeypatch, store: dict):
     """Inject an in-memory ``hermes_cli.config`` so scripts run in any interpreter."""
     import sys

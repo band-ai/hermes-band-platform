@@ -79,20 +79,31 @@ def _extract_credentials(data: dict[str, Any]) -> tuple[str, str]:
 
 
 def _resolve_env_writer() -> Callable[[str, str], Any]:
-    """Return Hermes's ``save_env_value``, or raise naming the resolver.
+    """Return Hermes's ``save_env_value``, or raise if it cannot persist.
 
     Kept separate from :func:`_save_credentials` so registration can prove the
     interpreter *before* the POST — see the pre-flight call in
     :func:`register_agent`.
+
+    A managed install (``HERMES_MANAGED`` or a ``.managed`` marker in
+    ``HERMES_HOME``) imports fine, but its ``save_env_value`` prints to stderr
+    and returns without writing, so the one-time agent key would be lost.
     """
     try:
-        from hermes_cli.config import save_env_value
+        from hermes_cli.config import format_managed_message, is_managed, save_env_value
     except Exception as exc:
         raise RuntimeError(
             "Could not import hermes_cli.config.save_env_value from this Python "
             f"({sys.executable}). Run this helper with the Hermes gateway Python: "
             "scripts/gateway_python.py --print resolves it."
         ) from exc
+
+    if is_managed():
+        raise RuntimeError(
+            "This Hermes install is managed, so it would not write "
+            "BAND_AGENT_ID/BAND_API_KEY to .env; no agent was registered.\n"
+            f"{format_managed_message('save Band credentials')}"
+        )
 
     return save_env_value
 

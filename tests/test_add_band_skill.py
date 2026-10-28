@@ -435,6 +435,35 @@ def test_register_agent_env_writer_error_names_the_resolver(monkeypatch):
         module._resolve_env_writer()
 
 
+def test_register_agent_refuses_managed_install_before_posting(monkeypatch):
+    """A managed Hermes drops ``save_env_value`` writes, losing the one-time key."""
+    module = _load_script("register_agent.py")
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
+    monkeypatch.setenv("BAND_USER_API_KEY", "user-key")
+
+    saved: list[tuple[str, str]] = []
+    monkeypatch.setitem(sys.modules, "hermes_cli", SimpleNamespace())
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        SimpleNamespace(
+            save_env_value=lambda k, v: saved.append((k, v)),
+            is_managed=lambda: True,
+            format_managed_message=lambda action: f"Cannot {action}: managed by NixOS.",
+        ),
+    )
+
+    def _fail(*a, **k):
+        raise AssertionError("an agent was registered on a managed install")
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", _fail)
+
+    with pytest.raises(RuntimeError, match="managed by NixOS"):
+        module.register_agent()
+
+    assert saved == []
+
+
 def test_register_agent_headers_use_browser_like_fingerprint(monkeypatch):
     module = _load_script("register_agent.py")
     monkeypatch.delenv("BAND_USER_AGENT", raising=False)

@@ -313,31 +313,13 @@ def test_register_agent_reads_user_key_from_band_api_key(monkeypatch):
 
     captured = {}
     monkeypatch.setattr(module, "_registration_headers", lambda k: captured.update(key=k) or {})
-    monkeypatch.setattr(
-        module, "_save_credentials", lambda agent_id, api_key: captured.update(saved=(agent_id, api_key))
-    )
-    # Stub the pre-flight so this test asserts registration, not whether the
-    # host happens to be installed in the environment running the suite.
-    monkeypatch.setattr(module, "_resolve_env_writer", lambda: None)
-
-    class _Resp:
-        status = 200
-
-        def read(self):
-            return b'{"agent": {"id": "a1"}, "credentials": {"api_key": "agent-key"}}'
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **k: _Resp())
+    saved = _stub_hermes(monkeypatch)
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **k: _RegistrationResponse())
 
     result = module.register_agent()
 
     assert captured["key"] == "user-key-from-snippet"
-    assert captured["saved"] == ("a1", "agent-key")
+    assert saved == [("BAND_AGENT_ID", "a1"), ("BAND_API_KEY", "agent-key")]
     assert result["success"] is True
 
 
@@ -403,6 +385,21 @@ def _refuse_post(*a, **k):
     raise AssertionError("an agent was registered though its key could not be saved")
 
 
+class _RegistrationResponse:
+    """A successful Band registration response."""
+
+    status = 200
+
+    def read(self):
+        return b'{"agent": {"id": "a1"}, "credentials": {"api_key": "agent-key"}}'
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 def test_register_agent_checks_the_env_writer_before_posting(monkeypatch):
     """A wrong interpreter must fail before Band mints anything.
 
@@ -463,20 +460,7 @@ def test_register_agent_saves_credentials_when_hermes_can_write(monkeypatch, her
     monkeypatch.delenv("BAND_AGENT_ID", raising=False)
     monkeypatch.setenv("BAND_USER_API_KEY", "user-key")
     saved = _stub_hermes(monkeypatch, **hermes)
-
-    class _Resp:
-        status = 200
-
-        def read(self):
-            return b'{"agent": {"id": "a1"}, "credentials": {"api_key": "agent-key"}}'
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **k: _Resp())
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **k: _RegistrationResponse())
 
     result = module.register_agent()
 

@@ -78,6 +78,10 @@ def _extract_credentials(data: dict[str, Any]) -> tuple[str, str]:
     return str(agent_id).strip(), str(api_key).strip()
 
 
+# Every key registration persists; checked up front against managed scope.
+_CREDENTIAL_KEYS = ("BAND_AGENT_ID", "BAND_API_KEY")
+
+
 def _resolve_env_writer() -> Callable[[str, str], Any]:
     """Return Hermes's ``save_env_value``, or raise if it cannot persist.
 
@@ -85,11 +89,16 @@ def _resolve_env_writer() -> Callable[[str, str], Any]:
     interpreter *before* the POST — see the pre-flight call in
     :func:`register_agent`.
 
-    A managed install (``HERMES_MANAGED`` or a ``.managed`` marker in
-    ``HERMES_HOME``) imports fine, but its ``save_env_value`` prints to stderr
-    and returns without writing, so the one-time agent key would be lost.
+    Two Hermes guards make ``save_env_value`` print to stderr and return
+    without writing, so the one-time agent key would be lost:
+
+    * a managed install (``HERMES_MANAGED`` or a ``.managed`` marker in
+      ``HERMES_HOME``) refuses every key;
+    * an administrator's managed scope (``HERMES_MANAGED_DIR`` or
+      ``/etc/hermes``) refuses the keys its ``.env`` pins.
     """
     try:
+        from hermes_cli import managed_scope
         from hermes_cli.config import format_managed_message, is_managed, save_env_value
     except Exception as exc:
         raise RuntimeError(
@@ -103,6 +112,16 @@ def _resolve_env_writer() -> Callable[[str, str], Any]:
             "This Hermes install is managed, so it would not write "
             "BAND_AGENT_ID/BAND_API_KEY to .env; no agent was registered.\n"
             f"{format_managed_message('save Band credentials')}"
+        )
+
+    pinned = [key for key in _CREDENTIAL_KEYS if managed_scope.is_env_managed(key)]
+    if pinned:
+        managed_dir = managed_scope.get_managed_dir()
+        source = managed_dir / ".env" if managed_dir else "the managed scope"
+        raise RuntimeError(
+            f"{', '.join(pinned)} {'is' if len(pinned) == 1 else 'are'} managed by "
+            f"your administrator ({source}), so Hermes would not write "
+            f"{'it' if len(pinned) == 1 else 'them'} to .env; no agent was registered."
         )
 
     return save_env_value

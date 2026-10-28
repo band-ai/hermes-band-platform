@@ -435,30 +435,45 @@ def test_register_agent_env_writer_error_names_the_resolver(monkeypatch):
         module._resolve_env_writer()
 
 
-def test_register_agent_refuses_managed_install_before_posting(monkeypatch):
-    """A managed Hermes drops ``save_env_value`` writes, losing the one-time key."""
+@pytest.mark.parametrize(
+    ("managed", "pinned", "message"),
+    [
+        (True, set(), "managed by NixOS"),
+        (False, {"BAND_AGENT_ID"}, r"BAND_AGENT_ID is managed by your administrator \(/etc/hermes/\.env\)"),
+        (False, {"BAND_API_KEY"}, r"BAND_API_KEY is managed by your administrator"),
+        (False, {"BAND_AGENT_ID", "BAND_API_KEY"}, "BAND_AGENT_ID, BAND_API_KEY are managed"),
+    ],
+)
+def test_register_agent_refuses_managed_writes_before_posting(monkeypatch, managed, pinned, message):
+    """Hermes drops ``save_env_value`` writes when the install, or an admin
+    scope pinning either key, is managed; the one-time key would be lost."""
     module = _load_script("register_agent.py")
     monkeypatch.delenv("BAND_AGENT_ID", raising=False)
     monkeypatch.setenv("BAND_USER_API_KEY", "user-key")
 
     saved: list[tuple[str, str]] = []
-    monkeypatch.setitem(sys.modules, "hermes_cli", SimpleNamespace())
+    managed_scope = SimpleNamespace(
+        is_env_managed=lambda key: key in pinned,
+        get_managed_dir=lambda: Path("/etc/hermes"),
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli", SimpleNamespace(managed_scope=managed_scope))
+    monkeypatch.setitem(sys.modules, "hermes_cli.managed_scope", managed_scope)
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.config",
         SimpleNamespace(
             save_env_value=lambda k, v: saved.append((k, v)),
-            is_managed=lambda: True,
+            is_managed=lambda: managed,
             format_managed_message=lambda action: f"Cannot {action}: managed by NixOS.",
         ),
     )
 
     def _fail(*a, **k):
-        raise AssertionError("an agent was registered on a managed install")
+        raise AssertionError("an agent was registered though its key could not be saved")
 
     monkeypatch.setattr(module.urllib.request, "urlopen", _fail)
 
-    with pytest.raises(RuntimeError, match="managed by NixOS"):
+    with pytest.raises(RuntimeError, match=message):
         module.register_agent()
 
     assert saved == []

@@ -313,28 +313,13 @@ def test_register_agent_reads_user_key_from_band_api_key(monkeypatch):
 
     captured = {}
     monkeypatch.setattr(module, "_registration_headers", lambda k: captured.update(key=k) or {})
-    monkeypatch.setattr(
-        module, "_save_credentials", lambda agent_id, api_key: captured.update(saved=(agent_id, api_key))
-    )
-
-    class _Resp:
-        status = 200
-
-        def read(self):
-            return b'{"agent": {"id": "a1"}, "credentials": {"api_key": "agent-key"}}'
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **k: _Resp())
+    saved = _stub_hermes(monkeypatch)
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **k: _RegistrationResponse())
 
     result = module.register_agent()
 
     assert captured["key"] == "user-key-from-snippet"
-    assert captured["saved"] == ("a1", "agent-key")
+    assert saved == [("BAND_AGENT_ID", "a1"), ("BAND_API_KEY", "agent-key")]
     assert result["success"] is True
 
 
@@ -358,6 +343,167 @@ def test_register_agent_short_circuits_when_already_registered(monkeypatch):
         "agent_id": "existing-agent",
         "saved": [],
     }
+
+
+def _stub_hermes(
+    monkeypatch,
+    *,
+    writer: bool = True,
+    managed_helpers: bool = True,
+    managed: bool = False,
+    scope: bool = True,
+    pinned: frozenset[str] = frozenset(),
+    managed_dir: Path | None = Path("/etc/hermes"),
+) -> list[tuple[str, str]]:
+    """Install a fake ``hermes_cli`` and return the list ``save_env_value`` fills.
+
+    Stubbed rather than assumed absent, so tests hold in an environment that has
+    hermes-agent installed. Each flag removes one piece, so a test can break
+    exactly the seam it pins.
+    """
+    saved: list[tuple[str, str]] = []
+    config = SimpleNamespace()
+    if writer:
+        config.save_env_value = lambda key, value: saved.append((key, value))
+    if managed_helpers:
+        config.is_managed = lambda: managed
+        config.format_managed_message = lambda action: f"Cannot {action}: managed by NixOS."
+    package = SimpleNamespace(config=config)
+    if scope:
+        package.managed_scope = SimpleNamespace(
+            is_env_managed=lambda key: key in pinned,
+            get_managed_dir=lambda: managed_dir,
+        )
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+    # ``None`` makes the submodule import raise, as on Hermes before 0.17.
+    monkeypatch.setitem(sys.modules, "hermes_cli.managed_scope", getattr(package, "managed_scope", None))
+    return saved
+
+
+def _refuse_post(*a, **k):
+    raise AssertionError("an agent was registered though its key could not be saved")
+
+
+class _RegistrationResponse:
+    """A successful Band registration response."""
+
+    status = 200
+
+    def read(self):
+        return b'{"agent": {"id": "a1"}, "credentials": {"api_key": "agent-key"}}'
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_register_agent_checks_the_env_writer_before_posting(monkeypatch):
+    """A wrong interpreter must fail before Band mints anything.
+
+    Band returns the agent key only in the creation response. Checked after the
+    POST, an unusable interpreter leaves a registered agent whose key was
+    discarded — unrecoverable, and the retry collides on the taken name.
+    """
+    module = _load_script("register_agent.py")
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
+    monkeypatch.setenv("BAND_USER_API_KEY", "user-key")
+    _stub_hermes(monkeypatch, writer=False)
+    monkeypatch.setattr(module.urllib.request, "urlopen", _refuse_post)
+
+    with pytest.raises(RuntimeError, match="save_env_value"):
+        module.register_agent()
+
+
+def test_register_agent_preflight_runs_after_the_user_key_check(monkeypatch):
+    """Ordering: a missing key still reports the key, not the interpreter."""
+    module = _load_script("register_agent.py")
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
+    monkeypatch.delenv("BAND_USER_API_KEY", raising=False)
+    monkeypatch.delenv("BAND_API_KEY", raising=False)
+
+    def _no_writer():
+        raise AssertionError("the env-writer probe ran before the user-key check")
+
+    monkeypatch.setattr(module, "_resolve_env_writer", _no_writer)
+
+    with pytest.raises(RuntimeError, match="Band API key is required"):
+        module.register_agent()
+
+
+def test_register_agent_env_writer_error_names_the_resolver(monkeypatch):
+    """The message has to say how to get the right interpreter."""
+    module = _load_script("register_agent.py")
+    _stub_hermes(monkeypatch, writer=False)
+
+    with pytest.raises(RuntimeError, match="gateway_python.py"):
+        module._resolve_env_writer()
+
+
+@pytest.mark.parametrize(
+    "hermes",
+    [
+        pytest.param({}, id="current"),
+        pytest.param({"scope": False}, id="no-managed-scope"),
+        pytest.param({"scope": False, "managed_helpers": False}, id="no-managed-helpers"),
+    ],
+)
+def test_register_agent_saves_credentials_when_hermes_can_write(monkeypatch, hermes):
+    """Managed guards are optional: a Hermes without them still registers.
+
+    Hermes before 0.17 has no ``managed_scope``; refusing it as a wrong
+    interpreter would loop, since ``gateway_python.py`` resolves the same one.
+    """
+    module = _load_script("register_agent.py")
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
+    monkeypatch.setenv("BAND_USER_API_KEY", "user-key")
+    saved = _stub_hermes(monkeypatch, **hermes)
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *a, **k: _RegistrationResponse())
+
+    result = module.register_agent()
+
+    assert saved == [("BAND_AGENT_ID", "a1"), ("BAND_API_KEY", "agent-key")]
+    assert result == {"success": True, "agent_id": "a1", "saved": ["BAND_AGENT_ID", "BAND_API_KEY"]}
+
+
+@pytest.mark.parametrize(
+    ("hermes", "message"),
+    [
+        pytest.param({"managed": True}, "managed by NixOS", id="managed-install"),
+        pytest.param(
+            {"pinned": {"BAND_AGENT_ID"}},
+            r"administrator manages them \(/etc/hermes/\.env\): BAND_AGENT_ID\.",
+            id="agent-id-pinned",
+        ),
+        pytest.param({"pinned": {"BAND_API_KEY"}}, r"\): BAND_API_KEY\.", id="api-key-pinned"),
+        pytest.param(
+            {"pinned": {"BAND_AGENT_ID", "BAND_API_KEY"}},
+            r"\): BAND_AGENT_ID, BAND_API_KEY\.",
+            id="both-pinned",
+        ),
+        pytest.param(
+            {"pinned": {"BAND_API_KEY"}, "managed_dir": None},
+            r"manages them \(the managed scope\)",
+            id="pinned-no-managed-dir",
+        ),
+    ],
+)
+def test_register_agent_refuses_managed_writes_before_posting(monkeypatch, hermes, message):
+    """Hermes drops ``save_env_value`` writes when the install, or an admin
+    scope pinning either key, is managed; the one-time key would be lost."""
+    module = _load_script("register_agent.py")
+    monkeypatch.delenv("BAND_AGENT_ID", raising=False)
+    monkeypatch.setenv("BAND_USER_API_KEY", "user-key")
+    saved = _stub_hermes(monkeypatch, **hermes)
+    monkeypatch.setattr(module.urllib.request, "urlopen", _refuse_post)
+
+    with pytest.raises(RuntimeError, match=message):
+        module.register_agent()
+
+    assert saved == []
+
 
 def test_register_agent_headers_use_browser_like_fingerprint(monkeypatch):
     module = _load_script("register_agent.py")

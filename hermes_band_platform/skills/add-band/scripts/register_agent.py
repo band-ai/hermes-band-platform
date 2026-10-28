@@ -21,6 +21,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
 _DEFAULT_REGISTRATION_USER_AGENT = (
@@ -77,17 +78,72 @@ def _extract_credentials(data: dict[str, Any]) -> tuple[str, str]:
     return str(agent_id).strip(), str(api_key).strip()
 
 
-def _save_credentials(agent_id: str, api_key: str) -> None:
+# Every key registration persists, in write order.
+_CREDENTIAL_KEYS = ("BAND_AGENT_ID", "BAND_API_KEY")
+
+
+def _resolve_env_writer() -> Callable[[str, str], Any]:
+    """Return Hermes's ``save_env_value``, or raise if it cannot persist.
+
+    Kept separate from :func:`_save_credentials` so registration can prove the
+    interpreter *before* the POST — see the pre-flight call in
+    :func:`register_agent`.
+
+    Only ``save_env_value`` identifies the right interpreter. Two Hermes guards
+    make it print to stderr and return without writing, losing the one-time
+    agent key, so they are checked too — each only where this Hermes has it:
+
+    * a managed install (``HERMES_MANAGED`` or a ``.managed`` marker in
+      ``HERMES_HOME``) refuses every key;
+    * an administrator's managed scope (``HERMES_MANAGED_DIR`` or
+      ``/etc/hermes``) refuses the keys its ``.env`` pins. Hermes added
+      ``managed_scope`` in 0.17; older releases have no such guard.
+    """
     try:
         from hermes_cli.config import save_env_value
-    except Exception as exc:  # pragma: no cover - environment failure path
+    except Exception as exc:
         raise RuntimeError(
-            "Could not import hermes_cli.config.save_env_value from this Python. "
-            "Run this helper with the Hermes gateway Python."
+            "Could not import hermes_cli.config.save_env_value from this Python "
+            f"({sys.executable}). Run this helper with the Hermes gateway Python: "
+            "scripts/gateway_python.py --print resolves it."
         ) from exc
 
-    save_env_value("BAND_AGENT_ID", agent_id)
-    save_env_value("BAND_API_KEY", api_key)
+    keys = ", ".join(_CREDENTIAL_KEYS)
+
+    try:
+        from hermes_cli.config import format_managed_message, is_managed
+    except ImportError:
+        pass
+    else:
+        if is_managed():
+            raise RuntimeError(
+                f"This Hermes install is managed, so it would not write {keys} "
+                "to .env; no agent was registered.\n"
+                f"{format_managed_message('save Band credentials')}"
+            )
+
+    try:
+        from hermes_cli import managed_scope
+    except ImportError:
+        pass
+    else:
+        pinned = [key for key in _CREDENTIAL_KEYS if managed_scope.is_env_managed(key)]
+        if pinned:
+            managed_dir = managed_scope.get_managed_dir()
+            source = managed_dir / ".env" if managed_dir else "the managed scope"
+            raise RuntimeError(
+                f"Hermes would not write these keys to .env because your "
+                f"administrator manages them ({source}): {', '.join(pinned)}. "
+                "No agent was registered."
+            )
+
+    return save_env_value
+
+
+def _save_credentials(agent_id: str, api_key: str) -> None:
+    save_env_value = _resolve_env_writer()
+    for key, value in zip(_CREDENTIAL_KEYS, (agent_id, api_key), strict=True):
+        save_env_value(key, value)
 
 
 def register_agent(force: bool = False) -> dict[str, Any]:
@@ -112,6 +168,13 @@ def register_agent(force: bool = False) -> dict[str, Any]:
     ).strip()
     if not user_key:
         raise RuntimeError("a Band API key is required (set BAND_API_KEY or BAND_USER_API_KEY)")
+
+    # Registration is irreversible: Band returns the agent key exactly once, in
+    # the creation response. So prove this interpreter can persist it before the
+    # POST — the shebang is ``python3``, which on a typical host resolves to a
+    # system interpreter with no ``hermes_cli``. Checked afterwards, that mints an
+    # agent whose key is then discarded, and the retry collides on the name.
+    _resolve_env_writer()
 
     base_url = os.environ.get("BAND_BASE_URL", "https://app.band.ai").rstrip("/")
     name = os.environ.get("BAND_AGENT_NAME", "Hermes Agent")
@@ -154,7 +217,7 @@ def register_agent(force: bool = False) -> dict[str, Any]:
     return {
         "success": True,
         "agent_id": agent_id,
-        "saved": ["BAND_AGENT_ID", "BAND_API_KEY"],
+        "saved": list(_CREDENTIAL_KEYS),
     }
 
 

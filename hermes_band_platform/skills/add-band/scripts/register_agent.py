@@ -78,7 +78,7 @@ def _extract_credentials(data: dict[str, Any]) -> tuple[str, str]:
     return str(agent_id).strip(), str(api_key).strip()
 
 
-# Every key registration persists; checked up front against managed scope.
+# Every key registration persists, in write order.
 _CREDENTIAL_KEYS = ("BAND_AGENT_ID", "BAND_API_KEY")
 
 
@@ -89,17 +89,18 @@ def _resolve_env_writer() -> Callable[[str, str], Any]:
     interpreter *before* the POST — see the pre-flight call in
     :func:`register_agent`.
 
-    Two Hermes guards make ``save_env_value`` print to stderr and return
-    without writing, so the one-time agent key would be lost:
+    Only ``save_env_value`` identifies the right interpreter. Two Hermes guards
+    make it print to stderr and return without writing, losing the one-time
+    agent key, so they are checked too — each only where this Hermes has it:
 
     * a managed install (``HERMES_MANAGED`` or a ``.managed`` marker in
       ``HERMES_HOME``) refuses every key;
     * an administrator's managed scope (``HERMES_MANAGED_DIR`` or
-      ``/etc/hermes``) refuses the keys its ``.env`` pins.
+      ``/etc/hermes``) refuses the keys its ``.env`` pins. Hermes added
+      ``managed_scope`` in 0.17; older releases have no such guard.
     """
     try:
-        from hermes_cli import managed_scope
-        from hermes_cli.config import format_managed_message, is_managed, save_env_value
+        from hermes_cli.config import save_env_value
     except Exception as exc:
         raise RuntimeError(
             "Could not import hermes_cli.config.save_env_value from this Python "
@@ -107,30 +108,42 @@ def _resolve_env_writer() -> Callable[[str, str], Any]:
             "scripts/gateway_python.py --print resolves it."
         ) from exc
 
-    if is_managed():
-        raise RuntimeError(
-            "This Hermes install is managed, so it would not write "
-            "BAND_AGENT_ID/BAND_API_KEY to .env; no agent was registered.\n"
-            f"{format_managed_message('save Band credentials')}"
-        )
+    keys = ", ".join(_CREDENTIAL_KEYS)
 
-    pinned = [key for key in _CREDENTIAL_KEYS if managed_scope.is_env_managed(key)]
-    if pinned:
-        managed_dir = managed_scope.get_managed_dir()
-        source = managed_dir / ".env" if managed_dir else "the managed scope"
-        raise RuntimeError(
-            f"{', '.join(pinned)} {'is' if len(pinned) == 1 else 'are'} managed by "
-            f"your administrator ({source}), so Hermes would not write "
-            f"{'it' if len(pinned) == 1 else 'them'} to .env; no agent was registered."
-        )
+    try:
+        from hermes_cli.config import format_managed_message, is_managed
+    except ImportError:
+        pass
+    else:
+        if is_managed():
+            raise RuntimeError(
+                f"This Hermes install is managed, so it would not write {keys} "
+                "to .env; no agent was registered.\n"
+                f"{format_managed_message('save Band credentials')}"
+            )
+
+    try:
+        from hermes_cli import managed_scope
+    except ImportError:
+        pass
+    else:
+        pinned = [key for key in _CREDENTIAL_KEYS if managed_scope.is_env_managed(key)]
+        if pinned:
+            managed_dir = managed_scope.get_managed_dir()
+            source = managed_dir / ".env" if managed_dir else "the managed scope"
+            raise RuntimeError(
+                f"Hermes would not write these keys to .env because your "
+                f"administrator manages them ({source}): {', '.join(pinned)}. "
+                "No agent was registered."
+            )
 
     return save_env_value
 
 
 def _save_credentials(agent_id: str, api_key: str) -> None:
     save_env_value = _resolve_env_writer()
-    save_env_value("BAND_AGENT_ID", agent_id)
-    save_env_value("BAND_API_KEY", api_key)
+    for key, value in zip(_CREDENTIAL_KEYS, (agent_id, api_key), strict=True):
+        save_env_value(key, value)
 
 
 def register_agent(force: bool = False) -> dict[str, Any]:
@@ -204,7 +217,7 @@ def register_agent(force: bool = False) -> dict[str, Any]:
     return {
         "success": True,
         "agent_id": agent_id,
-        "saved": ["BAND_AGENT_ID", "BAND_API_KEY"],
+        "saved": list(_CREDENTIAL_KEYS),
     }
 
 

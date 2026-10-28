@@ -362,6 +362,7 @@ def test_register_agent_short_circuits_when_already_registered(monkeypatch):
         "saved": [],
     }
 
+
 def test_register_agent_checks_the_env_writer_before_posting(monkeypatch):
     """A wrong interpreter must fail before Band mints anything.
 

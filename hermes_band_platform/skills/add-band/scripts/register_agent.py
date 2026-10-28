@@ -21,6 +21,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
 _DEFAULT_REGISTRATION_USER_AGENT = (
@@ -77,7 +78,7 @@ def _extract_credentials(data: dict[str, Any]) -> tuple[str, str]:
     return str(agent_id).strip(), str(api_key).strip()
 
 
-def _resolve_env_writer():
+def _resolve_env_writer() -> Callable[[str, str], Any]:
     """Return Hermes's ``save_env_value``, or raise naming the resolver.
 
     Kept separate from :func:`_save_credentials` so registration can prove the

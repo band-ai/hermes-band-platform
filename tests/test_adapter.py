@@ -1434,6 +1434,7 @@ class TestDurableSeedRehydration:
         assert "rejoined-room" not in adapter._rehydrate_rooms
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("hermetic_hermes_home")
     async def test_cold_room_seeds_real_session_store_roundtrip(self, adapter, tmp_path):
         # Wire the REAL gateway SessionStore (temp SQLite) and mock ONLY the
         # Band REST endpoints (the genuine external service). This validates the
@@ -1746,6 +1747,7 @@ class TestDurableSeedRehydration:
         assert store.atomic_seeded[0]["content"] == "[Bob] ping @alice now"
 
 
+@pytest.mark.usefixtures("hermetic_hermes_home")
 class TestSessionKeyParity:
     """_reset_room_session and _has_active_session derive the SAME key as the store."""
 
@@ -1775,6 +1777,7 @@ class TestSessionKeyParity:
         assert a._has_active_session("room-x") is False
 
 
+@pytest.mark.usefixtures("hermetic_hermes_home")
 class TestAtomicSeedTranscript:
     """_atomic_seed_transcript against the REAL SessionDB (the race-safe write)."""
 
@@ -2797,7 +2800,7 @@ class TestHubBootstrap:
         assert adapter.config.extra.get("hub_room") == "hub-new-1"
         assert adapter.config.home_channel is not None
         assert adapter.config.home_channel.chat_id == "hub-new-1"
-        assert adapter.config.home_channel.name == "Hermes Hub"
+        assert adapter.config.home_channel.name == "Hermes Agent Hub"
         # Home is persisted (not just in-memory) so every config reader sees it.
         assert adapter._test_saved_env.get("BAND_HOME_ROOM") == "hub-new-1"
 
@@ -3187,7 +3190,7 @@ class TestEnvEnablementHubSeeds:
         monkeypatch.delenv("BAND_HOME_ROOM", raising=False)
         result = _env_enablement()
         assert result["hub_room"] == "hub-1"
-        assert result["home_channel"] == {"chat_id": "hub-1", "name": "Hermes Hub"}
+        assert result["home_channel"] == {"chat_id": "hub-1", "name": "Hermes Agent Hub"}
 
     def test_home_room_overrides_hub_seed(self, monkeypatch):
         monkeypatch.setenv("BAND_HUB_ROOM", "hub-1")

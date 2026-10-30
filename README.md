@@ -6,7 +6,7 @@
   <a href="https://github.com/band-ai/hermes-band-platform/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/band-ai/hermes-band-platform/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/band-ai/hermes-band-platform/actions/workflows/release.yml"><img alt="Release" src="https://github.com/band-ai/hermes-band-platform/actions/workflows/release.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <img alt="Python 3.11–3.13" src="https://img.shields.io/badge/python-3.11%E2%80%933.13-blue">
+  <img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11%2B-blue">
   <a href="https://app.band.ai"><img alt="Band" src="https://img.shields.io/badge/band-app.band.ai-1f6feb"></a>
 </p>
 
@@ -25,7 +25,7 @@ links a Hermes agent to the **Band** platform over a persistent WebSocket and re
 between Band chat rooms and the agent. It wraps the official
 [`band-sdk`](https://pypi.org/project/band-sdk/) `BandLink` — it does **not** reimplement the
 Band protocol. Beyond messaging it registers a `band` action toolset (create rooms, look people
-up, add/remove participants, send messages) and bootstraps a **Hermes Hub**: a private
+up, add/remove participants, send messages) and bootstraps a **Hermes Agent Hub**: a private
 owner↔agent control room that serves as the Band main channel.
 
 ## How it works
@@ -67,8 +67,8 @@ The snippet is just a thin fetch of [`band-ai/add-band`](https://github.com/band
 hand-authored [`hermes/bootstrap.sh`](https://github.com/band-ai/add-band/blob/main/hermes/bootstrap.sh).
 To run setup by hand or on a release build, see [Install](#install).
 
-**Prerequisites:** Hermes already installed, with its gateway on **Python 3.11–3.13** (band-sdk
-has no 3.14 wheels yet), shell access as the user who owns the Hermes install, and a Band account
+**Prerequisites:** Hermes already installed, with its gateway on **Python 3.11 or newer** (tested
+on 3.11–3.14), shell access as the user who owns the Hermes install, and a Band account
 (see [Credentials](#credentials)).
 
 ## Install
@@ -140,7 +140,7 @@ hermes-band-platform/install.sh
 ```
 
 The installer stages the plugin into `$HERMES_HOME/plugins/band/`, resolves
-`band-sdk>=1.3.0,<2.0.0` **with the gateway's interpreter** (Python 3.11–3.13; correct wheels for
+`band-sdk>=1.3.0,<2.0.0` **with the gateway's interpreter** (Python 3.11 or newer; correct wheels for
 its platform) into the user-writable `$HERMES_HOME/band-libs/`, verifies `import band`, and runs
 `hermes plugins enable band`. The plugin prepends `band-libs` to `sys.path` at load, so the
 gateway venv is never written to — **no sudo, works when site-packages is read-only**. Re-running
@@ -156,17 +156,19 @@ is safe (idempotent). Env knobs: `HERMES_HOME`, `HERMES_PY` (interpreter overrid
 </details>
 
 Everything below installs into `$HERMES_PY`, **the interpreter that runs the gateway** — install
-anywhere else and the plugin stays invisible to Hermes. Derive it once from the `hermes` console
-script, whose shebang points at its own interpreter (don't guess `<project>/venv/bin/python`: the
-directory is `.venv` as often as `venv`, and FHS installs have neither):
+anywhere else and the plugin stays invisible to Hermes. Don't derive it from the `hermes` launcher
+by hand: the upstream installer puts shell wrappers in front of the interpreter (a root install's
+`/usr/local/bin/hermes` is a bash script, and current user installs run a store Python that
+activates a managed venv at boot), so neither the launcher's shebang nor
+`<project>/venv/bin/python` is reliable. Use the plugin's resolver, a single stdlib-only script that
+follows those launchers and validates the interpreter it prints:
 
 ```bash
-HERMES_PY="${HERMES_PY:-$(sed -n '1s/^#!\([^ ]*\).*/\1/p' "$(command -v hermes)")}"
-case "$HERMES_PY" in */python*) ;; *) echo "set HERMES_PY to the Python that runs hermes" >&2 ;; esac
+HERMES_PY="${HERMES_PY:-$(curl -fsSL https://raw.githubusercontent.com/band-ai/hermes-band-platform/main/hermes_band_platform/skills/add-band/scripts/gateway_python.py | python3 - --print)}"
 ```
 
-Once the plugin is installed, `scripts/gateway_python.py --print` does this properly — it
-validates the interpreter instead of deriving it, and the setup skill uses it for every step.
+From a checkout, run `hermes_band_platform/skills/add-band/scripts/gateway_python.py` directly
+(without `--print` for a JSON report of every candidate it tried).
 
 <details>
 <summary><b>Git directory install</b> — <code>hermes plugins install</code></summary>
@@ -251,8 +253,8 @@ mints an agent and saves only the agent-scoped pair; the user key never reaches 
 ```bash
 export BAND_USER_API_KEY=...
 HERMES_PY="$(hermes_band_platform/skills/add-band/scripts/gateway_python.py --print)" || exit 1
-"$HERMES_PY" hermes_band_platform/skills/add-band/scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY
-unset BAND_USER_API_KEY
+"$HERMES_PY" hermes_band_platform/skills/add-band/scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY (+ a non-default BAND_BASE_URL)
+unset BAND_USER_API_KEY BAND_API_KEY   # the gateway reads the agent key from .env
 ```
 
 > The bundled `register_agent.py` is a temporary helper that sends browser-like registration
@@ -260,14 +262,20 @@ unset BAND_USER_API_KEY
 > `band.cli.register_agent` is published — keeping the same `User-Agent`/`Accept`/`Accept-Language`
 > headers.
 
-**Pre-created agent (manual)** — make one at `app.band.ai/agents/new`, then set:
+**Pre-created agent (manual)** — on the Band **Agents** page, click **Connect remote agent**
+(`app.band.ai/agents/create`) and create the agent, then set:
 
 ```bash
 BAND_AGENT_ID=<agent-uuid>
 BAND_API_KEY=<band_a_key>
+BAND_BASE_URL=<https://your-band-host>   # only if the agent is not on app.band.ai
 ```
 
-Then restart: `hermes gateway restart`.
+Then restart the gateway: `hermes gateway restart`. On a first-time setup there is no gateway
+service to restart yet (on systemd, `start`/`restart` stop with "Gateway service is not
+installed"): install it with `hermes gateway install`, then `hermes gateway start`, or run it in
+the foreground with `hermes gateway run`. `hermes gateway setup` is the messaging-platform wizard,
+not the service installer.
 
 ### Verify it worked
 
@@ -299,9 +307,9 @@ has no DMs, so an un-mentioned message is ignored by design. A reply means you'r
 | `BAND_BASE_URL` | Band host base URL (default `https://app.band.ai`). WS + REST URLs are derived from this host. |
 | `BAND_ALLOWED_USERS` | Comma-separated Band user IDs allowed to talk to the agent. **Optional** — Band's own ACL is trusted by default; set this only to narrow access below what Band already permits. |
 | `BAND_ALLOW_ALL` | Explicitly allow anyone in a room to talk to the agent. Redundant with the default Band-ACL trust; mainly useful to override a `BAND_ALLOWED_USERS` restriction. |
-| `BAND_TOOL_OWNERS` | Comma-separated `platform:user_id` identities allowed to drive Band actions (e.g. `telegram:<tg-id>`). The resolved Band owner is always authorized from Band rooms; this allowlist grants others. |
+| `BAND_TOOL_OWNERS` | **Optional.** Comma-separated `platform:user_id` identities (e.g. `telegram:<tg-id>`) that may drive the mutating Band tools. Unset (the default), the tools are loose: any caller passes and Band enforces room roles server-side. Set, everyone else is refused, except the resolved Band owner calling from a Band room. |
 | `BAND_GROUP_SESSIONS_PER_USER` | Split a group room into a separate session per participant (`true`) or keep one shared session for the whole room (`false`). Default `false`. |
-| `BAND_OWNER_ID` | Owner UUID override. Normally resolved from the agent identity on connect; anchors the hub and the owner-only gates. |
+| `BAND_OWNER_ID` | Owner UUID override. Normally resolved from the agent identity on connect; anchors the hub, the owner-only slash-command gate, and the owner bypass when `BAND_TOOL_OWNERS` is set. |
 | `BAND_HUB_ROOM` | Hub room UUID. Auto-created and persisted on first connect; set it to pin an existing room. |
 | `BAND_HOME_ROOM` | Main-channel override for cron / notification delivery (also set by `/sethome` from a Band room). Defaults to the hub. |
 | `BAND_HUB_FAILOVER_THRESHOLD` | Consecutive failed hub sends before failing over to a fresh hub room (default `3`). A successful hub send resets the count. See [Hub failover](#hub-failover). |
@@ -403,7 +411,7 @@ The tools split into two tiers:
   and accept an optional explicit `room_id` that always wins. From a non-Band session
   (Telegram/CLI) `room_id` is required — supply it from `band_create_room` or `band_find_room`.
 
-| Tool | Tier | Owner-gated | Description |
+| Tool | Tier | Restricted by `BAND_TOOL_OWNERS` | Description |
 | --- | --- | --- | --- |
 | `band_create_room` | A | Yes | Create a room. Composite: pass `person` (+ optional `message`, `role`) to resolve, create, add, and message someone in one call. Returns `{room_id, added, sent}`. No `title` arg — the server derives it. |
 | `band_find_room` | A | No (read-only) | Find existing rooms by `query` (matches title/id) → `[{room_id, title}]`. |
@@ -414,20 +422,25 @@ The tools split into two tiers:
 | `band_get_participants` | B | No (read-only) | List the room's participants → `[{id, handle, name, type}]`. |
 
 <details>
-<summary><b>Owner gating</b> — who can drive the mutating tools</summary>
+<summary><b>Tool access</b>: who can drive the mutating tools</summary>
 
-Creating rooms and adding/removing people is mutating and outward-facing, and the toolset can be
-exposed on platforms like Telegram. Hermes has **no built-in cross-platform owner concept**, so the
-Band tools enforce their own gate:
+The mutating tools (`band_create_room`, `band_send_message`, `band_add_participant`,
+`band_remove_participant`) are **loose by default**. Band owns access control: it decides who
+is admitted to a room and enforces member/admin/owner roles server-side, so the plugin does not
+re-gate the agent's own outbound actions. Anyone who can reach the agent on a platform that lists
+the `band` toolset can ask it to act on Band, and Band refuses what the agent's role doesn't allow.
 
-- **Owner bypass (checked first):** the agent's resolved Band owner calling from *any* Band room is
-  always authorized. Fail-closed when the owner is unresolved.
-- The mutating tools otherwise check the caller's `platform:user_id` against the `BAND_TOOL_OWNERS`
-  allowlist.
-- **Fail-closed:** if `BAND_TOOL_OWNERS` is unset, or the caller is not on it (and the owner bypass
-  doesn't apply), the mutating tools refuse with a clear error. With `BAND_TOOL_OWNERS` unset the
-  gate falls back to the calling platform's own `<PLATFORM>_ALLOWED_USERS` allowlist.
-- Read-only tools (`band_find_room`, `band_find_contact`, `band_get_participants`) bypass the gate.
+To restrict them, set `BAND_TOOL_OWNERS`:
+
+- The caller's `platform:user_id` must be on the list, or the mutating tools refuse with a clear
+  error.
+- **Owner bypass:** the resolved Band owner calling from a Band room is always allowed. If the
+  owner is unresolved, the bypass doesn't apply and only the list grants access.
+- Read-only tools (`band_find_room`, `band_find_contact`, `band_get_participants`) are never
+  gated.
+
+The one owner-only surface that is always on is Hermes slash commands (see
+[The Hub](#the-hub-main-channel--command-surface)).
 </details>
 
 <details>
@@ -449,8 +462,8 @@ platform_toolsets:
 > channel but **none** of the action tools. You must add `band` to the `band` platform's toolsets
 > as well, not just to Telegram/CLI.
 
-The owner gate (above) is the real access boundary, not which platforms list the toolset — so
-exposing `band` on Telegram does not widen who can mutate Band.
+Listing `band` for a platform lets every caller that platform admits drive the Band tools. Set
+`BAND_TOOL_OWNERS` (above) if that is wider than you want, for example on a shared Telegram bot.
 </details>
 
 <details>

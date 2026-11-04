@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/band-ai/hermes-band-platform/compare/v0.2.0...v0.2.1) (2026-11-04)
+
+
+### Bug Fixes
+
+* **deps:** keep phoenix-channels-python-client below 0.5 ([#76](https://github.com/band-ai/hermes-band-platform/issues/76)) ([c55aa73](https://github.com/band-ai/hermes-band-platform/commit/c55aa730ca2d72d88268727cf202d83baa1b3773))
+
 ## [0.2.0](https://github.com/band-ai/hermes-band-platform/compare/v0.1.0...v0.2.0) (2026-10-30)
 
 

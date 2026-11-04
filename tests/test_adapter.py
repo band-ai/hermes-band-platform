@@ -4858,6 +4858,40 @@ class TestLinkDeathEscalation:
 
         assert [r for r in caplog.records if r.levelno >= logging.ERROR]
 
+    @staticmethod
+    def _superseded(*, retryable):
+        return SimpleNamespace(
+            reason="superseded", message="replaced by a newer connection", retryable=retryable
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("probe", [True, None], ids=["supervisor-stopped", "probe-blind"])
+    async def test_a_terminal_supersede_is_not_retried(self, adapter, probe):
+        # Another connection now holds this agent's identity. A retryable error
+        # would reconnect and evict it in turn, so two gateways sharing
+        # credentials would keep taking the link from each other. The reason is
+        # public SDK state, so this must not depend on the private probe.
+        adapter._link.last_disconnect_reason = self._superseded(retryable=False)
+        adapter._link_supervisor_stopped = lambda: probe
+        adapter._notify_fatal_error = AsyncMock()
+
+        await self._run_watch(adapter)
+
+        assert adapter.fatal_error_code == "link_closed_by_platform"
+        assert adapter.fatal_error_retryable is False
+        adapter._notify_fatal_error.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_retryable_supersede_still_reconnects(self, adapter):
+        adapter._link.last_disconnect_reason = self._superseded(retryable=True)
+        adapter._link_supervisor_stopped = lambda: True
+        adapter._notify_fatal_error = AsyncMock()
+
+        await self._run_watch(adapter)
+
+        assert adapter.fatal_error_code == "link_died"
+        assert adapter.fatal_error_retryable is True
+
     @pytest.mark.asyncio
     async def test_an_unknown_probe_never_escalates(self, adapter):
         # The safety property: an SDK whose internals moved degrades to "no

@@ -1061,12 +1061,37 @@ class BandAdapter(BasePlatformAdapter):
         queues the platform for background reconnection. This deliberately does
         NOT reconnect by itself — the runner owns adapter lifecycle, and a
         second reconnect loop here would race it.
+
+        The exception is a disconnect the platform marked non-retryable (a
+        supersede): another connection now holds this agent's identity, so that
+        one escalates as non-retryable instead, as Telegram's polling conflict
+        does. Retrying would evict the other connection in turn, and two
+        gateways sharing credentials would keep taking the link from each other.
         """
         try:
             while True:
                 await asyncio.sleep(_LINK_HEALTH_POLL_SECONDS)
                 # A teardown already in progress owns the link; nothing to do.
                 if not self._running or self._link is None:
+                    return
+
+                # Checked before the supervisor probe: the SDK exposes this
+                # publicly, so it holds even when the probe's internals move.
+                reason = getattr(self._link, "last_disconnect_reason", None)
+                if getattr(reason, "retryable", None) is False:
+                    msg = (
+                        "Band closed this agent's websocket connection and will "
+                        "not let it reconnect "
+                        f"({getattr(reason, 'reason', None)}: "
+                        f"{getattr(reason, 'message', None)}). This usually means "
+                        "another gateway connected with the same agent "
+                        "credentials; make sure only one runs with this "
+                        "BAND_AGENT_ID, then restart this one with "
+                        "'hermes gateway restart'"
+                    )
+                    logger.error("[band] %s", msg)
+                    self._set_fatal_error("link_closed_by_platform", msg, retryable=False)
+                    await self._notify_fatal_error()
                     return
 
                 stopped = self._link_supervisor_stopped()

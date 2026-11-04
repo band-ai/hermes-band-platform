@@ -103,8 +103,7 @@ end to end.
 
 ### 2. PyPI release
 
-> _Not yet on PyPI. Until the first release is published, use the [Quickstart](#quickstart) or
-> [From this repo](#3-from-this-repo). Once published:_
+The latest release, from PyPI:
 
 ```bash
 pip install hermes-band   # into the gateway's Python (must be writable)
@@ -190,17 +189,17 @@ gateway log shows one error naming this exact command.
 </details>
 
 <details>
-<summary><b>Git-ref install</b> — pre-PyPI, into the gateway's Python</summary>
+<summary><b>Git-ref install</b> — a specific tag, branch, or commit, into the gateway's Python</summary>
 
 Requires a **writable** gateway venv (self-managed installs) — on hosted runtimes the venv is
 read-only; use the installer instead.
 
 ```bash
-uv pip install --python "$HERMES_PY" "hermes-band @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}"
+uv pip install --python "$HERMES_PY" "hermes-band @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:?set a tag, branch, or commit}"
 hermes plugins enable band
 ```
 
-Pin `BAND_HERMES_REF` to a tag or commit for a reproducible install.
+`BAND_HERMES_REF` is required here; for the latest release use the [PyPI release](#2-pypi-release).
 </details>
 
 <details>

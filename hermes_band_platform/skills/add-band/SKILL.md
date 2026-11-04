@@ -75,11 +75,11 @@ Canonical install: the repo's **installer**, which ships the plugin as a **direc
 HERMES_PY="$HERMES_PY" ./install.sh    # repo root; honors HERMES_HOME, HERMES_PY
 ```
 
-Package install into the gateway's site-packages instead (**only** when the gateway venv is writable — self-managed installs; auto-installs `band-sdk`):
+Package install into the gateway's site-packages instead (**only** when the gateway venv is writable — self-managed installs; auto-installs `band-sdk`). Installs the latest `hermes-band` release from PyPI unless `BAND_HERMES_REF` names a tag, branch, or commit to install from Git:
 
 ```bash
-BAND_HERMES_REF="${BAND_HERMES_REF:-main}"
-uv pip install --python "$HERMES_PY" "hermes-band @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF}"
+if [ -n "${BAND_HERMES_REF:-}" ]; then hermes_band_spec="hermes-band @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF}"; else hermes_band_spec="hermes-band"; fi
+uv pip install --python "$HERMES_PY" "$hermes_band_spec"
 hermes plugins enable band 2>/dev/null && hermes plugins list | grep -w band >/dev/null \
   || "$HERMES_PY" -c "from hermes_cli import plugins_cmd as C; s=C._get_enabled_set(); s.add('band'); C._save_enabled_set(s); print('enabled band via config')"
 ```
@@ -157,10 +157,10 @@ re-installs or re-registers what's already in place.
      ```bash
      HERMES_PY="$HERMES_PY" ./install.sh   # at the repo root, three dirs above this skill
      ```
-   - Package install into site-packages instead — **only when the gateway venv is writable** (self-managed installs; auto-installs `band-sdk`):
+   - Package install into site-packages instead — **only when the gateway venv is writable** (self-managed installs; auto-installs `band-sdk`). The latest `hermes-band` release from PyPI by default; a set `BAND_HERMES_REF` (tag, branch, or commit) installs that from Git instead:
      ```bash
-     BAND_HERMES_REF="${BAND_HERMES_REF:-main}"
-     uv pip install --python "$HERMES_PY" "hermes-band @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF}"
+     if [ -n "${BAND_HERMES_REF:-}" ]; then hermes_band_spec="hermes-band @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF}"; else hermes_band_spec="hermes-band"; fi
+     uv pip install --python "$HERMES_PY" "$hermes_band_spec"
      hermes plugins enable band
      ```
    - For Nix installs, ensure the package and `band-sdk` are in the gateway Python environment and `plugins.enabled` contains `band`.

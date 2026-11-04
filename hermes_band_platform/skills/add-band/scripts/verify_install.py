@@ -308,12 +308,14 @@ def verify_install() -> dict[str, Any]:
     ):
         actions.append(
             "Install the plugin. Canonical (works on read-only gateway venvs, "
-            "no sudo): clone https://github.com/band-ai/hermes-band-platform "
-            "and run ./install.sh — it stages $HERMES_HOME/plugins/band, "
+            "no sudo): clone https://github.com/band-ai/hermes-band-platform at its "
+            "latest release tag (or $BAND_HERMES_REF) and run ./install.sh — it "
+            "stages $HERMES_HOME/plugins/band, "
             "resolves band-sdk into $HERMES_HOME/band-libs, and enables the "
-            "plugin. Package alternative (writable gateway venv only): "
-            "uv pip install --python \"$HERMES_PY\" "
-            "\"hermes-band @ git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}\""
+            "plugin. Package alternative (writable gateway venv only), the latest "
+            "release: uv pip install --python \"$HERMES_PY\" hermes-band — or a "
+            "specific tag, branch, or commit: uv pip install --python \"$HERMES_PY\" "
+            "\"hermes-band @ git+https://github.com/band-ai/hermes-band-platform.git@$BAND_HERMES_REF\""
         )
     if "sdk_importable" in missing or "band_libs_on_sys_path" in missing:
         actions.append(
@@ -350,8 +352,9 @@ def verify_install() -> dict[str, Any]:
             "agent will connect but lack the multi-participant/delegation playbook. "
             "Refresh the install (re-run ./install.sh from a fresh clone, or for "
             "package installs: uv pip install --python \"$HERMES_PY\" --upgrade "
-            "\"hermes-band @ "
-            "git+https://github.com/band-ai/hermes-band-platform.git@${BAND_HERMES_REF:-main}\"), "
+            "hermes-band, or \"hermes-band @ "
+            "git+https://github.com/band-ai/hermes-band-platform.git@$BAND_HERMES_REF\" "
+            "for a specific tag, branch, or commit), "
             "then restart the gateway."
         )
     return {

@@ -6,8 +6,8 @@ hosted runtimes the gateway's own site-packages is read-only, so ``band-sdk``
 cannot live there. The installer instead resolves it into a user-writable
 target dir::
 
-    uv pip install --python "<gateway_python>" \
-        --target "$HERMES_HOME/band-libs" "band-sdk>=1.3.0,<2.0.0"
+    uv pip install --python "<gateway_python>" --target "$HERMES_HOME/band-libs" \
+        "band-sdk>=1.3.0,<2.0.0" "phoenix-channels-python-client<0.5"
 
 and this shim prepends that dir to ``sys.path`` before anything imports
 ``band``. Prepending (not appending) makes ``band-libs`` authoritative when
@@ -38,6 +38,10 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 BAND_SDK_SPEC = "band-sdk>=1.3.0,<2.0.0"
+# Every band-sdk 1.x requires phoenix-channels-python-client with a floor and no
+# ceiling, and 0.5.0 removed `PHXChannelsClient`, which band-sdk 1.x imports, so
+# an unconstrained resolve installs an SDK that fails on `import band`.
+PHOENIX_CLIENT_SPEC = "phoenix-channels-python-client<0.5"
 
 
 def hermes_home() -> Path:
@@ -67,7 +71,7 @@ def sdk_install_command() -> str:
     """The exact no-sudo, no-site-packages-write command that fixes a missing SDK."""
     return (
         f'uv pip install --python "{sys.executable}" '
-        f'--target "{band_libs_dir()}" "{BAND_SDK_SPEC}"'
+        f'--target "{band_libs_dir()}" "{BAND_SDK_SPEC}" "{PHOENIX_CLIENT_SPEC}"'
     )
 
 

@@ -323,6 +323,7 @@ def verify_install() -> dict[str, Any]:
             "no site-packages write): "
             'uv pip install --python "$HERMES_PY" --target '
             f"\"{band_libs['dir']}\" 'band-sdk>=1.3.0,<2.0.0' "
+            "'phoenix-channels-python-client<0.5' "
             "— then restart the gateway."
         )
     if "plugin_enabled" in missing:

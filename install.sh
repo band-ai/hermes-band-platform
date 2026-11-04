@@ -28,6 +28,9 @@ command -v hermes >/dev/null || die "install hermes first (the hermes CLI must b
 
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 BAND_SDK_SPEC="${BAND_SDK_SPEC:-band-sdk>=1.3.0,<2.0.0}"
+# Mirrors _band_libs.PHOENIX_CLIENT_SPEC: band-sdk 1.x leaves this dependency
+# unbounded and 0.5.0 broke its `import band`.
+PHOENIX_CLIENT_SPEC="phoenix-channels-python-client<0.5"
 
 # Locate the plugin source next to this script. Two layouts are supported:
 # a repo checkout (hermes_band_platform/) and an extracted release bundle
@@ -83,7 +86,7 @@ find "$tmp" -name '*.pyc' -delete
 
 # --- 2. Resolve band-sdk into the user-writable band-libs dir ----------------
 band_libs="$HERMES_HOME/band-libs"
-uv pip install --python "$HERMES_PY" --target "$band_libs" --upgrade "$BAND_SDK_SPEC"
+uv pip install --python "$HERMES_PY" --target "$band_libs" --upgrade "$BAND_SDK_SPEC" "$PHOENIX_CLIENT_SPEC"
 
 # Prove the gateway will resolve the SDK exactly the way the plugin loads it:
 # through the CANDIDATE's _band_libs shim, not a hand-rolled sys.path edit.

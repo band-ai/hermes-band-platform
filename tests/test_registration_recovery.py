@@ -24,10 +24,12 @@ def registration_peer():
 
         def do_POST(self):
             self.requests.append((self.path, self.headers.get("X-API-Key")))
-            self.rfile.read(int(self.headers["Content-Length"]))
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
             self.send_response(self.status)
             self.end_headers()
             self.wfile.write(self.body)
+
+        do_GET = do_POST
 
         def log_message(self, *_args):
             pass
@@ -99,3 +101,69 @@ def test_success_persists_identity_and_destination(registration_peer, helper_env
     assert "agent-secret" not in result.stdout + result.stderr
     assert json.loads(saved.read_text()) == {"BAND_BASE_URL": destination, "BAND_AGENT_ID": "a1", "BAND_API_KEY": "agent-secret"}
     assert len(peer.requests) == 1
+
+
+@pytest.mark.parametrize("error_kind,status,recovery", [
+    ("api", 401, True), ("api", 403, True), ("parsing", 401, True),
+    ("parsing", 403, True), ("api", 500, False), ("network", None, False),
+])
+def test_roundtrip_cli_redacts_errors(monkeypatch, capsys, error_kind, status, recovery):
+    import importlib.util
+    from types import SimpleNamespace
+
+    from band_rest.core import ParsingError
+    from band_rest.core.api_error import ApiError
+
+    script = SCRIPT.with_name("verify_roundtrip.py")
+    spec = importlib.util.spec_from_file_location("recovery_roundtrip", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module._plugin_env, "resolve_layout", lambda **kwargs: SimpleNamespace(error=None, as_dict=dict))
+    monkeypatch.setattr(module, "_env_value", lambda name: "room" if name == "BAND_HUB_ROOM" else "test-agent-key")
+    errors = {
+        "api": ApiError(status_code=status, body={"message": SECRET}, headers={"secret": SECRET}),
+        "parsing": ParsingError(status_code=status, body={"message": SECRET}, headers={"secret": SECRET}),
+        "network": ConnectionError(SECRET),
+    }
+
+    async def rejected(*args):
+        raise errors[error_kind]
+
+    monkeypatch.setattr(module, "_run", rejected)
+    assert module.main([]) == 1
+    output = capsys.readouterr()
+    assert SECRET not in output.out + output.err
+    payload = json.loads(output.out)
+    assert payload["success"] is False
+    assert ("authentication recovery" in payload["error"]) == recovery
+    if status is not None:
+        assert f"HTTP {status}" in payload["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper", ["_context_ids", "_new_human_message"])
+@pytest.mark.parametrize("status", [401, 403, 500])
+async def test_roundtrip_polling_exposes_auth_failure_only(registration_peer, helper, status):
+    import importlib.util
+
+    from band_rest import AsyncRestClient
+    from band_rest.core.api_error import ApiError
+
+    destination, peer = registration_peer
+    peer.status = status
+    peer.body = b"not-json"
+    spec = importlib.util.spec_from_file_location("polling_roundtrip", SCRIPT.with_name("verify_roundtrip.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    rest = AsyncRestClient(api_key=SECRET, base_url=destination)
+    args = [rest, "room"] if helper == "_context_ids" else [rest, "room", set()]
+    try:
+        if status in {401, 403}:
+            with pytest.raises(ApiError) as caught:
+                await getattr(module, helper)(*args)
+            assert caught.value.status_code == status
+        else:
+            result = await getattr(module, helper)(*args)
+            assert result == (set() if helper == "_context_ids" else None)
+    finally:
+        await rest._client_wrapper.httpx_client.httpx_client.aclose()

@@ -138,12 +138,18 @@ async def _mentions_for(rest: Any, room_id: str) -> list[Any]:
 async def _context_ids(rest: Any, room_id: str) -> set[str]:
     """Snapshot the message ids currently visible in the room (for reply diffing)."""
     from band.client.rest import DEFAULT_REQUEST_OPTIONS
+    from band_rest.core import ParsingError
+    from band_rest.core.api_error import ApiError
 
     ids: set[str] = set()
     try:
         ctx = await rest.agent_api_context.get_agent_chat_context(
             chat_id=room_id, request_options=DEFAULT_REQUEST_OPTIONS
         )
+    except (ApiError, ParsingError) as exc:
+        if exc.status_code in {401, 403}:
+            raise
+        return ids
     except Exception:
         return ids
     for item in getattr(ctx, "data", None) or []:
@@ -158,11 +164,17 @@ async def _new_human_message(
 ) -> Optional[str]:
     """Return the sender label of a new non-agent message, or None."""
     from band.client.rest import DEFAULT_REQUEST_OPTIONS
+    from band_rest.core import ParsingError
+    from band_rest.core.api_error import ApiError
 
     try:
         ctx = await rest.agent_api_context.get_agent_chat_context(
             chat_id=room_id, request_options=DEFAULT_REQUEST_OPTIONS
         )
+    except (ApiError, ParsingError) as exc:
+        if exc.status_code in {401, 403}:
+            raise
+        return None
     except Exception:
         return None
     for item in getattr(ctx, "data", None) or []:
@@ -271,13 +283,25 @@ def main(argv: Optional[list[str]] = None) -> int:
             {"success": False, "error": "BAND_API_KEY not set", "layout": layout.as_dict()}
         )
 
+    from band_rest.core import ParsingError
+    from band_rest.core.api_error import ApiError
+
     try:
         result = asyncio.run(_run(room_id, args.message, args.await_reply, args.timeout))
-    except Exception as exc:  # surface a bounded hint, never a secret
+    except (ApiError, ParsingError) as exc:
+        status = exc.status_code
+        detail = f"Band round-trip request failed (HTTP {status})."
+        if status in {401, 403}:
+            detail += (
+                " Follow the add-band skill's authentication recovery: check the "
+                "destination and same-site key permissions before retrying."
+            )
+        result = {"success": False, "room_id": room_id, "error": detail}
+    except Exception as exc:  # noqa: BLE001 — never expose exception bodies or credentials.
         result = {
             "success": False,
             "room_id": room_id,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": f"Band round-trip failed ({type(exc).__name__}); inspect the failing operation locally.",
         }
     result["layout"] = layout.as_dict()
     return _emit(result)

@@ -3,7 +3,7 @@
 > **Most installs should use the Band web app's "Add to Hermes" flow** (generated
 > from the bootstrapper source at
 > [band-ai/add-band](https://github.com/band-ai/add-band)) — on the gateway host it
-> installs the `add-band` skill from this repo and hands off to `hermes chat -s add-band`.
+> installs the `add-band` skill from this repo and hands off to `hermes chat -s band:add-band`.
 
 Use the prompt below only when you **can't run that on the target host** — e.g.
 you're driving setup from a **different machine or a non-Hermes agent** (Claude
@@ -13,8 +13,8 @@ official `add-band` setup skill from GitHub and follows it end to end — instal
 enable, credentials, restart, and verification all live in the skill, so this
 prompt stays thin and never goes stale.
 
-The agent pauses at two points that need you: providing Band credentials, and the
-final in-Band @mention test.
+The agent pauses for credentials and the final in-Band @mention test. A Band
+authentication failure may require missing site or administrator details.
 
 ---
 
@@ -57,11 +57,16 @@ You're connecting this machine's Hermes install to Band for me. Work in the shel
    • Never make me paste a Band *user* API key into a command — I'll set BAND_USER_API_KEY
      for the one registration step, then remove it.
 
-3. Stop and ask me at the two human gates:
-   • Credentials — I either create the Band agent at app.band.ai/agents/create (Agents page →
+3. Ask me at these human gates:
+   • Credentials — I either create the Band agent on the established Band site (cloud default
+     app.band.ai/agents/create; Agents page →
      Connect remote agent) and give you
      BAND_AGENT_ID + BAND_API_KEY, or I set BAND_USER_API_KEY for the bundled
      `scripts/register_agent.py` helper.
+   • On a Band 401/403, follow the skill’s authentication recovery before stopping.
+     Reuse known context, ask missing site details in plain language, configure confirmed
+     settings for me, and resume safely. Do not add deployment questions to successful setup.
+     Keep provider authentication separate; never ask for a key in chat.
    • The live test — I @mention the agent in the "Hermes Agent Hub" room and confirm a reply.
 
 4. When done, report: plugin version, how you enabled it (CLI vs config), the BAND_HUB_ROOM id,

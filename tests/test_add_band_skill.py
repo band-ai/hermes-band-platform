@@ -400,7 +400,7 @@ def test_register_agent_reads_user_key_from_band_api_key(monkeypatch):
     result, sent, saved = _register_with(monkeypatch, {"BAND_API_KEY": "user-key-from-snippet"})
 
     assert sent["key"] == "user-key-from-snippet"
-    assert saved == {"BAND_AGENT_ID": "a1", "BAND_API_KEY": "agent-key"}
+    assert saved == {"BAND_AGENT_ID": "a1", "BAND_API_KEY": "agent-key", "BAND_BASE_URL": "https://app.band.ai"}
     assert result["success"] is True
 
 
@@ -415,12 +415,12 @@ def test_register_agent_prefers_the_user_key_over_a_stale_agent_key(monkeypatch)
 @pytest.mark.parametrize(
     ("configured", "registered_at", "persisted"),
     [
-        (None, "https://app.band.ai", None),
-        ("https://app.band.ai/", "https://app.band.ai", None),
+        (None, "https://app.band.ai", "https://app.band.ai"),
+        ("https://app.band.ai/", "https://app.band.ai", "https://app.band.ai"),
         ("https://dev.band.example/", "https://dev.band.example", "https://dev.band.example"),
     ],
 )
-def test_register_agent_persists_a_non_default_base_url(
+def test_register_agent_persists_the_registration_destination(
     monkeypatch, configured, registered_at, persisted
 ):
     """The agent exists only on the host that minted it; without BAND_BASE_URL in
@@ -577,8 +577,8 @@ def test_register_agent_saves_credentials_when_hermes_can_write(monkeypatch, her
 
     result = module.register_agent()
 
-    assert saved == [("BAND_AGENT_ID", "a1"), ("BAND_API_KEY", "agent-key")]
-    assert result == {"success": True, "agent_id": "a1", "saved": ["BAND_AGENT_ID", "BAND_API_KEY"]}
+    assert saved == [("BAND_AGENT_ID", "a1"), ("BAND_API_KEY", "agent-key"), ("BAND_BASE_URL", "https://app.band.ai")]
+    assert result == {"success": True, "agent_id": "a1", "saved": ["BAND_AGENT_ID", "BAND_API_KEY", "BAND_BASE_URL"]}
 
 
 @pytest.mark.parametrize(

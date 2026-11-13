@@ -5,8 +5,8 @@ Temporary helper until ``band-sdk`` publishes ``band.cli.register_agent``. The
 Band *user* API key is read from ``BAND_API_KEY`` (the name the Band web app's
 onboarding snippet exports) or ``BAND_USER_API_KEY``, and is never printed. Only
 the returned agent-scoped ``BAND_AGENT_ID`` + ``BAND_API_KEY`` are persisted to
-the gateway ``.env`` through Hermes's env writer, plus ``BAND_BASE_URL`` when
-registration ran against a non-default host, so the gateway connects to the host
+the gateway ``.env`` through Hermes's env writer, plus ``BAND_BASE_URL`` for the
+registration destination, so the gateway connects to the host
 that minted the agent. The user key in the shell env is the caller's to
 ``unset`` before any agent/LLM handoff (the bootstrap does).
 
@@ -25,6 +25,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 _DEFAULT_REGISTRATION_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -33,6 +34,28 @@ _DEFAULT_REGISTRATION_USER_AGENT = (
 )
 
 _DEFAULT_BASE_URL = "https://app.band.ai"
+
+
+class RegistrationError(RuntimeError):
+    """A diagnostic safe to show without response bodies or credentials."""
+
+
+def _http_failure(base_url: str, status: int) -> RegistrationError:
+    parsed = urlsplit(base_url)
+    destination = f"{parsed.scheme}://{parsed.hostname}"
+    if parsed.port:
+        destination += f":{parsed.port}"
+    detail = ""
+    if status in {401, 403}:
+        detail = (
+            " Check the Band address and same-site key permissions before retrying. "
+            "Follow the add-band skill's authentication recovery."
+        )
+    elif status == 422:
+        detail = " Check existing agents and registration details before retrying."
+    return RegistrationError(
+        f"Band registration failed at {destination} (HTTP {status}).{detail}"
+    )
 
 
 def _registration_headers(user_key: str) -> dict[str, str]:
@@ -82,9 +105,8 @@ def _extract_credentials(data: dict[str, Any]) -> tuple[str, str]:
     return str(agent_id).strip(), str(api_key).strip()
 
 
-# Every key registration persists, in write order. BAND_BASE_URL is added only
-# for a non-default host (see _save_credentials).
-_CREDENTIAL_KEYS = ("BAND_AGENT_ID", "BAND_API_KEY")
+# Validate every persistence target before creating a remote agent.
+_CREDENTIAL_KEYS = ("BAND_AGENT_ID", "BAND_API_KEY", "BAND_BASE_URL")
 
 
 def _resolve_env_writer() -> Callable[[str, str], Any]:
@@ -107,7 +129,7 @@ def _resolve_env_writer() -> Callable[[str, str], Any]:
     try:
         from hermes_cli.config import save_env_value
     except Exception as exc:
-        raise RuntimeError(
+        raise RegistrationError(
             "Could not import hermes_cli.config.save_env_value from this Python "
             f"({sys.executable}). Run this helper with the Hermes gateway Python: "
             "scripts/gateway_python.py --print resolves it."
@@ -121,7 +143,7 @@ def _resolve_env_writer() -> Callable[[str, str], Any]:
         pass
     else:
         if is_managed():
-            raise RuntimeError(
+            raise RegistrationError(
                 f"This Hermes install is managed, so it would not write {keys} "
                 "to .env; no agent was registered.\n"
                 f"{format_managed_message('save Band credentials')}"
@@ -136,7 +158,7 @@ def _resolve_env_writer() -> Callable[[str, str], Any]:
         if pinned:
             managed_dir = managed_scope.get_managed_dir()
             source = managed_dir / ".env" if managed_dir else "the managed scope"
-            raise RuntimeError(
+            raise RegistrationError(
                 f"Hermes would not write these keys to .env because your "
                 f"administrator manages them ({source}): {', '.join(pinned)}. "
                 "No agent was registered."
@@ -148,17 +170,12 @@ def _resolve_env_writer() -> Callable[[str, str], Any]:
 def _save_credentials(agent_id: str, api_key: str, base_url: str) -> list[str]:
     """Persist the agent's credentials; return the names written.
 
-    A non-default ``base_url`` is saved too: the agent exists only on the host
-    that registered it, and the adapter falls back to app.band.ai without it.
+    Save the destination even for cloud to replace any stale custom endpoint.
     """
     save_env_value = _resolve_env_writer()
-    for key, value in zip(_CREDENTIAL_KEYS, (agent_id, api_key), strict=True):
+    for key, value in zip(_CREDENTIAL_KEYS, (agent_id, api_key, base_url), strict=True):
         save_env_value(key, value)
-    saved = list(_CREDENTIAL_KEYS)
-    if base_url != _DEFAULT_BASE_URL:
-        save_env_value("BAND_BASE_URL", base_url)
-        saved.append("BAND_BASE_URL")
-    return saved
+    return list(_CREDENTIAL_KEYS)
 
 
 def register_agent(force: bool = False) -> dict[str, Any]:
@@ -182,7 +199,7 @@ def register_agent(force: bool = False) -> dict[str, Any]:
         or ""
     ).strip()
     if not user_key:
-        raise RuntimeError("a Band API key is required (set BAND_API_KEY or BAND_USER_API_KEY)")
+        raise RegistrationError("a Band API key is required (set BAND_API_KEY or BAND_USER_API_KEY)")
 
     # Registration is irreversible: Band returns the agent key exactly once, in
     # the creation response. So prove this interpreter can persist it before the
@@ -207,26 +224,24 @@ def register_agent(force: bool = False) -> dict[str, Any]:
             response_body = response.read().decode("utf-8")
             status = response.status
     except urllib.error.HTTPError as exc:
-        response_body = exc.read().decode("utf-8", "replace")
-        raise RuntimeError(
-            f"Band registration failed (HTTP {exc.code}): {response_body[:300]}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Band registration failed: {exc.reason}") from exc
+        raise _http_failure(base_url, exc.code) from None
+    except urllib.error.URLError:
+        raise RegistrationError(
+            "Band registration transport failed. Creation outcome may be unknown; "
+            "check existing agents before retrying."
+        ) from None
 
     if status not in {200, 201}:
-        raise RuntimeError(
-            f"Band registration failed (HTTP {status}): {response_body[:300]}"
-        )
+        raise _http_failure(base_url, status)
 
     try:
         payload = json.loads(response_body)
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Band registration response was not valid JSON") from exc
+        raise RegistrationError("Band registration response was not valid JSON") from exc
 
     agent_id, api_key = _extract_credentials(payload)
     if not agent_id or not api_key:
-        raise RuntimeError("Band registration response missing agent id/key")
+        raise RegistrationError("Band registration response missing agent id/key")
 
     saved = _save_credentials(agent_id, api_key, base_url)
     return {
@@ -240,8 +255,14 @@ def main() -> int:
     force = "--force" in sys.argv[1:]
     try:
         result = register_agent(force=force)
-    except Exception as exc:
+    except RegistrationError as exc:
         print(json.dumps({"success": False, "error": str(exc)}, sort_keys=True))
+        return 1
+    except Exception:  # noqa: BLE001 — CLI diagnostics must not expose unexpected exception data.
+        print(json.dumps({
+            "success": False,
+            "error": "Band registration could not complete. Check existing agents before retrying; no automatic retry was made.",
+        }, sort_keys=True))
         return 1
     print(json.dumps(result, sort_keys=True))
     return 0

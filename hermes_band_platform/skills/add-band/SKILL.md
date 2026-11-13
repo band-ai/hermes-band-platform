@@ -23,12 +23,59 @@ Band rooms are mention-gated and Band owns access control. The plugin creates a 
 
 Do not use this skill for ordinary Band chat troubleshooting after setup; inspect gateway logs and the adapter state directly instead.
 
+## Recover a Band authentication failure
+
+Successful setup asks no deployment questions. If **Band** returns HTTP 401/403
+at registration, gateway startup, or round-trip verification, pause dependent
+steps and follow the [onboarding recovery guide](https://github.com/band-ai/add-band/blob/main/ONBOARDING-RECOVERY.md).
+This recovery branch takes precedence over stopping setup on that error. Provider
+authentication and a reply timeout alone are separate investigations.
+
+If the guide is unavailable, inspect the destination actually used and reuse
+known context. Ask only what is missing, in ordinary chat: “Band rejected the
+request. The key or the Band address may be different. What website do you
+normally open to use Band?” Explain that this helps compare the destination.
+The browser address is a clue, not proof of API paths. Resolve connection details
+from deployment documentation or existing configuration before another request.
+If unavailable, offer a message the user can forward: “I use Band at <website>.
+Please send the connection details supported by the Hermes integration and how
+to obtain a key with permission to create an agent on that site.” If the confirmed
+destination still rejects the request, check same-site key provenance and permissions;
+do not infer a revoked key. Never ask for keys in chat or print response bodies.
+
+Apply confirmed settings for the user with the gateway's env writer. Inspect
+`BAND_BASE_URL` in the active process environment, the gateway `.env`, and
+`platforms.band.extra.base_url`; environment values win. Replace stale values,
+including explicitly saving `https://app.band.ai` when returning to cloud.
+The adapter accepts a single host/port and derives HTTPS REST plus WSS
+`/api/v1/socket/websocket`; it discards supplied schemes and paths. Independent
+hosts, plain HTTP, and custom path prefixes need administrator-confirmed compatible
+connection details, not invented environment variables. Use the user's established
+browser address for UI links; it may differ from the connection address.
+
+Keep existing credentials associated with their deployment. Do not re-register
+an existing agent to repair settings. If the destination changes, preserve and
+report the old registration separately and check existing state at the confirmed
+site before obtaining credentials there. After a lost/interrupted creation response,
+check that site's UI/configuration before retrying; do not assume a missing local
+key means no agent was created. Cancellation stops dependent steps. A name conflict
+also requires reconciliation, not automatic renaming or deletion.
+
+For recovery after the shell bootstrap stopped, run
+`env -u BAND_USER_API_KEY -u BAND_API_KEY -u BAND_AGENT_API_KEY hermes chat -s band:add-band`
+to keep keys out of its inherited environment. This skill can
+repair settings even when the bootstrap's existing-agent check would skip them.
+Any new registration uses the existing plain-shell secret acquisition path, outside
+the LLM environment. Restart the gateway after configuration changes, rerun gateway
+and round-trip verification, and continue only unfinished setup steps. An unavailable
+assistant requires the guide/administrator handoff, not a blind bootstrap retry.
+
 ## Prerequisites
 
 - Hermes is installed and its gateway runs in a Python **3.11 or newer** environment (the Band SDK's floor).
 - You can run shell commands as the user who owns the Hermes install.
 - The user can provide either:
-  - Band agent credentials from the Agents page's **Connect remote agent** button (`app.band.ai/agents/create`): `BAND_AGENT_ID` and `BAND_API_KEY`, or
+  - Band agent credentials from the Agents page's **Connect remote agent** button (on the established Band browser site; cloud default `app.band.ai/agents/create`): `BAND_AGENT_ID` and `BAND_API_KEY`, or
   - a short-lived user API key in `BAND_USER_API_KEY` for automated Enterprise registration.
 
 This skill installs the plugin and the Band SDK as part of the procedure — they need not be present beforehand.
@@ -50,7 +97,7 @@ Skill helper paths are relative to this skill directory:
 - `scripts/verify_gateway.py`
 - `scripts/verify_roundtrip.py` — prove the agent can post to its owner
 
-Registration temporarily ships as `scripts/register_agent.py` because the SDK CLI is not published yet. The helper saves `BAND_AGENT_ID` + `BAND_API_KEY` through Hermes's env writer (plus `BAND_BASE_URL` when it registered against a non-default host, so the gateway connects where the agent lives) and never prints the user key. It also sends a browser-like request fingerprint to avoid Cloudflare 1010 blocks on `app.band.ai`; the future `band-register-agent` / `band.cli.register_agent` path must keep equivalent headers before the bundled helper is removed. The setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
+Registration temporarily ships as `scripts/register_agent.py` because the SDK CLI is not published yet. The helper saves `BAND_AGENT_ID` + `BAND_API_KEY` through Hermes's env writer (plus the registration `BAND_BASE_URL`, so the gateway connects where the agent lives) and never prints the user key. It also sends a browser-like request fingerprint to avoid Cloudflare 1010 blocks on `app.band.ai`; the future `band-register-agent` / `band.cli.register_agent` path must keep equivalent headers before the bundled helper is removed. The setup scripts emit JSON so you can inspect success, missing checks, and next actions without exposing secrets.
 
 This skill is **resumable**: run `verify_install.py` first and act *only* on what it reports as `blocking[]`, so re-running after a partial failure never double-installs or re-registers.
 
@@ -87,7 +134,7 @@ hermes plugins enable band 2>/dev/null && hermes plugins list | grep -w band >/d
 Register (temporary bundled helper — needs `BAND_USER_API_KEY`), ensure the access policy, then verify install / gateway / prove a round-trip (always with the gateway interpreter):
 
 ```bash
-"$HERMES_PY" scripts/register_agent.py        # mints the agent and saves BAND_AGENT_ID + BAND_API_KEY (+ a non-default BAND_BASE_URL)
+"$HERMES_PY" scripts/register_agent.py        # mints the agent and saves BAND_AGENT_ID + BAND_API_KEY (+ BAND_BASE_URL)
 "$HERMES_PY" scripts/ensure_access_policy.py   # gateway trusts Band's ACL (idempotent; safe to re-run)
 "$HERMES_PY" scripts/verify_install.py
 "$HERMES_PY" scripts/verify_gateway.py         # hub created + home (main) channel set
@@ -175,10 +222,10 @@ re-installs or re-registers what's already in place.
 
 5. Ensure agent credentials are present (`BAND_AGENT_ID` + `BAND_API_KEY` in Hermes's `.env`). `scripts/verify_install.py` reports whether they are.
    - Already saved (e.g. the bootstrapper registered the agent before handing off): continue.
-   - Pre-created agent: have the user click **Connect remote agent** on the Band Agents page (`app.band.ai/agents/create`), create the agent, and save `BAND_AGENT_ID` + `BAND_API_KEY` with Hermes's env writer. If the agent lives on a Band host other than `https://app.band.ai`, save that host as `BAND_BASE_URL` too, or the gateway connects to app.band.ai with a key it doesn't know.
+   - Pre-created agent: have the user click **Connect remote agent** on the Band Agents page (on the established Band browser site; cloud default `app.band.ai/agents/create`), create the agent, and save `BAND_AGENT_ID` + `BAND_API_KEY` with Hermes's env writer. If the agent lives on a Band host other than `https://app.band.ai`, save that host as `BAND_BASE_URL` too, or the gateway connects to app.band.ai with a key it doesn't know.
    - Auto-register from a user key — a **script step, not an LLM step**. Until the SDK CLI is published, use the bundled `scripts/register_agent.py` helper. With `BAND_USER_API_KEY` set in a plain shell, the helper reads it from the environment, mints the agent, and saves agent-scoped creds through Hermes's env writer; it never prints or persists the *user* key:
      ```bash
-     "$HERMES_PY" scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY (+ a non-default BAND_BASE_URL) through Hermes env writer
+     "$HERMES_PY" scripts/register_agent.py   # saves BAND_AGENT_ID + BAND_API_KEY (+ BAND_BASE_URL) through Hermes env writer
      unset BAND_USER_API_KEY BAND_API_KEY   # BAND_API_KEY may hold the user key (web snippet); the gateway reads the agent key from .env
      ```
      This is **idempotent at the flow level**: step 2 only routes here when `verify_install` reports the credentials missing, so a re-run never mints a second agent. **Do not put `BAND_USER_API_KEY` into the agent's own environment or read it yourself** — let the bootstrapper or a plain shell consume it before/outside the agent, so the user key never reaches the LLM. After `band.cli.register_agent` is published in `band-sdk`, replace this helper call with `"$HERMES_PY" -m band.cli.register_agent` only after confirming the SDK CLI sends the same Cloudflare-safe registration headers. Have the user remove `BAND_USER_API_KEY` afterward.
@@ -210,7 +257,7 @@ re-installs or re-registers what's already in place.
    "$HERMES_PY" scripts/verify_roundtrip.py                 # outbound proof (default)
    "$HERMES_PY" scripts/verify_roundtrip.py --await-reply   # full duplex: also wait for the owner's @mention
    ```
-   - A successful send exercises auth + room + the exact REST path real replies use. If this fails after `verify_gateway.py` passed, the problem is mentions/room state, not the socket.
+   - A successful send exercises auth + room + the exact REST path real replies use. If it fails, inspect safe status and gateway evidence: a Band 401/403 enters authentication recovery above; other failures need their own diagnosis. A gateway check does not prove REST authentication.
    - `--await-reply` additionally posts the check, then waits for the owner to @mention back — proving inbound delivery too. Use it when you want the user to confirm live.
    - This is also the proof that **"send a message to me" works**: the agent reaches its owner by calling `band_send_message` with no `room_id` (it falls back to the owner's hub/home and @mentions the owner), which is the same path the round-trip exercises.
 

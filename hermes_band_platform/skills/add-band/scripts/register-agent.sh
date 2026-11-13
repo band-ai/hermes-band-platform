@@ -129,7 +129,7 @@ resp=$(curl -sS -X POST "$base/api/v1/me/agents/register" \
   -H "User-Agent: $ua" \
   -H "Accept: application/json, text/plain, */*" \
   -H "Accept-Language: en-US,en;q=0.9" \
-  -H "Content-Type: application/json" -d "$req_body" -w $'\n%{http_code}' -K - <<EOF
+  -H "Content-Type: application/json" -d "$req_body" -w $'\n%{http_code}' -K - 2>/dev/null <<EOF
 header = "X-API-Key: $BAND_API_KEY"
 EOF
 ) || true
@@ -138,7 +138,21 @@ code=${resp##*$'\n'}
 out=${resp%$'\n'*}
 case "$code" in
   200 | 201) ;;
-  *) echo "band: registration failed (HTTP ${code:-?}): $(printf '%.300s' "$out")" >&2; exit 1 ;;
+  *)
+    echo "band: registration failed (HTTP ${code:-?}) at the configured BAND_BASE_URL." >&2
+    case "$code" in
+      401 | 403)
+        echo "band: the key or destination may be incorrect. Use ONBOARDING-RECOVERY.md: compare the request destination with the website where you normally open Band; confirm connection details before retrying." >&2 ;;
+      422)
+        case "$out" in
+          *"has already been taken"* | *"has been taken"*)
+            echo "band: agent name has already been taken; check existing agents on this Band site before retrying." >&2 ;;
+        esac ;;
+      *)
+        echo "band: creation may be incomplete or its result unknown; check existing agents on this Band site before retrying." >&2 ;;
+    esac
+    exit 1 ;;
+
 esac
 
 # Find a Python 3 that actually runs. `command -v` alone is not enough:
